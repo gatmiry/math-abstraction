@@ -4,3 +4,4 @@ datasets
 ipykernel
 transformers
 torch
+transformers[torch]
