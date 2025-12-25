@@ -14,7 +14,7 @@ def fix_double_backslashes(text):
 def main():
     # Read the JSONL file
     problems = []
-    with open('outputs/math_solutions.jsonl', 'r') as f:
+    with open('outputs/math_solutions_2000.jsonl', 'r') as f:
         for line in f:
             if line.strip():
                 problems.append(json.loads(line))

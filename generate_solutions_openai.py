@@ -12,13 +12,34 @@ import multiprocessing as mp
 from functools import partial
 
 
+def load_settings() -> Dict:
+    """Load settings from settings.json file."""
+    settings_path = os.path.join(os.path.dirname(__file__), "settings.json")
+    if os.path.exists(settings_path):
+        with open(settings_path, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def get_api_key() -> Optional[str]:
+    """Get API key from settings.json, environment variable, or None."""
+    settings = load_settings()
+    api_key = settings.get("openai_api_key")
+    if not api_key:
+        api_key = os.getenv("OPENAI_API_KEY")
+    return api_key
+
+
 class GeometryProblemGenerator:
     """Generate solutions to geometry problems using OpenAI API."""
     
     def __init__(self, api_key: Optional[str] = None, model: str = "gpt-5"):
-        api_key = api_key or os.getenv("OPENAI_API_KEY")
+        api_key = api_key or get_api_key()
         if not api_key:
-            raise ValueError("OpenAI API key required. Set OPENAI_API_KEY environment variable.")
+            raise ValueError(
+                "OpenAI API key required. Set OPENAI_API_KEY environment variable "
+                "or add 'openai_api_key' to settings.json file."
+            )
         
         self.client = OpenAI(api_key=api_key)
         self.model = model
@@ -37,7 +58,7 @@ class GeometryProblemGenerator:
         dataset: datasets.Dataset,
         max_problems: Optional[int] = None,
         problem_type: str = "Geometry",
-        level: str = "Level 5"
+        level: str = "Level 4"
     ) -> List[Dict]:
         """Filter dataset for geometry and easy problems using dataset fields."""
         filtered = []
@@ -119,13 +140,18 @@ Expand proofs into as many blocks as required for clarity and correctness."""
         
         try:
             response = self.client.responses.create(
-                model=self.model,
-                input=[
-                    {"role": "developer", "content": proof_developer_prompt},
-                    {"role": "user", "content": f"Solve the following problem and find the final answer:\n\n{problem}"}
-                ],
-                max_tokens=max_tokens,
-                temperature=0.3
+                prompt={
+                    "id": "pmpt_69475c3f5c9c8194b0a136dc663d15b30cc8e7bedee1d50b",
+                    "version": "2"
+                },
+                input=[{"role": "user", "content": f"{problem}"}],
+                reasoning={
+                    "summary": "auto"
+                },
+                include=[
+                    "reasoning.encrypted_content",
+                    "web_search_call.action.sources"
+                ]
             )
             return response.output_text #response.choices[0].message.content.strip()
         except Exception as e:
@@ -178,12 +204,18 @@ Expand proofs into as many blocks as required for clarity and correctness."""
             List of result dictionaries with 'problem', 'ground_truth', and 'solution' keys.
         """
         if num_processes is None:
+            # Default to CPU count, but for I/O-bound API calls, you can use more
+            # Recommended: 2-4x CPU count if not hitting rate limits
+            # Maximum practical: 20-50 depending on API tier and rate limits
             num_processes = mp.cpu_count()
         
         # Get API key and model for worker processes
-        api_key = os.getenv("OPENAI_API_KEY")
+        api_key = get_api_key()
         if not api_key:
-            raise ValueError("OpenAI API key required. Set OPENAI_API_KEY environment variable.")
+            raise ValueError(
+                "OpenAI API key required. Set OPENAI_API_KEY environment variable "
+                "or add 'openai_api_key' to settings.json file."
+            )
         
         # Create worker function with API key and model
         worker_func = partial(
@@ -309,6 +341,7 @@ Expand proofs into as many blocks as required for clarity and correctness."""
     except Exception as e:
         solution = f"Error: {str(e)}"
     
+
     return {
         "problem": problem,
         "ground_truth": problem_dict["answer"],
@@ -318,15 +351,15 @@ Expand proofs into as many blocks as required for clarity and correctness."""
 
 def main():
     # API key is loaded from settings.json or environment variable
-    generator = GeometryProblemGenerator(model="gpt-4o")
+    generator = GeometryProblemGenerator()
     
     # Load competition_math dataset (default)
     dataset = generator.load_dataset()
     problems = generator.filter_problems(
         dataset,
-        max_problems=20,
+        max_problems=20000,
         problem_type="Geometry",
-        level="Level 5"  # Easiest level
+        level="Level 4"  # Easiest level
     )
     
     # results = generator.generate_solutions_batch(
@@ -337,9 +370,9 @@ def main():
     
     results = generator.generate_solutions_parallel(
         problems,
-        output_path="outputs/math_solutions.jsonl",
-        dataset_output_path="outputs/math_solutions_dataset",
-        num_processes=10
+        output_path="outputs/math_solutions_20000_level_4.jsonl",
+        dataset_output_path="outputs/math_solutions_dataset_20000_level_4",
+        num_processes=50
     )
     
     print(f"Generated {len(results)} solutions")
