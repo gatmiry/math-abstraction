@@ -17,11 +17,11 @@ import json
 import os
 
 # Configuration
-MODEL_PATH = "Qwen/Qwen2.5-7B" #"./qwen_finetuned"
-DATASET_NAME = "qwedsacf/competition_math"
-PROBLEM_TYPE = "Geometry"
-PROBLEM_LEVEL = "Level 4"
-OUTPUT_FILE = "generated_solutions_baseline.jsonl"#"generated_solutions_level4.jsonl"
+MODEL_PATH = "Qwen/Qwen2-Math-7B-Instruct" #"./qwen_finetuned"
+DATASET_NAME = "KbsdJames/Omni-MATH"
+#PROBLEM_TYPE = "Geometry"
+#PROBLEM_LEVEL = "Level 4"
+OUTPUT_FILE = "generated_inputs/generated_solutions_qwen2-math-7b-instruct.jsonl"#"generated_solutions_level4.jsonl"
 MAX_NEW_TOKENS = 1024
 GPU_MEMORY_UTILIZATION = 0.9
 
@@ -77,11 +77,8 @@ def generate_solutions(llm, tokenizer, problems, output_file):
     with open(output_file, "w") as f:
         for i, output in enumerate(outputs):
             result = {
-                "problem": problems[i]['problem'],
-                "ground_truth": problems[i]['solution'],
-                "type": problems[i]['type'],
-                "level": problems[i]['level'],
                 "generated_solution": output.outputs[0].text,
+                **problems[i]
             }
             f.write(json.dumps(result) + "\n")
     
@@ -98,14 +95,11 @@ def main():
     #geometry_problems = ds['train'].filter(
     #    lambda x: x.get('type') == PROBLEM_TYPE and x.get('level') == PROBLEM_LEVEL
     #)
-    problems = ds['train']
-    #solutions = [example['solution'] for example in geometry_problems]
-    print(f"Found {len(problems)} problems")
-    
-    if len(problems) == 0:
-        print("No problems found. Exiting.")
-        return
-    
+    print('ds type is ', type(ds))
+    num_problems = len(ds['test'])
+    problems = ds['test'].select(range(int(num_problems*0.8)))
+    print(f"Found {len(problems)} train problems")
+    #print('first row of problems:', problems[0].keys())
     # Load model
     llm, tokenizer = load_model_and_tokenizer(MODEL_PATH)
     

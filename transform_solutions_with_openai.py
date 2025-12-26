@@ -241,8 +241,8 @@ def transform_solutions_parallel(
 def main():
     # Configuration
     input_path = "generated_solutions_baseline.jsonl"  # Qwen-generated solutions
-    output_jsonl_path = "newopenaioutputs/transformed_solutions_qwen2.57b.jsonl"
-    output_dataset_path = "newopenaioutputs/transformed_solutions_qwen2.57b_dataset"
+    output_jsonl_path = "newopenaioutputs/transformed_solutions_qwen2-math-7b-instruct.jsonl"
+    output_dataset_path = "newopenaioutputs/transformed_solutions_qwen2-math-7b-instruct_dataset"
     max_data_n = 5000  # Set to a number to limit processing (e.g., 100)
     num_processes = 100  # Set to a number or None for CPU count
     
