@@ -21,9 +21,9 @@ from datasets import load_from_disk
 import torch
 
 # Configuration
-MODEL_NAME = "Qwen/Qwen2.5-7B"
-DATASET_PATH = "newopenaioutputs/transformed_solutions_qwen2.57b_dataset"
-OUTPUT_DIR = "./models/qwen2.57b_finetuned_on_first_5000_transformed_math_solutions"
+MODEL_NAME = "Qwen/Qwen2-Math-7B-Instruct"
+DATASET_PATH = "newopenaioutputs/transformed_solutions_qwen2-math-7b-instruct_dataset"
+OUTPUT_DIR = "./models/qwen2-math-7b-instruct_finetuned_on_first_3542_transformed_omni_math_solutions"
 # MAX_LENGTH: 2048 covers ~95% of examples (median: 934, 95th percentile: 1934)
 # Alternative: 2560 covers ~99% of examples (99th percentile: 2466, max: 2752)
 # Note: 4096 doubles activation memory compared to 2048 - reduce if you hit OOM errors
@@ -32,7 +32,8 @@ MAX_LENGTH = 4096
 def format_chat_messages(problem, solution):
     """Format problem and solution in Qwen chat format."""
     messages = [
-        {"role": "user", "content": f"Solve this geometry problem:\n\n{problem}"},
+        {"role": "system", "content": f"""You are a math tutor. Give a complete solution put the final answer in the format \\boxed{...}."""}, 
+        {"role": "user", "content": f"""{problem}"""},
         {"role": "assistant", "content": solution}
     ]
     return messages
