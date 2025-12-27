@@ -136,17 +136,22 @@ class LemmaTheoremDataset(Dataset):
         
         # Mark ALL tokens that are part of the \begin{...} commands
         # (not just the first token, but all tokens spanning the entire command)
+        # This includes: \begin{lemmatheorem}, \begin{lemmatheorembox}, \begin{intermediatederivation}
         for lemma_pattern in lemma_patterns:
             for match in re.finditer(lemma_pattern, solution):
                 cmd_start_char = match.start()
                 cmd_end_char = match.end()
+                matched_text = match.group(0)
+                print("matched_text: ", matched_text)
                 
                 # Find all tokens that overlap with this command
+                # We need to mark ALL tokens that have any character overlap with the command
                 for i, (char_start, char_end) in enumerate(offsets):
                     if i >= solution_len:
                         continue
                     
                     # Check if this token overlaps with the command
+                    # Token overlaps if: token starts before command ends AND token ends after command starts
                     token_overlaps = (char_start < cmd_end_char and char_end > cmd_start_char)
                     
                     if token_overlaps:
@@ -162,8 +167,9 @@ class LemmaTheoremDataset(Dataset):
             # Find all Wikipedia URLs in this block
             for url_match in re.finditer(wikipedia_url_pattern, block_text, re.IGNORECASE):
                 full_url = url_match.group(0)
+                #print("full_url: ", full_url)
                 core_address = url_match.group(1)  # The part after /wiki/ (e.g., "Dilation_(geometry)")
-                
+                #print("core_address: ", core_address)
                 # Find the character position of the core address within the full solution
                 url_start_in_solution = block_start + url_match.start()
                 wiki_path_pos = full_url.find('/wiki/')
@@ -186,7 +192,7 @@ class LemmaTheoremDataset(Dataset):
                     if token_overlaps:
                         # Decode the token to check its content
                         token_text = self.tokenizer.decode([tokens[i]], skip_special_tokens=True)
-                        
+                        print("token_text for wikipedia url: ", token_text)
                         # Calculate how much of this token is within the core address
                         overlap_start = max(char_start, core_address_start_char)
                         overlap_end = min(char_end, core_address_end_char)

@@ -10,6 +10,11 @@ import os
 import json
 import re
 import torch
+
+# Set CUDA_VISIBLE_DEVICES to use only the last 4 GPUs (GPUs 4, 5, 6, 7)
+# This avoids conflicts with other processes using the first GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
+
 from datasets import load_from_disk, load_dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
