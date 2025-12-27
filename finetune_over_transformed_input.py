@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
 Minimal fine-tuning script for Qwen 7B on geometry problems.
-Uses Qwen's chat template format for training.
+Uses TRL SFTTrainer to only train on assistant tokens.
 
 Requirements:
-    pip install transformers datasets torch accelerate
-
-Optional for QLoRA (memory-efficient fine-tuning):
-    pip install peft bitsandbytes
+    pip install transformers datasets torch accelerate trl
 """
 
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     TrainingArguments,
-    Trainer,
-    DataCollatorForLanguageModeling
 )
+from trl import SFTTrainer
 from datasets import load_from_disk
 import torch
 
@@ -38,32 +34,13 @@ def format_chat_messages(problem, solution):
     ]
     return messages
 
-def preprocess_function(examples, tokenizer):
-    """Preprocess examples using Qwen's chat template."""
-    inputs = []
-    
+def format_dataset(examples):
+    """Format dataset for SFTTrainer - returns messages."""
+    messages_list = []
     for problem, solution in zip(examples['problem'], examples['new_proof']):
         messages = format_chat_messages(problem, solution)
-        # Use apply_chat_template to format according to Qwen's format
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False
-        )
-        inputs.append(text)
-    
-    # Tokenize
-    model_inputs = tokenizer(
-        inputs,
-        max_length=MAX_LENGTH,
-        truncation=True,
-        padding=False
-    )
-    
-    # Labels will be set by DataCollatorForLanguageModeling (same as input_ids)
-    # No need to set labels here for causal LM - the collator handles it
-    
-    return model_inputs
+        messages_list.append(messages)
+    return {"messages": messages_list}
 
 def main():
     # Use GPU 1 (GPU 0 is occupied by Jupyter kernel)
@@ -95,26 +72,25 @@ def main():
     dataset = load_from_disk(DATASET_PATH)
     print(f"Dataset size: {len(dataset)}")
     
-    # Preprocess dataset
-    print("Preprocessing dataset...")
-    tokenized_dataset = dataset.map(
-        lambda x: preprocess_function(x, tokenizer),
+    # Format dataset for SFTTrainer (converts to messages format)
+    print("Formatting dataset...")
+    formatted_dataset = dataset.map(
+        format_dataset,
         batched=True,
         remove_columns=dataset.column_names
     )
     
     # Split into train/validation (90/10)
-    split_dataset = tokenized_dataset.train_test_split(test_size=0.1, seed=42)
+    split_dataset = formatted_dataset.train_test_split(test_size=0.1, seed=42)
     train_dataset = split_dataset["train"]
     eval_dataset = split_dataset["test"]
     
     print(f"Train size: {len(train_dataset)}, Eval size: {len(eval_dataset)}")
     
-    # Data collator
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False  # Causal LM, not masked LM
-    )
+    # Verify dataset format (SFTTrainer requires "messages" column for assistant-only training)
+    if "messages" not in train_dataset.column_names:
+        raise ValueError("Dataset must have 'messages' column for SFTTrainer to mask non-assistant tokens")
+    print("Dataset has 'messages' format - SFTTrainer will automatically mask non-assistant tokens")
     
     # Training arguments
     training_args = TrainingArguments(
@@ -145,13 +121,17 @@ def main():
         report_to="none",  # Disable wandb/tensorboard
     )
     
-    # Initialize Trainer
-    trainer = Trainer(
+    # Initialize SFTTrainer
+    # SFTTrainer automatically masks non-assistant tokens when dataset has "messages" format
+    # It sets labels to -100 for system/user tokens, only computing loss on assistant tokens
+    trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=data_collator,
+        tokenizer=tokenizer,
+        max_seq_length=MAX_LENGTH,
+        dataset_text_field=None,  # Not needed when using messages format
     )
     
     # Train
