@@ -115,10 +115,8 @@ def format_prompt(problem, problem_type="math"):
     """Format problem using Qwen chat template."""
     type_str = problem_type.lower() if problem_type != "math" else "math"
     messages = [
-        {
-            "role": "user",
-            "content": f"Solve this {type_str} problem without using any external tools. Put your solution in \\boxed{{...}} format.\n\n Here is the problem:\n\n{problem}"
-        }
+            {"role": "system", "content": f"""You are a math tutor. Give a complete solution put the final answer in the format \\boxed{...}."""}, 
+            {"role": "user", "content": f"""{problem}"""}
     ]
     return messages
 

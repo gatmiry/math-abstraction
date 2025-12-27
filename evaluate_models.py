@@ -26,7 +26,8 @@ from transformers import AutoModelForCausalLM
 
 # Configuration
 BASELINE_MODEL = "Qwen/Qwen2.5-7B"
-FINETUNED_MODEL = "./math-abstraction/models/qwen_finetuned/qwen_finetuned"
+#FINETUNED_MODEL = "./math-abstraction/models/qwen_finetuned/qwen_finetuned"
+FINETUNED_MODEL = "./models/qwen2-math-7b-instruct_finetuned_on_first_3542_transformed_omni_math_solutions"
 DATASET_PATH = None  # Set to None to load from HuggingFace, or path to dataset
 DATASET_NAME = "qwedsacf/competition_math"  # HuggingFace dataset name
 PROBLEM_TYPE = "Algebra"  # Filter for this problem type
@@ -112,10 +113,8 @@ def format_prompt(problem, problem_type="math"):
     """Format problem using Qwen chat template."""
     type_str = problem_type.lower() if problem_type != "math" else "math"
     messages = [
-        {
-            "role": "user",
-            "content": f"Solve this {type_str} problem without using any external tools. Put your solution in \\boxed{{...}} format.\n\n Here is the problem:\n\n{problem}"
-        }
+            {"role": "system", "content": f"""You are a math tutor. Give a complete solution put the final answer in the format \\boxed{...}."""}, 
+            {"role": "user", "content": f"""{problem}"""}
     ]
     return messages
 
@@ -218,12 +217,15 @@ def evaluate_models():
         full_dataset = load_dataset(DATASET_NAME, split="train")
         print(f"Full dataset loaded: {len(full_dataset)} examples")
         
-        # Filter for problem type and level
-        print(f"Filtering for {PROBLEM_TYPE} {PROBLEM_LEVEL} problems...")
-        filtered_dataset = full_dataset.filter(
-            lambda x: x.get('type') == PROBLEM_TYPE and x.get('level') == PROBLEM_LEVEL
-        )
-        print(f"Found {len(filtered_dataset)} {PROBLEM_TYPE} {PROBLEM_LEVEL} problems")
+        if PROBLEM_TYPE and PROBLEM_LEVEL:
+            # Filter for problem type and level
+            print(f"Filtering for {PROBLEM_TYPE} {PROBLEM_LEVEL} problems...")
+            filtered_dataset = full_dataset.filter(
+                lambda x: x.get('type') == PROBLEM_TYPE and x.get('level') == PROBLEM_LEVEL
+            )
+            print(f"Found {len(filtered_dataset)} {PROBLEM_TYPE} {PROBLEM_LEVEL} problems")
+        else:
+            filtered_dataset = full_dataset
         
         # Limit samples if specified
         if MAX_SAMPLES and MAX_SAMPLES < len(filtered_dataset):
@@ -387,7 +389,9 @@ def evaluate_models():
             "baseline_answer": baseline_answer,
             "finetuned_answer": finetuned_answer,
             "baseline_correct": baseline_is_correct,
-            "finetuned_correct": finetuned_is_correct
+            "finetuned_correct": finetuned_is_correct,
+            "baseline_response": baseline_resp,
+            "finetuned_response": finetuned_resp
         })
     
     # Print results
@@ -408,7 +412,7 @@ def evaluate_models():
     # Save detailed results
     problem_type_str = PROBLEM_TYPE.lower() if DATASET_PATH is None else "all"
     level_str = PROBLEM_LEVEL.replace(" ", "_").lower() if DATASET_PATH is None else ""
-    output_file = f"outputs2/model_evaluation_results_{problem_type_str}_{level_str}.jsonl"
+    output_file = f"outputs2/transformed_model_qwen2-math-7b-instruct_evaluation_results_{problem_type_str}_{level_str}.jsonl"
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, "w") as f:
         for result in results:
