@@ -30,7 +30,7 @@ def format_prompt(problem):
     messages = [
         {
             "role": "user",
-            "content": f"Solve this geometry problem without using any external tools. Put your solution in \\boxed{{...}} format.\n\n Here is the problem:\n\n{problem}"
+            "content": f"Solve this math problem without using any external tools. Put your solution in \\boxed{{...}} format.\n\n Here is the problem:\n\n{problem}"
         }
     ]
     return messages
