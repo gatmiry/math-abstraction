@@ -37,8 +37,8 @@ This is the proof:
     try:
         response = client.responses.create(
             prompt={
-                "id": "pmpt_69475c3f5c9c8194b0a136dc663d15b30cc8e7bedee1d50b",
-                "version": "2"
+                "id": "pmpt_694bb78979a481969e18ba6a5ac61b81042befdd28a17945",
+                "version": "9",
             },
             input=[{"role": "user", "content": transform_prompt}],
             reasoning={
