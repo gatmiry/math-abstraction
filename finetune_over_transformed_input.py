@@ -134,8 +134,7 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        processing_class=tokenizer,  # Changed from 'tokenizer' to 'processing_class'
-        dataset_text_field=None,  # Not needed when using messages format
+        processing_class=tokenizer,
     )
     
     # Train
