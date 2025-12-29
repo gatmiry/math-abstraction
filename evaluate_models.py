@@ -30,14 +30,14 @@ except ImportError:
 from transformers import AutoModelForCausalLM
 
 # Configuration
-BASELINE_MODEL = "Qwen/Qwen2.5-7B"
+BASELINE_MODEL = "Qwen/Qwen2-Math-7B-Instruct"
 #FINETUNED_MODEL = "./math-abstraction/models/qwen_finetuned/qwen_finetuned"
-FINETUNED_MODEL = "./models/qwen2-math-7b-instruct_finetuned_on_first_3542_transformed_omni_math_solutions"
+FINETUNED_MODEL = "./models/qwen2-math-7b-instruct_finetuned_on_first_3542_transformed_omni_math_solutions_filtered_lr:{lr}_warmup_steps:{warmup_steps}_num_epochs:{num_epochs}"
 DATASET_PATH = None  # Set to None to load from HuggingFace, or path to dataset
 DATASET_NAME = "qwedsacf/competition_math"  # HuggingFace dataset name
-PROBLEM_TYPE = "Algebra"  # Filter for this problem type
+PROBLEM_TYPE = "Geometry"  # Filter for this problem type
 PROBLEM_LEVEL = "Level 4"  # Filter for this difficulty level
-MAX_NEW_TOKENS = 1024
+MAX_NEW_TOKENS = 2048
 MAX_SAMPLES = None  # Set to a number to limit evaluation (e.g., 50 for quick test), None for all
 USE_VLLM = True  # Use vLLM for faster inference with tensor parallelism
 TENSOR_PARALLEL_SIZE = 4  # Use 4 GPUs per model (so both models can run on 8 GPUs total)
@@ -305,7 +305,7 @@ def evaluate_models():
             dtype="bfloat16",
             trust_remote_code=True,
         )
-        finetuned_tokenizer = AutoTokenizer.from_pretrained(FINETUNED_MODEL, trust_remote_code=True)
+        finetuned_tokenizer = AutoTokenizer.from_pretrained(BASELINE_MODEL, trust_remote_code=True)
         finetuned_model = None
         print("Fine-tuned model loaded")
         
