@@ -21,7 +21,7 @@ warmup_steps = 300
 num_epochs = 5
 MODEL_NAME = "Qwen/Qwen2-Math-7B-Instruct"
 DATASET_PATH = "newopenaioutputs/transformed_solutions_qwen2-math-7b-instruct_filtered"
-OUTPUT_DIR = "./models/qwen2-math-7b-instruct_finetuned_on_first_3542_transformed_omni_math_solutions_filtered_lr:{lr}_warmup_steps:{warmup_steps}_num_epochs:{num_epochs}"
+OUTPUT_DIR = f"./models/qwen2-math-7b-instruct_finetuned_on_first_3542_transformed_omni_math_solutions_filtered_lr:{lr}_warmup_steps:{warmup_steps}_num_epochs:{num_epochs}"
 # MAX_LENGTH: 2048 covers ~95% of examples (median: 934, 95th percentile: 1934)
 # Alternative: 2560 covers ~99% of examples (99th percentile: 2466, max: 2752)
 # Note: 4096 doubles activation memory compared to 2048 - reduce if you hit OOM errors

@@ -42,6 +42,15 @@ def filter_dataset(input_file):
 if __name__ == '__main__':
     dataset = filter_dataset('newopenaioutputs/transformed_solutions_qwen2-math-7b-instruct.jsonl')
     print(f"Filtered dataset: {len(dataset)} examples")
+    
+    # Save as HuggingFace dataset
     dataset.save_to_disk('newopenaioutputs/transformed_solutions_qwen2-math-7b-instruct_filtered')
     print("Dataset saved to newopenaioutputs/transformed_solutions_qwen2-math-7b-instruct_filtered")
+    
+    # Also save as JSONL file
+    output_jsonl = 'newopenaioutputs/transformed_solutions_qwen2-math-7b-instruct_filtered.jsonl'
+    with open(output_jsonl, 'w') as f:
+        for item in dataset:
+            f.write(json.dumps(item) + '\n')
+    print(f"JSONL file saved to {output_jsonl}")
 

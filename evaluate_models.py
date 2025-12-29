@@ -305,7 +305,7 @@ def evaluate_models():
             dtype="bfloat16",
             trust_remote_code=True,
         )
-        finetuned_tokenizer = AutoTokenizer.from_pretrained(BASELINE_MODEL, trust_remote_code=True)
+        finetuned_tokenizer = AutoTokenizer.from_pretrained(FINETUNED_MODEL, trust_remote_code=True)
         finetuned_model = None
         print("Fine-tuned model loaded")
         
