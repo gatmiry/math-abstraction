@@ -18,9 +18,10 @@ import torch
 # Configuration
 lr = 2e-5
 warmup_steps = 300
+num_epochs = 5
 MODEL_NAME = "Qwen/Qwen2-Math-7B-Instruct"
 DATASET_PATH = "newopenaioutputs/transformed_solutions_qwen2-math-7b-instruct_filtered"
-OUTPUT_DIR = "./models/qwen2-math-7b-instruct_finetuned_on_first_3542_transformed_omni_math_solutions_filtered_lr:{lr}_warmup_steps:{warmup_steps}"
+OUTPUT_DIR = "./models/qwen2-math-7b-instruct_finetuned_on_first_3542_transformed_omni_math_solutions_filtered_lr:{lr}_warmup_steps:{warmup_steps}_num_epochs:{num_epochs}"
 # MAX_LENGTH: 2048 covers ~95% of examples (median: 934, 95th percentile: 1934)
 # Alternative: 2560 covers ~99% of examples (99th percentile: 2466, max: 2752)
 # Note: 4096 doubles activation memory compared to 2048 - reduce if you hit OOM errors
@@ -29,7 +30,7 @@ MAX_LENGTH = 4096
 def format_chat_messages(problem, solution):
     """Format problem and solution in Qwen chat format."""
     messages = [
-        {"role": "system", "content": f"""You are a math tutor. Give a complete solution and put the final answer in the format \\boxed{...}."""}, 
+        {"role": "system", "content": """You are a math tutor. Give a complete solution using the environments \\begin{intermediatederivation}...\\end{intermediatederivation} and \\begin{lemmatheorembox}...\\end{lemmatheorembox}, and put the final answer in the format \\boxed{...} at the end."""}, 
         {"role": "user", "content": f"""{problem}"""},
         {"role": "assistant", "content": solution}
     ]
@@ -99,7 +100,7 @@ def main():
     training_args = SFTConfig(
         output_dir=OUTPUT_DIR,
         overwrite_output_dir=True,
-        num_train_epochs=3,
+        num_train_epochs=num_epochs,
         per_device_train_batch_size=1,  # Adjust based on GPU memory
         per_device_eval_batch_size=1,
         gradient_accumulation_steps=4,  # Effective batch size = 4
