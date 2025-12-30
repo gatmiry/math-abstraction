@@ -32,10 +32,10 @@ from transformers import AutoModelForCausalLM
 # Configuration
 BASELINE_MODEL = "Qwen/Qwen2-Math-7B-Instruct"
 #FINETUNED_MODEL = "./math-abstraction/models/qwen_finetuned/qwen_finetuned"
-FINETUNED_MODEL = "./models/qwen2-math-7b-instruct_finetuned_on_first_3542_transformed_omni_math_solutions_filtered_lr:{lr}_warmup_steps:{warmup_steps}_num_epochs:{num_epochs}"
+FINETUNED_MODEL = "./models/qwen2-math-7b-instruct_finetuned_on_first_3542_transformed_omni_math_solutions_filtered_lr:2e-05_warmup_steps:300_num_epochs:5"
 DATASET_PATH = None  # Set to None to load from HuggingFace, or path to dataset
 DATASET_NAME = "qwedsacf/competition_math"  # HuggingFace dataset name
-PROBLEM_TYPE = "Geometry"  # Filter for this problem type
+PROBLEM_TYPE = "Algebra"  # Filter for this problem type
 PROBLEM_LEVEL = "Level 4"  # Filter for this difficulty level
 MAX_NEW_TOKENS = 2048
 MAX_SAMPLES = None  # Set to a number to limit evaluation (e.g., 50 for quick test), None for all
@@ -118,7 +118,9 @@ def format_prompt(problem, problem_type="math"):
     """Format problem using Qwen chat template."""
     type_str = problem_type.lower() if problem_type != "math" else "math"
     messages = [
-            {"role": "system", "content": f"""You are a math tutor. Give a complete solution put the final answer in the format \\boxed{...}."""}, 
+            #{"role": "system", "content": f"""You are a math tutor. Give a complete solution put the final answer in the format \\boxed{...}."""}, 
+            #"role": "user", "content": f"""{problem}"""}
+            {"role": "system", "content": """You are a math tutor. Give a complete solution using the environments \\begin{intermediatederivation}...\\end{intermediatederivation} and \\begin{lemmatheorembox}...\\end{lemmatheorembox}, and put the final answer in the format \\boxed{...} at the end."""}, 
             {"role": "user", "content": f"""{problem}"""}
     ]
     return messages
@@ -417,7 +419,7 @@ def evaluate_models():
     # Save detailed results
     problem_type_str = PROBLEM_TYPE.lower() if DATASET_PATH is None else "all"
     level_str = PROBLEM_LEVEL.replace(" ", "_").lower() if DATASET_PATH is None else ""
-    output_file = f"outputs2/transformed_model_qwen2-math-7b-instruct_evaluation_results_{problem_type_str}_{level_str}.jsonl"
+    output_file = f"outputs2/new_transformed_model_qwen2-math-7b-instruct_evaluation_results_{problem_type_str}_{level_str}.jsonl"
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, "w") as f:
         for result in results:
