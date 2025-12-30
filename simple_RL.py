@@ -11,7 +11,7 @@ from datasets import load_dataset
 
 # Configuration
 MODEL_PATH = "./models/qwen2-math-7b-instruct_finetuned_on_first_3542_transformed_omni_math_solutions_filtered_lr:2e-06_warmup_steps:300_num_epochs:3/checkpoint-500"
-DATASET_NAME = "qwedsacf/competition_math"  # Omni-MATH dataset
+DATASET_NAME = "KbsdJames/Omni-MATH"  # Omni-MATH dataset
 OUTPUT_DIR = "./models/qwen2-math-7b-instruct_grpo_omni_math"
 
 def extract_boxed_answer(text):
@@ -87,20 +87,48 @@ def main():
     # Load model and tokenizer
     print(f"Loading model from {MODEL_PATH}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH,
-        torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
-        local_files_only=True,
-        trust_remote_code=True,
-        device_map="auto"
+    
+    # Check if running in distributed mode (accelerate/torchrun)
+    import os
+    is_distributed = (
+        "RANK" in os.environ or 
+        "LOCAL_RANK" in os.environ or 
+        "WORLD_SIZE" in os.environ
     )
+    
+    model_kwargs = {
+        "torch_dtype": torch.bfloat16 if device.type == "cuda" else torch.float32,
+        "local_files_only": True,
+        "trust_remote_code": True,
+    }
+    
+    if not is_distributed:
+        # Single GPU: use device_map="cuda:0" to ensure model stays on one GPU
+        # Using "auto" can split model across GPUs, causing device mismatch errors
+        model_kwargs["device_map"] = "cuda:0" if device.type == "cuda" else "cpu"
+    else:
+        # Distributed training: don't use device_map, let Accelerate handle it
+        # Accelerate will place the model on the correct device for each process
+        pass
+    
+    model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, **model_kwargs)
+    
+    # Clear CUDA cache before training to free up memory
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        # Set memory allocation to expandable segments to reduce fragmentation
+        import os
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    
+    # For distributed training, don't manually move model - Accelerate will handle it
+    # For single GPU with device_map, model is already on the right device
     
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
     # Load dataset
     print(f"Loading dataset: {DATASET_NAME}...")
-    dataset = load_dataset(DATASET_NAME, split="train")
+    dataset = load_dataset(DATASET_NAME, split="test")
     print(f"Dataset size: {len(dataset)}")
     
     # Format dataset for GRPO
@@ -138,6 +166,11 @@ def main():
     reward_func = create_reward_func(prompt_to_answer)
     
     # GRPO training config
+    # Memory optimizations for large models:
+    # - 8-bit optimizer: saves ~42GB (reduces optimizer from 56GB to 14GB)
+    # - Reduced max_completion_length to save memory during generation
+    # - gradient_checkpointing: trades compute for memory
+    # - gradient_accumulation_steps=4 to maintain effective batch size
     training_args = GRPOConfig(
         output_dir=OUTPUT_DIR,
         num_train_epochs=1,
@@ -148,8 +181,13 @@ def main():
         save_steps=500,
         bf16=True,
         gradient_checkpointing=True,
-        max_length=2048,
-        max_prompt_length=1024,
+        max_completion_length=1024,  # Keep at 1024 (512 too short)
+        num_generations=4,  # Must be divisible by generation_batch_size (which is 1*1*4=4)
+        optim="adamw_bnb_8bit",  # 8-bit optimizer saves ~42GB (reduces optimizer from 56GB to 14GB)
+        dataloader_pin_memory=False,  # Save memory
+        dataloader_num_workers=0,  # Save memory
+        # Additional memory optimizations:
+        max_grad_norm=1.0,  # Gradient clipping (standard, doesn't save memory but prevents issues)
     )
     
     # Initialize GRPO trainer
