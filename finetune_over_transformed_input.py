@@ -16,8 +16,8 @@ from datasets import load_from_disk
 import torch
 
 # Configuration
-lr = 2e-07
-warmup_steps = 400
+lr = 2e-06
+warmup_steps = 300
 num_epochs = 3
 MODEL_NAME = "Qwen/Qwen2-Math-7B-Instruct"
 DATASET_PATH = "newopenaioutputs/transformed_solutions_qwen2-math-7b-instruct_filtered"

@@ -10,7 +10,7 @@ from trl import GRPOConfig, GRPOTrainer
 from datasets import load_dataset
 
 # Configuration
-MODEL_PATH = "./models/qwen2-math-7b-instruct_finetuned_on_first_3542_transformed_omni_math_solutions_filtered_lr:2e-06_warmup_steps:300_num_epochs:3/checkpoint-500"
+MODEL_PATH = "./models/qwen2-math-7b-instruct_finetuned_on_first_3542_transformed_omni_math_solutions_filtered_lr:2e-06_warmup_steps:300_num_epochs:3"
 DATASET_NAME = "KbsdJames/Omni-MATH"  # Omni-MATH dataset
 OUTPUT_DIR = "./models/qwen2-math-7b-instruct_grpo_omni_math"
 
@@ -74,7 +74,8 @@ def create_reward_func(prompt_to_answer):
 def format_prompt(problem):
     """Format problem as a prompt."""
     messages = [
-        {"role": "system", "content": "You are a math tutor. Give a complete solution and put the final answer in the format \\boxed{...}."},
+        #{"role": "system", "content": "You are a math tutor. Give a complete solution and put the final answer in the format \\boxed{...}."},
+        {"role": "system", "content": """You are a math tutor. Give a complete solution using the environments \\begin{intermediatederivation}...\\end{intermediatederivation} and \\begin{lemmatheorembox}...\\end{lemmatheorembox}, and put the final answer in the format \\boxed{...} at the end."""},
         {"role": "user", "content": problem}
     ]
     return messages
@@ -181,8 +182,8 @@ def main():
         save_steps=500,
         bf16=True,
         gradient_checkpointing=True,
-        max_completion_length=1024,  # Keep at 1024 (512 too short)
-        num_generations=4,  # Must be divisible by generation_batch_size (which is 1*1*4=4)
+        max_completion_length=2048,  # Keep at 1024 (512 too short)
+        num_generations=8,  # Must be divisible by generation_batch_size (which is 1*1*4=4)
         optim="adamw_bnb_8bit",  # 8-bit optimizer saves ~42GB (reduces optimizer from 56GB to 14GB)
         dataloader_pin_memory=False,  # Save memory
         dataloader_num_workers=0,  # Save memory

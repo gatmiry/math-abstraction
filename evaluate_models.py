@@ -32,10 +32,10 @@ from transformers import AutoModelForCausalLM
 # Configuration
 BASELINE_MODEL = "Qwen/Qwen2-Math-7B-Instruct"
 #FINETUNED_MODEL = "./math-abstraction/models/qwen_finetuned/qwen_finetuned"
-FINETUNED_MODEL = "./models/qwen2-math-7b-instruct_finetuned_on_first_3542_transformed_omni_math_solutions_filtered_lr:2e-05_warmup_steps:300_num_epochs:5"
+FINETUNED_MODEL = "./models/qwen2-math-7b-instruct_finetuned_on_first_3542_transformed_omni_math_solutions_filtered_lr:2e-06_warmup_steps:300_num_epochs:3"
 DATASET_PATH = None  # Set to None to load from HuggingFace, or path to dataset
 DATASET_NAME = "qwedsacf/competition_math"  # HuggingFace dataset name
-PROBLEM_TYPE = "Algebra"  # Filter for this problem type
+PROBLEM_TYPE = "Geometry"  # Filter for this problem type
 PROBLEM_LEVEL = "Level 4"  # Filter for this difficulty level
 MAX_NEW_TOKENS = 2048
 MAX_SAMPLES = None  # Set to a number to limit evaluation (e.g., 50 for quick test), None for all
@@ -45,29 +45,43 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def extract_answer(text):
-    """Extract answer from text, looking for \\boxed{...} patterns."""
+    """Extract answer from text, looking for \\boxed{...} patterns with proper nested brace handling."""
     if not text:
         return None
     
-    # Try to find boxed{...} pattern (most flexible - works with or without backslash)
-    # This handles cases where \boxed becomes boxed due to string processing
-    boxed_pattern = r'boxed\{([^}]+)\}'
-    matches = re.findall(boxed_pattern, text)
-    if matches:
-        return matches[-1].strip()  # Return the last match
+    # Find all positions where boxed{ appears (handle various escape patterns)
+    patterns = [r'\\boxed\{', r'\\\\boxed\{', r'boxed\{']
+    start_pos = -1
     
-    # Try to find \boxed{...} pattern (with escaped backslash)
-    boxed_pattern2 = r'\\boxed\{([^}]+)\}'
-    matches = re.findall(boxed_pattern2, text)
-    if matches:
-        return matches[-1].strip()
+    for pattern in patterns:
+        matches = list(re.finditer(pattern, text))
+        if matches:
+            # Use the last match
+            start_pos = matches[-1].end() - 1  # Position of the opening brace
+            break
     
-    # Try to find \\boxed{...} pattern (double escaped)
-    boxed_pattern3 = r'\\\\boxed\{([^}]+)\}'
-    matches = re.findall(boxed_pattern3, text)
-    if matches:
-        return matches[-1].strip()
+    if start_pos == -1:
+        return None
     
+    # Now manually parse to find matching closing brace
+    # We need to count braces to handle nesting
+    # Start with brace_count = 1 since we're already inside the opening brace
+    brace_count = 1
+    i = start_pos + 1  # Start after the opening brace
+    start_i = i  # Start of the content (after the opening brace)
+    
+    while i < len(text):
+        if text[i] == '{':
+            brace_count += 1
+        elif text[i] == '}':
+            brace_count -= 1
+            if brace_count == 0:
+                # Found matching closing brace
+                answer = text[start_i:i].strip()
+                return answer
+        i += 1
+    
+    # If we never found a closing brace, return None
     return None
 
 

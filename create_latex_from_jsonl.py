@@ -213,7 +213,7 @@ if __name__ == '__main__':
     # If no arguments provided, use default file
     if len(sys.argv) == 1:
         # Default to the openmathreasoning file
-        default_file = 'outputs2/math_solutions_openmathreasoning_50.jsonl'
+        default_file = 'outputs2/transformed_solutions_qwen2-math-7b-instruct_filtered.jsonl'
         if os.path.exists(default_file):
             print(f"No arguments provided. Using default file: {default_file}")
             create_latex_from_jsonl(default_file)
