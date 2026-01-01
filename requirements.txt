@@ -8,3 +8,4 @@ transformers[torch]
 vllm==0.11.2
 trl==0.26.2
 wandb
+apple_bolt
