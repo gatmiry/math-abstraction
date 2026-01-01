@@ -1,0 +1,99 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{geometry}
+\begin{document}
+
+\section*{Problem 1}
+\textbf{Problem:}
+In the diagram below, we have $\sin \angle RPQ = \frac{7}{25}$.  What is $\sin \angle RPS$?
+
+[asy]
+pair R,P,Q,SS;
+SS = (-2,0);
+P = (0,0);
+Q = (2,0);
+R = rotate(aSin(7/25))*(1.5,0);
+dot("$S$",SS,S);
+do...
+
+\textbf{Ground Truth:} \frac{7
+
+\textbf{Baseline Answer:} \frac{25
+
+\textbf{Finetuned Answer:} \frac{7
+
+\newpage
+
+\section*{Problem 2}
+\textbf{Problem:}
+Cylinder $B$'s height is equal to the radius of cylinder $A$ and cylinder $B$'s radius is equal to the height $h$ of cylinder $A$. If the volume of cylinder $A$ is twice the volume of cylinder $B$, th...
+
+\textbf{Ground Truth:} 4
+
+\textbf{Baseline Answer:} 2
+
+\textbf{Finetuned Answer:} 4
+
+\newpage
+
+\section*{Problem 3}
+\textbf{Problem:}
+Either increasing the radius or the height of a cylinder by six inches will result in the same volume. The original height of the cylinder is two inches. What is the original radius in inches?
+
+\textbf{Ground Truth:} 6
+
+\textbf{Baseline Answer:} None
+
+\textbf{Finetuned Answer:} 6
+
+\newpage
+
+\section*{Problem 4}
+\textbf{Problem:}
+In triangle $ABC$, we have that $E$ and $F$ are midpoints of sides $\overline{AC}$ and $\overline{AB}$, respectively. The area of $\triangle ABC$ is 24 square units. How many square units are in the a...
+
+\textbf{Ground Truth:} 6
+
+\textbf{Baseline Answer:} 3
+
+\textbf{Finetuned Answer:} 6
+
+\newpage
+
+\section*{Problem 5}
+\textbf{Problem:}
+The diagonals of a regular hexagon have two possible lengths. What is the ratio of the shorter length to the longer length? Express your answer as a common fraction in simplest radical form.
+
+\textbf{Ground Truth:} \frac{\sqrt{3
+
+\textbf{Baseline Answer:} \frac{1
+
+\textbf{Finetuned Answer:} \frac{\sqrt{3
+
+\newpage
+
+\section*{Problem 6}
+\textbf{Problem:}
+A solid box is 15 cm by 10 cm by 8 cm. A new solid is formed by removing a cube 3 cm on a side from each corner of this box. What percent of the original volume is removed?
+
+\textbf{Ground Truth:} 18\%
+
+\textbf{Baseline Answer:} 18
+
+\textbf{Finetuned Answer:} 18\%
+
+\newpage
+
+\section*{Problem 7}
+\textbf{Problem:}
+Three congruent isosceles triangles $DAO$, $AOB$ and $OBC$ have $AD=AO=OB=BC=10$ and $AB=DO=OC=12$.  These triangles are arranged to form trapezoid $ABCD$, as shown.  Point $P$ is on side $AB$ so that...
+
+\textbf{Ground Truth:} 12
+
+\textbf{Baseline Answer:} 4
+
+\textbf{Finetuned Answer:} 12
+
+\newpage
+
+\end{document}
