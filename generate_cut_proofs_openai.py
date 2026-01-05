@@ -5,6 +5,7 @@ Reads proofs from OMNI-MATH HuggingFace dataset and generates 5 different cut ve
 
 import os
 import json
+import re
 from typing import List, Dict, Optional
 from openai import OpenAI
 import datasets
@@ -109,15 +110,17 @@ def _generate_cut_proofs_worker(item_dict: Dict, api_key: str) -> Dict:
                     "proof": prompt_input["solution"]
                 }
             },
-            #input=prompt_input,
-            response_format={
-                "type": "json_schema",
-                "json_schema": schema,
-            },
         )
         
-        # Parsed JSON object (guaranteed to match schema)
-        cut_proofs = response.output_parsed
+        # Parse JSON from output text
+        output_text = response.output_text
+        # Try to extract JSON from the response (might be wrapped in markdown code blocks)
+        json_match = re.search(r'\{.*\}', output_text, re.DOTALL)
+        if json_match:
+            cut_proofs = json.loads(json_match.group(0))
+        else:
+            # If no JSON found, try parsing the whole output
+            cut_proofs = json.loads(output_text)
         
         # Merge the cut proofs into the result
         result = item_dict.copy()
