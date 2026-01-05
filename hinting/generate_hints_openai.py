@@ -6,7 +6,8 @@ Reads cut proofs from cut_proofs_dataset and generates hints for each.
 import os
 import json
 import re
-from typing import List, Dict, Optional
+import shutil
+from typing import Any, List, Dict, Optional
 from openai import OpenAI
 import datasets
 from tqdm import tqdm
@@ -86,6 +87,7 @@ def _generate_hint_worker(item_dict: Dict, api_key: str) -> Dict:
         parsed_response = json.loads(json_str)
         
         # Merge the parsed fields into the result
+        # Keep lists as lists, don't convert to strings
         #result = item_dict.copy()
         result = {}
         # Extract all fields from the parsed response and add to result
@@ -113,16 +115,34 @@ def _generate_hint_worker(item_dict: Dict, api_key: str) -> Dict:
         return result
         
     except json.JSONDecodeError as e:
-        # Return original item with error message if JSON parsing fails
-        result = item_dict.copy()
-        result["raw_hint_output"] = response.output_text if 'response' in locals() else ""
-        result["parse_error"] = f"JSON decode error: {str(e)}"
+        # Return error result with only expected fields
+        result = {
+            "problem": problem,
+            "domain": domain_str,
+            "difficulty": difficulty_str,
+            "partial_proof": "",
+            "full_proof": "",
+            "ground_truth_solution": ground_truth_solution,
+            "final_answer": final_answer,
+            "hints": [],
+            "raw_hint_output": response.output_text if 'response' in locals() else "",
+            "parse_error": f"JSON decode error: {str(e)}"
+        }
         return result
     except Exception as e:
-        # Return original item with error message
-        result = item_dict.copy()
-        result["raw_hint_output"] = response.output_text if 'response' in locals() else ""
-        result["parse_error"] = f"Error: {str(e)}"
+        # Return error result with only expected fields
+        result = {
+            "problem": problem,
+            "domain": domain_str,
+            "difficulty": difficulty_str,
+            "partial_proof": "",
+            "full_proof": "",
+            "ground_truth_solution": ground_truth_solution,
+            "final_answer": final_answer,
+            "hints": [],
+            "raw_hint_output": response.output_text if 'response' in locals() else "",
+            "parse_error": f"Error: {str(e)}"
+        }
         return result
 
 
@@ -200,7 +220,80 @@ def generate_hints(
     
     # Save as HuggingFace Dataset
     if output_dataset_path:
-        dataset = datasets.Dataset.from_list(results)
+        # Remove existing dataset if it exists to avoid feature mismatch errors
+        if os.path.exists(output_dataset_path):
+            print(f"Removing existing dataset at {output_dataset_path}...")
+            shutil.rmtree(output_dataset_path)
+            # Verify removal
+            if os.path.exists(output_dataset_path):
+                raise RuntimeError(f"Failed to remove existing dataset at {output_dataset_path}")
+        
+        # Normalize results: extract only the fields we want to keep
+        # This ensures all results have the same schema
+        normalized_results = []
+        expected_fields = [
+            "problem", "domain", "difficulty", "partial_proof", "full_proof",
+            "ground_truth_solution", "final_answer", "hints", "raw_hint_output", "parse_error"
+        ]
+        
+        for result in results:
+            normalized = {}
+            for field in expected_fields:
+                if field in result:
+                    normalized[field] = result[field]
+                else:
+                    # Set default values for missing fields
+                    if field == "hints":
+                        normalized[field] = []
+                    elif field in ["raw_hint_output", "parse_error"]:
+                        normalized[field] = ""
+                    else:
+                        normalized[field] = ""
+            normalized_results.append(normalized)
+        
+        # Build Features schema that supports list fields
+        # Collect all unique keys from normalized results
+        all_keys = set[Any]()
+        for result in normalized_results:
+            all_keys.update(result.keys())
+        
+        # Build features dict - check all results to determine types
+        features_dict = {}
+        for key in all_keys:
+            # Check all results to find the type
+            for result in normalized_results:
+                if key in result:
+                    value = result[key]
+                    if isinstance(value, list):
+                        # If list is not empty, check element type
+                        if value and isinstance(value[0], str):
+                            features_dict[key] = datasets.Sequence(datasets.Value("string"))
+                        else:
+                            # Default to list of strings
+                            features_dict[key] = datasets.Sequence(datasets.Value("string"))
+                        break
+                    elif isinstance(value, dict):
+                        features_dict[key] = datasets.Value("string")
+                        break
+                    elif isinstance(value, (int, float)):
+                        if isinstance(value, float):
+                            features_dict[key] = datasets.Value("float64")
+                        else:
+                            features_dict[key] = datasets.Value("int64")
+                        break
+                    else:
+                        features_dict[key] = datasets.Value("string")
+                        break
+            
+            # If key not found in any result, default to string
+            if key not in features_dict:
+                features_dict[key] = datasets.Value("string")
+        
+        # Create Features object
+        features = datasets.Features(features_dict)
+        
+        # Create dataset with explicit features
+        dataset = datasets.Dataset.from_list(normalized_results, features=features)
         dataset.save_to_disk(output_dataset_path)
         print(f"Saved dataset to {output_dataset_path}")
 
@@ -210,8 +303,8 @@ def main():
     dataset_path = "../newopenaioutputs/cut_proofs_dataset"  # Path to cut_proofs_dataset
     output_jsonl_path = "../newopenaioutputs/hints.jsonl"
     output_dataset_path = "../newopenaioutputs/hints_dataset"
-    max_data_n = 2  # Set to a number to limit processing (e.g., 100)
-    num_processes = 2  # Set to a number or None for CPU count
+    max_data_n = None  # Set to a number to limit processing (e.g., 100)
+    num_processes = 50 # Set to a number or None for CPU count
     
     generate_hints(
         dataset_path=dataset_path,
