@@ -104,7 +104,7 @@ def _generate_cut_proofs_worker(item_dict: Dict, api_key: str) -> Dict:
         response = client.responses.create(
             prompt={
                 "id": "pmpt_695983d6d67881968f7ec6e53baca11c0cdb61de54e6239e",
-                "version": "9",
+                "version": "10",
                 "variables": {
                     "problem": prompt_input["problem"],
                     "proof": prompt_input["solution"]
