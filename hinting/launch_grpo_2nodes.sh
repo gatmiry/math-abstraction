@@ -75,6 +75,45 @@ else
     exit 1
 fi
 
+# Configure NCCL for multi-node communication
+# Detect network interface automatically if not set
+if [ -z "$NCCL_SOCKET_IFNAME" ]; then
+    # Try to detect the primary network interface (not loopback)
+    INTERFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+    if [ -n "$INTERFACE" ]; then
+        export NCCL_SOCKET_IFNAME="$INTERFACE"
+        echo "Auto-detected network interface: $INTERFACE"
+    else
+        # Fallback: try eth0
+        if ip link show eth0 >/dev/null 2>&1; then
+            export NCCL_SOCKET_IFNAME="eth0"
+            echo "Using default network interface: eth0"
+        fi
+    fi
+fi
+
+# NCCL environment variables for multi-node training
+export NCCL_DEBUG=${NCCL_DEBUG:-0}  # Set to 0 to completely disable NCCL logging
+export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}  # Disable InfiniBand (use Ethernet)
+export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-0}  # Enable P2P if available
+export NCCL_SOCKET_NTHREADS=${NCCL_SOCKET_NTHREADS:-4}
+export NCCL_NSOCKS_PERTHREAD=${NCCL_NSOCKS_PERTHREAD:-4}
+export NCCL_TIMEOUT=${NCCL_TIMEOUT:-1800}  # 30 minutes timeout (increase if needed)
+# Unset NCCL_DEBUG_SUBSYS to reduce subsystem-specific logging
+unset NCCL_DEBUG_SUBSYS
+
+echo "NCCL Configuration:"
+echo "  NCCL_SOCKET_IFNAME: ${NCCL_SOCKET_IFNAME:-not set}"
+echo "  NCCL_DEBUG: ${NCCL_DEBUG} (disabled)"
+echo "  NCCL_IB_DISABLE: ${NCCL_IB_DISABLE}"
+echo "  NCCL_TIMEOUT: ${NCCL_TIMEOUT}"
+echo ""
+
+# Reduce PyTorch distributed logging (ProcessGroupNCCL warnings come from here)
+export TORCH_DISTRIBUTED_DEBUG=${TORCH_DISTRIBUTED_DEBUG:-OFF}  # Set to OFF to suppress warnings
+unset TORCH_SHOW_CPP_STACKTRACES  # Disable C++ stack traces for cleaner output
+export PYTHON_FAULT_HANDLER=1
+
 # Launch with torchrun
 torchrun \
     --nnodes=${NUM_NODES} \

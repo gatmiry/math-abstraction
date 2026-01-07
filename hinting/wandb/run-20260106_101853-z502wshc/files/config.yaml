@@ -1,0 +1,123 @@
+_wandb:
+    value:
+        cli_version: 0.23.1
+        e:
+            4q01kkxpoby7ncjh5c5k5o251951cwle:
+                codePath: hinting/hinting_grpo.py
+                codePathLocal: hinting_grpo.py
+                cpu_count: 96
+                cpu_count_logical: 192
+                cudaVersion: "12.8"
+                disk:
+                    /:
+                        total: "30396777496576"
+                        used: "504330797056"
+                email: khashayargatmiry@gmail.com
+                executable: /mnt/task_runtime/myenv/bin/python
+                git:
+                    commit: a46b3054b8d8ec0886a1e100d3956f77f126b700
+                    remote: https://github.com/gatmiry/math-abstraction.git
+                gpu: NVIDIA H100 80GB HBM3
+                gpu_count: 8
+                gpu_nvidia:
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-f145468c-f01f-a326-5144-fc18c842337f
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-fb76c35a-9f89-1e54-d95c-bb0b3ae04008
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-045a38c3-48a5-6af7-d825-22dc68842eba
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-93b59576-eb3b-4c9b-88f6-ca39f407d986
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-2bdd0b88-bff2-1868-46ca-f1dd3d60a151
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-e18b0c08-3194-2d07-7bf5-79e0754fbdd2
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-cbabdb7e-5960-342f-417c-25b3b4c917f8
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-8c8c5d53-4397-fcaf-94eb-6d20a8f63ceb
+                host: bolt-hi8r5hv49p-6ybs4a7g4z
+                memory:
+                    total: "2147441168384"
+                os: Linux-6.1.134-152.225.amzn2023.x86_64-x86_64-with-glibc2.35
+                program: /mnt/task_runtime/hinting/hinting_grpo.py
+                python: CPython 3.12.5
+                root: /mnt/task_runtime/hinting
+                startedAt: "2026-01-06T18:18:53.784971Z"
+                writerId: 4q01kkxpoby7ncjh5c5k5o251951cwle
+        m: []
+        python_version: 3.12.5
+        t:
+            "1":
+                - 1
+                - 11
+                - 41
+                - 49
+                - 51
+                - 71
+                - 84
+                - 95
+            "2":
+                - 1
+                - 11
+                - 41
+                - 49
+                - 51
+                - 71
+                - 84
+                - 95
+            "3":
+                - 13
+                - 15
+                - 16
+            "4": 3.12.5
+            "5": 0.23.1
+            "6": 4.57.3
+            "12": 0.23.1
+            "13": linux-x86_64
+dataset:
+    value: ../newopenaioutputs/hints_dataset
+generation_batch_size:
+    value: 16
+gpus_per_node:
+    value: 8
+gradient_accumulation_steps:
+    value: 8
+learning_rate:
+    value: 1e-06
+max_completion_length:
+    value: 1536
+model:
+    value: Qwen/Qwen2-Math-7B-Instruct
+num_generations:
+    value: 2
+num_nodes:
+    value: 2
+per_device_train_batch_size:
+    value: 1
+world_size:
+    value: 16
