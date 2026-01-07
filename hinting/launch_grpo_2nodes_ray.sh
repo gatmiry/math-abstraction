@@ -1,24 +1,22 @@
 #!/bin/bash
-# Launch script for GRPO training with verl and Ray on 2 nodes, each with 8 H100 GPUs
+# Launch script for GRPO training with verl on an existing Ray cluster
 # 
 # USAGE:
-#   On Node 0 (head node):
-#     export RAY_HEAD_IP="<node0_ip>"
-#     export RAY_HEAD_PORT="10001"
+#   Ensure Ray cluster is already running (check with: ray status)
+#   Then simply run:
 #     bash launch_grpo_2nodes_ray.sh
 #
-#   On Node 1 (worker node):
-#     export RAY_HEAD_IP="<node0_ip>"  # Same as Node 0!
-#     export RAY_HEAD_PORT="10001"
-#     bash launch_grpo_2nodes_ray.sh worker
-#
-# See verl documentation for Ray cluster setup details
+# Prerequisites:
+#   - Ray cluster must be running with 2 nodes, 16 GPUs total
+#   - verl and ray packages must be installed
 
-# Configuration
-NUM_NODES=2
-GPUS_PER_NODE=8
-RAY_HEAD_IP="${RAY_HEAD_IP:-localhost}"  # MUST be set to Node 0's IP address
-RAY_HEAD_PORT="${RAY_HEAD_PORT:-10001}"
+set -e
+
+# Disable Ray dashboard to avoid opentelemetry conflicts with vLLM 0.8.5
+export RAY_DISABLE_DASHBOARD=1
+
+# vLLM 0.8.5 V1 engine works fine, but keep this for compatibility
+export VLLM_USE_V1=0
 
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,50 +36,19 @@ if ! python -c "import ray" 2>/dev/null; then
     exit 1
 fi
 
-# Determine if this is the head node or worker node
-NODE_TYPE="${1:-head}"
+# Check Ray cluster status
+echo "Checking Ray cluster status..."
+AVAILABLE_GPUS=$(python -c "import ray; ray.init(address='auto', ignore_reinit_error=True); print(int(ray.cluster_resources().get('GPU', 0)))" 2>/dev/null)
 
-if [ "$NODE_TYPE" == "head" ]; then
-    echo "Starting Ray head node..."
-    echo "Ray head IP: $RAY_HEAD_IP"
-    echo "Ray head port: $RAY_HEAD_PORT"
-    
-    # Start Ray head node
-    ray start --head \
-        --node-ip-address="$RAY_HEAD_IP" \
-        --port="$RAY_HEAD_PORT" \
-        --num-gpus="$GPUS_PER_NODE" \
-        --dashboard-host=0.0.0.0
-    
-    echo "Ray head node started. Waiting for workers to connect..."
-    echo "Run this script with 'worker' argument on other nodes:"
-    echo "  bash launch_grpo_2nodes_ray.sh worker"
-    
-    # Run the training script
-    echo "Starting training..."
-    python "$PYTHON_SCRIPT"
-    
-elif [ "$NODE_TYPE" == "worker" ]; then
-    echo "Starting Ray worker node..."
-    echo "Connecting to Ray head at: $RAY_HEAD_IP:$RAY_HEAD_PORT"
-    
-    # Start Ray worker node
-    ray start --address="$RAY_HEAD_IP:$RAY_HEAD_PORT" \
-        --num-gpus="$GPUS_PER_NODE"
-    
-    echo "Ray worker node started and connected to head."
-    echo "Worker will participate in training automatically."
-    
-    # Keep the worker running
-    echo "Worker node is running. Press Ctrl+C to stop."
-    while true; do
-        sleep 10
-    done
-else
-    echo "ERROR: Invalid node type: $NODE_TYPE"
-    echo "Usage:"
-    echo "  Head node: bash launch_grpo_2nodes_ray.sh"
-    echo "  Worker node: bash launch_grpo_2nodes_ray.sh worker"
+if [ -z "$AVAILABLE_GPUS" ] || [ "$AVAILABLE_GPUS" -eq 0 ]; then
+    echo "ERROR: No GPUs available in Ray cluster"
+    echo "Please ensure Ray cluster is running: ray status"
     exit 1
 fi
+
+echo "Ray cluster connected: $AVAILABLE_GPUS GPUs available"
+
+# Run the training script
+echo "Starting GRPO training..."
+python "$PYTHON_SCRIPT"
 

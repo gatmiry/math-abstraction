@@ -1,0 +1,53 @@
+ # Option A: Install prebuilt wheel (if available for your CUDA/torch)
+   pip install flash-attn --no-build-isolation
+   
+   # Option B: Skip it and disable in training (use eager attention)
+   # The training will fall back to eager attention if flash-attn isn't available
+
+pip install flash-attn --no-build-isolation --no-cache-dir
+
+
+
+
+
+   # Install PyTorch first (with CUDA support)
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
+
+## compressing flash-attn: actually this is not even needed, the install-node.sh fine will do it!
+cd /mnt/task_runtime/myenv/lib/python3.12/site-packages
+tar czf /mnt/task_runtime/flash_attn_pkg.tar.gz flash_attn flash_attn-*.dist-info flash_attn_2_cuda*.so
+
+## opening and installing on the other node
+source /mnt/task_runtime/menv/bin/activate
+pip uninstall flash_attn flash-attn -y
+SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
+cd "$SITE_PACKAGES"
+tar xzf /mnt/task_runtime/flash_attn-2.8.3-py312-cu124.tar.gz
+python -c "from flash_attn.bert_padding import unpad_input; print('SUCCESS')"
+
+
+
+
+
+
+## on head node
+# Find your network interface
+ip addr | grep -E "^[0-9]:" | awk '{print $2}' | tr -d ':'
+
+# Set the interface (usually eth0, ens, or similar - NOT lo)
+export GLOO_SOCKET_IFNAME=eth0
+export NCCL_SOCKET_IFNAME=eth0
+
+# Restart Ray
+ray stop
+RAY_DISABLE_DASHBOARD=1 ray start --head --num-gpus=8
+
+
+
+## on worker node:
+export GLOO_SOCKET_IFNAME=eth0
+export NCCL_SOCKET_IFNAME=eth0
+
+ray stop
+RAY_DISABLE_DASHBOARD=1 ray start --address='<HEAD_IP>:6379' --num-gpus=8

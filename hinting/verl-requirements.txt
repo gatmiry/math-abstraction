@@ -1,0 +1,53 @@
+# Working verl + vLLM + Ray requirements for PPO/GRPO training
+# Tested on: 2026-01-07
+# 
+# For EXACT versions, use: pip install -r verl-requirements-frozen.txt
+# This file contains the key packages. Use frozen file to avoid incompatibilities.
+#
+# Note: Run with RAY_DISABLE_DASHBOARD=1 to avoid opentelemetry conflicts
+
+# Core RL training
+verl==0.4.1
+vllm==0.8.5.post1
+trl==0.26.2
+
+# PyTorch stack (note: +default suffix may vary by system)
+torch==2.6.0
+torchaudio==2.6.0
+torchvision==0.21.0
+
+# Flash Attention
+flash_attn==2.8.3
+flashinfer-python==0.5.2
+
+# Transformers ecosystem
+transformers==4.57.3
+accelerate==1.12.0
+peft==0.18.0
+datasets==4.4.2
+tokenizers==0.22.1
+safetensors==0.7.0
+
+# Ray (for distributed training)
+ray==2.53.0
+
+# Config management
+hydra-core>=1.3.0
+omegaconf==2.3.0
+
+# Data processing
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.16.3
+
+# OpenTelemetry (specific versions for Ray 2.53 compatibility)
+opentelemetry-api==1.39.1
+opentelemetry-sdk==1.39.1
+opentelemetry-semantic-conventions==0.60b1
+opentelemetry-exporter-otlp==1.26.0
+
+# Other
+sentencepiece==0.2.1
+protobuf==4.25.8
+regex==2025.11.3
+bitsandbytes==0.49.0

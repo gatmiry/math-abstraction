@@ -237,8 +237,8 @@ def main():
     output_jsonl_path = "newopenaioutputs/cut_proofs.jsonl"
     output_dataset_path = "newopenaioutputs/cut_proofs_dataset"
     dataset_split = "test"  # 'train', 'test', etc.
-    max_data_n = 2  # Set to a number to limit processing (e.g., 100)
-    num_processes = 2  # Set to a number or None for CPU count
+    max_data_n = None  # Set to a number to limit processing (e.g., 100)
+    num_processes = 50  # Set to a number or None for CPU count
     
     generate_cut_proofs(
         output_jsonl_path=output_jsonl_path,

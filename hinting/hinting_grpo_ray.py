@@ -2,21 +2,33 @@
 """
 GRPO training script for Omni-MATH dataset using verl with Ray for distributed training.
 Configured for 2 nodes, each with 8 H100 GPUs (16 GPUs total).
-Uses Ray instead of torchrun for distributed training.
+Uses Hydra to properly load verl's default configs and override specific values.
 """
 
 import os
+
+# vLLM 0.8.5 V1 engine works fine, but keep this for compatibility with older versions
+os.environ.setdefault("VLLM_USE_V1", "0")
+
 import re
+import sys
 import ray
-from omegaconf import OmegaConf, DictConfig
+import tempfile
+import datetime
+import pandas as pd
+from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 from datasets import load_from_disk
 from typing import List, Dict, Optional, Any
-import datetime
-
-# Import verl components
-from verl.trainer.main_ppo import run_ppo
-from verl.trainer.config import AlgoConfig
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
+# Ensure Ray runtime_env carries necessary env vars
+try:
+    from verl.trainer.constants_ppo import PPO_RAY_RUNTIME_ENV
+    PPO_RAY_RUNTIME_ENV.setdefault("env_vars", {})
+    PPO_RAY_RUNTIME_ENV["env_vars"]["VLLM_USE_V1"] = "0"
+except ImportError:
+    pass  # verl 0.4.x may not have this
 
 # Configuration
 MODEL_PATH = "Qwen/Qwen2-Math-7B-Instruct"
@@ -62,46 +74,39 @@ def normalize_answer(answer: str) -> str:
 
 
 def compute_score(
-    data_sources: List[str],
-    solution_strs: List[str],
-    ground_truths: List[Optional[str]],
-    extra_infos: List[Dict[str, Any]],
+    data_source: str = None,
+    solution_str: str = None,
+    ground_truth: str = None,
+    extra_info: Dict[str, Any] = None,
     **kwargs
-) -> List[float]:
-    """Compute reward scores for a batch of solutions.
+) -> float:
+    """Compute reward score for a single solution (verl 0.4.1 format).
     
-    This function is used by verl's BatchRewardManager.
+    This function is called by verl's NaiveRewardManager for each sample.
     
     Args:
-        data_sources: List of data source identifiers (not used here)
-        solution_strs: List of generated solution strings
-        ground_truths: List of ground truth answers (from dataset)
-        extra_infos: List of extra info dictionaries
+        data_source: Data source identifier (not used here)
+        solution_str: Generated solution string
+        ground_truth: Ground truth answer (from dataset)
+        extra_info: Extra info dictionary
         **kwargs: Additional keyword arguments
     
     Returns:
-        List of reward scores (1.0 if answer matches, 0.0 otherwise)
+        Reward score (1.0 if answer matches, 0.0 otherwise)
     """
-    rewards = []
+    if ground_truth is None:
+        return 0.0
     
-    for i, (solution_str, ground_truth) in enumerate(zip(solution_strs, ground_truths)):
-        if ground_truth is None:
-            rewards.append(0.0)
-            continue
-        
-        # Extract boxed answer from solution
-        boxed_answer = extract_boxed_answer(solution_str)
-        boxed_normalized = normalize_answer(boxed_answer)
-        answer_normalized = normalize_answer(ground_truth)
-        
-        # Compare normalized answers
-        if boxed_normalized and answer_normalized and boxed_normalized == answer_normalized:
-            rewards.append(1.0)
-        else:
-            rewards.append(0.0)
+    # Extract boxed answer from solution
+    boxed_answer = extract_boxed_answer(solution_str)
+    boxed_normalized = normalize_answer(boxed_answer)
+    answer_normalized = normalize_answer(ground_truth)
     
-    print(f"[REWARD] Computed rewards for {len(rewards)} solutions: {sum(rewards)}/{len(rewards)} correct")
-    return rewards
+    # Compare normalized answers
+    if boxed_normalized and answer_normalized and boxed_normalized == answer_normalized:
+        return 1.0
+    else:
+        return 0.0
 
 
 def format_prompt(problem: str, partial_proof: str) -> List[Dict[str, str]]:
@@ -185,165 +190,6 @@ Take the limit as \\(h \\to 0\\):
     return messages
 
 
-def create_verl_config() -> DictConfig:
-    """Create verl configuration for GRPO training.
-    
-    Returns:
-        OmegaConf DictConfig with verl training configuration
-    """
-    # Base config structure matching verl's ppo_trainer.yaml
-    config_dict = {
-        # Actor, rollout, and reference model config
-        "actor_rollout_ref": {
-            "hybrid_engine": True,
-            "nccl_timeout": 600,
-            "rollout": {
-                "_target_": "verl.workers.config.RolloutConfig",
-                "name": "vllm",  # Rollout engine: hf, vllm, or sglang
-                "n": 4,  # Number of generations per prompt (>1 for GRPO)
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "top_k": -1,
-                "do_sample": True,
-                "prompt_length": 2048,
-                "response_length": 1536,
-                "dtype": "bfloat16",
-                "gpu_memory_utilization": 0.5,
-                "tensor_model_parallel_size": 1,
-                "layered_summon": False,
-            },
-            "actor": {
-                "_target_": "verl.workers.config.FSDPActorConfig",
-                "strategy": "fsdp",
-                "rollout_n": 4,  # Must match rollout.n - number of generations per prompt
-                "use_kl_loss": False,  # Set to False for GRPO (we use use_kl_in_reward instead)
-                "use_dynamic_bsz": False,  # Whether to auto-adjust batch size
-                "ppo_mini_batch_size": 16,  # Must be <= train_batch_size
-                "ppo_micro_batch_size": None,
-                "ppo_micro_batch_size_per_gpu": 4,  # Required when use_dynamic_bsz is False
-                "ppo_max_token_len_per_gpu": 16384,
-                "clip_ratio": 0.2,
-                "entropy_coeff": 0,
-                "ppo_epochs": 1,
-                "shuffle": False,
-            },
-            "model": {
-                "_target_": "verl.workers.config.HFModelConfig",
-                "path": MODEL_PATH,
-                "trust_remote_code": True,
-            },
-        },
-        # Algorithm config - GRPO
-        "algorithm": {
-            "_target_": "verl.trainer.config.AlgoConfig",
-            "gamma": 1.0,
-            "lam": 1.0,
-            "adv_estimator": "grpo",  # Use GRPO advantage estimator
-            "norm_adv_by_std_in_grpo": True,
-            "use_kl_in_reward": False,
-            "kl_penalty": "kl",
-            "kl_ctrl": {
-                "_target_": "verl.trainer.config.KLControlConfig",
-                "type": "fixed",
-                "kl_coef": 0.001,
-                "horizon": 10000,
-                "target_kl": 0.1,
-            },
-            "use_pf_ppo": False,
-        },
-        # Trainer config
-        "trainer": {
-            "balance_batch": True,
-            "total_epochs": 1,
-            "total_training_steps": None,
-            "project_name": "grpo-omni-math",
-            "experiment_name": f"grpo_omni_math_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            "logger": ["console", "wandb"],
-            "log_val_generations": 0,
-            "rollout_data_dir": None,
-            "validation_data_dir": None,
-            "nnodes": NUM_NODES,
-            "n_gpus_per_node": GPUS_PER_NODE,
-            "save_freq": 500,
-            "esi_redundant_time": 0,
-            "resume_mode": "auto",
-            "resume_from_path": None,
-            "val_before_train": True,
-            "val_only": False,
-            "test_freq": -1,
-            "critic_warmup": 0,
-            "default_hdfs_dir": None,
-            "del_local_ckpt_after_load": False,
-            "default_local_dir": OUTPUT_DIR,
-            "max_actor_ckpt_to_keep": None,
-            "max_critic_ckpt_to_keep": None,
-            "ray_wait_register_center_timeout": 300,
-            "device": "cuda",
-            "use_legacy_worker_impl": "auto",
-        },
-        # Data config
-        "data": {
-            "_target_": "verl.trainer.config.data.legacy_data.LegacyDataConfig",
-            "reward_fn_key": "data_source",
-            # Dataset paths will be set dynamically
-        },
-        # Critic config
-        "critic": {
-            "_target_": "verl.trainer.config.critic.dp_critic.DPCriticConfig",
-            "enable": None,  # None = auto-detect (enabled for GAE, disabled for GRPO)
-            "strategy": "fsdp",
-            "model": {
-                "_target_": "verl.trainer.config.model.hf_model.HFModelConfig",
-                "model_path": MODEL_PATH,
-                "trust_remote_code": True,
-            },
-        },
-        # Reward model config (using custom reward function)
-        "reward_model": {
-            "_target_": "verl.trainer.config.reward_model.dp_reward_loop.DPRewardLoopConfig",
-            "enable": True,
-            "strategy": "fsdp",
-            "enable_resource_pool": False,
-            "nnodes": 0,
-            "n_gpus_per_node": 0,
-        },
-        # Custom reward function
-        "custom_reward_function": {
-            "path": __file__,  # This file
-            "name": "compute_score",  # Function name
-            "reward_kwargs": {},
-        },
-        # Ray config
-        "ray_kwargs": {
-            "ray_init": {
-                "num_cpus": None,  # Auto-detect
-                "runtime_env": {
-                    "env_vars": {
-                        "TOKENIZERS_PARALLELISM": "false",
-                        "NCCL_DEBUG": "WARN",
-                        "NCCL_TIMEOUT": "7200",
-                    }
-                }
-            },
-            "timeline_json_file": None,
-        },
-        # Profiler config
-        "global_profiler": {
-            "_target_": "verl.utils.profiler.ProfilerConfig",
-            "tool": None,
-            "steps": None,
-            "profile_continuous_steps": False,
-            "save_path": "outputs/profile",
-        },
-        # Transfer queue config
-        "transfer_queue": {
-            "enable": False,
-        },
-    }
-    
-    return OmegaConf.create(config_dict)
-
-
 def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None):
     """Create RL dataset in verl format.
     
@@ -355,10 +201,12 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
     Returns:
         List of data items in verl format
     """
+    import json
+    
     # Load dataset
     dataset = load_from_disk(dataset_path)
     
-    # Format dataset
+    # Format dataset - store messages as JSON for verl to parse
     def format_dataset(examples):
         """Format dataset examples for GRPO training."""
         prompts = []
@@ -367,13 +215,9 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
             examples['problem'], examples['partial_proof'], examples['final_answer']
         ):
             if final_answer:  # Only include if final answer exists
+                # Store messages as list of dicts - verl will apply chat template
                 messages = format_prompt(problem, partial_proof)
-                prompt = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-                prompts.append(prompt)
+                prompts.append(messages)  # Store raw messages, not formatted string
                 answers.append(final_answer)
         
         return {"prompt": prompts, "answer": answers}
@@ -396,16 +240,26 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
         print(f"[INFO] Limited dataset from {original_size} to {len(formatted_dataset)} rows (using last {max_samples} rows)")
     
     # Convert to verl format
-    # verl expects data in a specific format with prompts and ground_truths
+    # verl expects ground_truth nested under reward_model
     rl_data = []
     for item in formatted_dataset:
         rl_data.append({
-            "prompt": item["prompt"],
-            "ground_truth": item["answer"],
+            "prompt": item["prompt"],  # List of message dicts with 'role' and 'content'
+            "reward_model": {
+                "ground_truth": item["answer"],
+            },
             "data_source": "omni_math",  # Identifier for reward function
         })
     
     return rl_data
+
+
+def get_verl_config_path():
+    """Get path to verl's config directory."""
+    import verl
+    verl_path = os.path.dirname(verl.__file__)
+    config_path = os.path.join(verl_path, "trainer", "config")
+    return config_path
 
 
 def main():
@@ -435,41 +289,114 @@ def main():
     rl_data = create_rl_dataset(tokenizer, DATASET_NAME, max_samples=MAX_NUM)
     print(f"Created {len(rl_data)} training samples")
     
-    # Create verl config
-    print("Creating verl configuration...")
-    config = create_verl_config()
-    
-    # Set dataset in config
-    # verl expects parquet files for data
-    # We'll need to convert the dataset to parquet format
-    import tempfile
-    import pandas as pd
-    
-    # Convert to DataFrame and save as parquet
+    # Save dataset to parquet file
+    print("Saving dataset to parquet...")
     df_data = pd.DataFrame(rl_data)
-    with tempfile.NamedTemporaryFile(mode='wb', suffix='.parquet', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode='wb', suffix='.parquet', delete=False, dir='/mnt/tmp') as f:
         df_data.to_parquet(f.name, index=False)
         dataset_file = f.name
+    print(f"Dataset saved to {dataset_file}")
     
-    config.data.train_files = dataset_file
-    config.data.val_files = None  # No validation for now
-    config.data.prompt_key = "prompt"
-    config.data.max_prompt_length = 2048
-    config.data.max_response_length = 1536
-    config.data.train_batch_size = 16  # Adjust based on GPU memory
+    # Load verl's default config using Hydra
+    print("Loading verl configuration with Hydra...")
+    config_path = get_verl_config_path()
     
-    # Initialize Ray if not already initialized
-    if not ray.is_initialized():
-        print("Initializing Ray...")
-        ray.init(
-            **OmegaConf.to_container(config.ray_kwargs.ray_init)
-        )
-        print("Ray initialized successfully")
+    # Clear any previous Hydra instance
+    GlobalHydra.instance().clear()
+    
+    # Initialize Hydra with verl's config directory
+    initialize_config_dir(config_dir=config_path, version_base=None)
+    
+    # Compose the config with our overrides
+    experiment_name = f"grpo_omni_math_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    # Use Hydra's compose to load defaults and apply overrides
+    overrides = [
+        # Model path
+        f"actor_rollout_ref.model.path={MODEL_PATH}",
+        "actor_rollout_ref.model.trust_remote_code=true",
+        
+        # Rollout config for GRPO - using vLLM
+        "actor_rollout_ref.rollout.name=vllm",
+        "actor_rollout_ref.rollout.n=4",  # Multiple generations for GRPO
+        "actor_rollout_ref.rollout.temperature=1.0",
+        "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",
+        "actor_rollout_ref.rollout.prompt_length=2048",
+        "actor_rollout_ref.rollout.response_length=1536",
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.rollout.load_format=auto",
+        "actor_rollout_ref.rollout.enforce_eager=true",
+        
+        # Ray cluster config - connect to existing cluster
+        "++ray_kwargs.ray_init.address=auto",
+        
+        # Actor config
+        "actor_rollout_ref.actor.ppo_mini_batch_size=16",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.actor.ppo_epochs=1",
+        
+        # Algorithm - GRPO
+        "algorithm.adv_estimator=grpo",
+        "algorithm.use_kl_in_reward=false",
+        "algorithm.norm_adv_by_std_in_grpo=true",
+        
+        # Data config
+        f"data.train_files={dataset_file}",
+        f"data.val_files={dataset_file}",  # Use same file for validation to avoid None error
+        "data.prompt_key=prompt",
+        "data.max_prompt_length=2048",
+        "data.max_response_length=1536",
+        "data.train_batch_size=16",
+        "data.val_batch_size=16",
+        
+        # Trainer config
+        f"trainer.project_name=grpo-omni-math",
+        f"trainer.experiment_name={experiment_name}",
+        f"trainer.nnodes={NUM_NODES}",
+        f"trainer.n_gpus_per_node={GPUS_PER_NODE}",
+        f"trainer.default_local_dir={OUTPUT_DIR}",
+        "trainer.total_epochs=1",
+        "trainer.save_freq=500",
+        "trainer.val_before_train=false",  # Skip validation for now
+        
+        # Custom reward function (use ++ to add or override)
+        f"++custom_reward_function.path={__file__}",
+        "++custom_reward_function.name=compute_score",
+        
+        # Disable reward model loop (use custom function)
+        "++reward_model.enable=false",
+        
+        # Disable critic (not needed for GRPO)
+        "++critic.enable=false",
+    ]
+    
+    try:
+        config = compose(config_name="ppo_trainer", overrides=overrides)
+    except Exception as e:
+        print(f"Error composing config: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+    
+    print("Configuration loaded successfully")
+    print(f"Config summary:")
+    print(f"  - Model: {config.actor_rollout_ref.model.path}")
+    print(f"  - Adv estimator: {config.algorithm.adv_estimator}")
+    print(f"  - Train batch size: {config.data.train_batch_size}")
+    print(f"  - Nodes: {config.trainer.nnodes}, GPUs/node: {config.trainer.n_gpus_per_node}")
+    
+    # Note: Ray will be initialized by verl's run_ppo with proper config
+    # including address='auto' and VLLM_USE_V1=0 in runtime_env
+    
+    # Import run_ppo here to avoid import issues
+    from verl.trainer.main_ppo import run_ppo
     
     # Run PPO training
     print("Starting GRPO training with verl...")
     try:
         run_ppo(config)
+        print("Training completed successfully!")
     except Exception as e:
         print(f"Error during training: {e}")
         import traceback
@@ -479,8 +406,8 @@ def main():
         # Cleanup
         if os.path.exists(dataset_file):
             os.unlink(dataset_file)
+            print(f"Cleaned up temporary dataset file: {dataset_file}")
 
 
 if __name__ == "__main__":
     main()
-
