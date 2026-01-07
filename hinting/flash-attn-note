@@ -51,3 +51,5 @@ export NCCL_SOCKET_IFNAME=eth0
 
 ray stop
 RAY_DISABLE_DASHBOARD=1 ray start --address='<HEAD_IP>:6379' --num-gpus=8
+
+## to install flash attention from tar ball, you cand download it from artifacts of task id hi8r5hv49p and put it in wheels folder in hinting, then run install-node-.v2.sh
