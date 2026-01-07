@@ -34,7 +34,7 @@ except ImportError:
 MODEL_PATH = "Qwen/Qwen2-Math-7B-Instruct"
 DATASET_NAME = "../newopenaioutputs/hints_dataset"  # Omni-MATH dataset
 OUTPUT_DIR = "../models/qwen2-math-7b-instruct_grpo_hints_dataset_verl"
-MAX_NUM = 128  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
+MAX_NUM = 512  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
 # Distributed training configuration
 # 2 nodes, 8 GPUs per node = 16 GPUs total
@@ -190,16 +190,17 @@ Take the limit as \\(h \\to 0\\):
     return messages
 
 
-def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None):
-    """Create RL dataset in verl format.
+def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None, train_fraction: float = 0.8):
+    """Create RL dataset in verl format with train/val split.
     
     Args:
         tokenizer: Tokenizer instance
         dataset_path: Path to dataset
         max_samples: Maximum number of samples (None = use all)
+        train_fraction: Fraction of data for training (default 0.8)
     
     Returns:
-        List of data items in verl format
+        Tuple of (train_data, val_data) in verl format
     """
     import json
     
@@ -239,19 +240,33 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
         formatted_dataset = formatted_dataset.select(range(start_idx, len(formatted_dataset)))
         print(f"[INFO] Limited dataset from {original_size} to {len(formatted_dataset)} rows (using last {max_samples} rows)")
     
+    # Split into train and val
+    total_size = len(formatted_dataset)
+    train_size = int(total_size * train_fraction)
+    
+    train_dataset = formatted_dataset.select(range(0, train_size))
+    val_dataset = formatted_dataset.select(range(train_size, total_size))
+    
+    print(f"[INFO] Split dataset: {train_size} train ({train_fraction*100:.0f}%), {total_size - train_size} val ({(1-train_fraction)*100:.0f}%)")
+    
     # Convert to verl format
     # verl expects ground_truth nested under reward_model
-    rl_data = []
-    for item in formatted_dataset:
-        rl_data.append({
-            "prompt": item["prompt"],  # List of message dicts with 'role' and 'content'
-            "reward_model": {
-                "ground_truth": item["answer"],
-            },
-            "data_source": "omni_math",  # Identifier for reward function
-        })
+    def to_verl_format(dataset_split):
+        rl_data = []
+        for item in dataset_split:
+            rl_data.append({
+                "prompt": item["prompt"],  # List of message dicts with 'role' and 'content'
+                "reward_model": {
+                    "ground_truth": item["answer"],
+                },
+                "data_source": "omni_math",  # Identifier for reward function
+            })
+        return rl_data
     
-    return rl_data
+    train_data = to_verl_format(train_dataset)
+    val_data = to_verl_format(val_dataset)
+    
+    return train_data, val_data
 
 
 def get_verl_config_path():
@@ -284,18 +299,25 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Create RL dataset
+    # Create RL dataset with train/val split
     print("Creating RL dataset...")
-    rl_data = create_rl_dataset(tokenizer, DATASET_NAME, max_samples=MAX_NUM)
-    print(f"Created {len(rl_data)} training samples")
+    train_data, val_data = create_rl_dataset(tokenizer, DATASET_NAME, max_samples=MAX_NUM, train_fraction=0.8)
+    print(f"Created {len(train_data)} training samples, {len(val_data)} validation samples")
     
-    # Save dataset to parquet file
-    print("Saving dataset to parquet...")
-    df_data = pd.DataFrame(rl_data)
-    with tempfile.NamedTemporaryFile(mode='wb', suffix='.parquet', delete=False, dir='/mnt/tmp') as f:
-        df_data.to_parquet(f.name, index=False)
-        dataset_file = f.name
-    print(f"Dataset saved to {dataset_file}")
+    # Save train dataset to parquet file
+    print("Saving datasets to parquet...")
+    df_train = pd.DataFrame(train_data)
+    with tempfile.NamedTemporaryFile(mode='wb', suffix='_train.parquet', delete=False, dir='/mnt/tmp') as f:
+        df_train.to_parquet(f.name, index=False)
+        train_dataset_file = f.name
+    print(f"Train dataset saved to {train_dataset_file}")
+    
+    # Save val dataset to parquet file
+    df_val = pd.DataFrame(val_data)
+    with tempfile.NamedTemporaryFile(mode='wb', suffix='_val.parquet', delete=False, dir='/mnt/tmp') as f:
+        df_val.to_parquet(f.name, index=False)
+        val_dataset_file = f.name
+    print(f"Val dataset saved to {val_dataset_file}")
     
     # Load verl's default config using Hydra
     print("Loading verl configuration with Hydra...")
@@ -321,7 +343,7 @@ def main():
         "actor_rollout_ref.rollout.n=4",  # Multiple generations for GRPO
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.8",
         "actor_rollout_ref.rollout.prompt_length=2048",
         "actor_rollout_ref.rollout.response_length=1536",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
@@ -332,7 +354,7 @@ def main():
         "++ray_kwargs.ray_init.address=auto",
         
         # Actor config
-        "actor_rollout_ref.actor.ppo_mini_batch_size=16",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=64",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.actor.ppo_epochs=1",
         
@@ -342,12 +364,12 @@ def main():
         "algorithm.norm_adv_by_std_in_grpo=true",
         
         # Data config
-        f"data.train_files={dataset_file}",
-        f"data.val_files={dataset_file}",  # Use same file for validation to avoid None error
+        f"data.train_files={train_dataset_file}",
+        f"data.val_files={val_dataset_file}",
         "data.prompt_key=prompt",
         "data.max_prompt_length=2048",
         "data.max_response_length=1536",
-        "data.train_batch_size=16",
+        "data.train_batch_size=64",
         "data.val_batch_size=16",
         
         # Trainer config
@@ -358,7 +380,9 @@ def main():
         f"trainer.default_local_dir={OUTPUT_DIR}",
         "trainer.total_epochs=1",
         "trainer.save_freq=500",
-        "trainer.val_before_train=false",  # Skip validation for now
+        "trainer.val_before_train=true",  # Run validation before training
+        "trainer.test_freq=1",  # Validate every N training steps (1 = every step)
+        "trainer.log_val_generations=3",  # Log N validation samples to wandb
         
         # Custom reward function (use ++ to add or override)
         f"++custom_reward_function.path={__file__}",
@@ -404,9 +428,12 @@ def main():
         raise
     finally:
         # Cleanup
-        if os.path.exists(dataset_file):
-            os.unlink(dataset_file)
-            print(f"Cleaned up temporary dataset file: {dataset_file}")
+        if os.path.exists(train_dataset_file):
+            os.unlink(train_dataset_file)
+            print(f"Cleaned up temporary train dataset file: {train_dataset_file}")
+        if os.path.exists(val_dataset_file):
+            os.unlink(val_dataset_file)
+            print(f"Cleaned up temporary val dataset file: {val_dataset_file}")
 
 
 if __name__ == "__main__":
