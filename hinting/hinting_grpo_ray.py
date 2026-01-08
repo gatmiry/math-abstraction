@@ -190,7 +190,7 @@ Take the limit as \\(h \\to 0\\):
     return messages
 
 
-def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None, val_size: int = 64):
+def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None, val_size: int = 64, max_prompt_tokens: int = 2560):
     """Create RL dataset in verl format with train/val split.
     
     Args:
@@ -198,6 +198,7 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
         dataset_path: Path to dataset
         max_samples: Maximum number of samples (None = use all)
         val_size: Number of samples for validation (default 64)
+        max_prompt_tokens: Maximum prompt length in tokens (default 2560)
     
     Returns:
         Tuple of (train_data, val_data) in verl format
@@ -232,6 +233,19 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
     
     # Filter out None answers
     formatted_dataset = formatted_dataset.filter(lambda x: x['answer'] is not None)
+    
+    # Filter out prompts that are too long
+    def is_prompt_short_enough(example):
+        """Check if prompt fits within max_prompt_tokens."""
+        prompt_text = tokenizer.apply_chat_template(example['prompt'], tokenize=False, add_generation_prompt=True)
+        token_count = len(tokenizer.encode(prompt_text))
+        return token_count <= max_prompt_tokens
+    
+    original_count = len(formatted_dataset)
+    formatted_dataset = formatted_dataset.filter(is_prompt_short_enough)
+    filtered_count = original_count - len(formatted_dataset)
+    if filtered_count > 0:
+        print(f"[INFO] Filtered out {filtered_count} samples with prompts > {max_prompt_tokens} tokens")
     
     # Limit dataset to last MAX_NUM rows if specified
     if max_samples is not None and max_samples > 0:
@@ -345,7 +359,7 @@ def main():
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.9",
-        "actor_rollout_ref.rollout.prompt_length=2048",
+        "actor_rollout_ref.rollout.prompt_length=2560",
         "actor_rollout_ref.rollout.response_length=1536",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.rollout.load_format=auto",
@@ -368,7 +382,7 @@ def main():
         f"data.train_files={train_dataset_file}",
         f"data.val_files={val_dataset_file}",
         "data.prompt_key=prompt",
-        "data.max_prompt_length=2048",
+        "data.max_prompt_length=2560",
         "data.max_response_length=1536",
         "data.train_batch_size=64",
         "data.val_batch_size=16",
