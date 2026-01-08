@@ -34,7 +34,7 @@ except ImportError:
 MODEL_PATH = "Qwen/Qwen2-Math-7B-Instruct"
 DATASET_NAME = "../newopenaioutputs/hints_dataset"  # Omni-MATH dataset
 OUTPUT_DIR = "../models/qwen2-math-7b-instruct_grpo_hints_dataset_verl"
-MAX_NUM = 512  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
+MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
 # Distributed training configuration
 # 2 nodes, 8 GPUs per node = 16 GPUs total
@@ -190,14 +190,14 @@ Take the limit as \\(h \\to 0\\):
     return messages
 
 
-def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None, train_fraction: float = 0.8):
+def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None, val_size: int = 64):
     """Create RL dataset in verl format with train/val split.
     
     Args:
         tokenizer: Tokenizer instance
         dataset_path: Path to dataset
         max_samples: Maximum number of samples (None = use all)
-        train_fraction: Fraction of data for training (default 0.8)
+        val_size: Number of samples for validation (default 64)
     
     Returns:
         Tuple of (train_data, val_data) in verl format
@@ -242,12 +242,13 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
     
     # Split into train and val
     total_size = len(formatted_dataset)
-    train_size = int(total_size * train_fraction)
+    val_size_actual = min(val_size, total_size)  # Don't exceed dataset size
+    train_size = total_size - val_size_actual
     
     train_dataset = formatted_dataset.select(range(0, train_size))
     val_dataset = formatted_dataset.select(range(train_size, total_size))
     
-    print(f"[INFO] Split dataset: {train_size} train ({train_fraction*100:.0f}%), {total_size - train_size} val ({(1-train_fraction)*100:.0f}%)")
+    print(f"[INFO] Split dataset: {train_size} train, {val_size_actual} val")
     
     # Convert to verl format
     # verl expects ground_truth nested under reward_model
@@ -301,7 +302,7 @@ def main():
     
     # Create RL dataset with train/val split
     print("Creating RL dataset...")
-    train_data, val_data = create_rl_dataset(tokenizer, DATASET_NAME, max_samples=MAX_NUM, train_fraction=0.8)
+    train_data, val_data = create_rl_dataset(tokenizer, DATASET_NAME, max_samples=MAX_NUM, val_size=64)  # 64 samples for validation
     print(f"Created {len(train_data)} training samples, {len(val_data)} validation samples")
     
     # Save train dataset to parquet file
@@ -343,7 +344,7 @@ def main():
         "actor_rollout_ref.rollout.n=4",  # Multiple generations for GRPO
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.8",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.9",
         "actor_rollout_ref.rollout.prompt_length=2048",
         "actor_rollout_ref.rollout.response_length=1536",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
@@ -379,9 +380,9 @@ def main():
         f"trainer.n_gpus_per_node={GPUS_PER_NODE}",
         f"trainer.default_local_dir={OUTPUT_DIR}",
         "trainer.total_epochs=1",
-        "trainer.save_freq=500",
-        "trainer.val_before_train=true",  # Run validation before training
-        "trainer.test_freq=1",  # Validate every N training steps (1 = every step)
+        "trainer.save_freq=500",  # Effectively disable checkpointing (no shared filesystem)
+        "trainer.val_before_train=false",  # Skip validation before training (too slow)
+        "trainer.test_freq=50",  # Validate every 50 training steps
         "trainer.log_val_generations=3",  # Log N validation samples to wandb
         
         # Custom reward function (use ++ to add or override)
