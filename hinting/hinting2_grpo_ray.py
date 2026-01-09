@@ -10,25 +10,33 @@ import os
 # vLLM 0.8.5 V1 engine works fine, but keep this for compatibility with older versions
 os.environ.setdefault("VLLM_USE_V1", "0")
 
-# HuggingFace token file path (not tracked by git)
-HF_TOKEN_FILE = os.path.join(os.path.dirname(__file__), "hf_token.txt")
+# Token file path (not tracked by git)
+TOKEN_FILE = os.path.join(os.path.dirname(__file__), "hf_token.txt")
 
 
-def login_huggingface():
-    """Login to HuggingFace using token from file."""
-    if not os.path.exists(HF_TOKEN_FILE):
-        print(f"[WARNING] HF token file not found: {HF_TOKEN_FILE}")
-        print("Create it with your HuggingFace token to download gated models.")
+def load_tokens():
+    """Load tokens from file. Format: KEY=VALUE per line."""
+    tokens = {}
+    if not os.path.exists(TOKEN_FILE):
+        print(f"[WARNING] Token file not found: {TOKEN_FILE}")
+        return tokens
+    
+    with open(TOKEN_FILE, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                tokens[key.strip()] = value.strip()
+    
+    return tokens
+
+
+def login_huggingface(tokens):
+    """Login to HuggingFace using token from dict."""
+    token = tokens.get('HF_TOKEN')
+    if not token:
+        print("[WARNING] HF_TOKEN not found in token file")
         return False
-    
-    with open(HF_TOKEN_FILE, 'r') as f:
-        lines = [line.strip() for line in f.readlines() if line.strip() and not line.startswith('#')]
-    
-    if not lines:
-        print(f"[WARNING] No token found in {HF_TOKEN_FILE}")
-        return False
-    
-    token = lines[0]
     
     # Set environment variable for transformers/datasets
     os.environ["HF_TOKEN"] = token
@@ -41,6 +49,26 @@ def login_huggingface():
         return True
     except Exception as e:
         print(f"[WARNING] HuggingFace login failed: {e}")
+        return False
+
+
+def login_wandb(tokens):
+    """Login to Weights & Biases using API key from dict."""
+    api_key = tokens.get('WANDB_API_KEY')
+    if not api_key or api_key == 'YOUR_WANDB_API_KEY_HERE':
+        print("[WARNING] WANDB_API_KEY not configured in token file")
+        return False
+    
+    # Set environment variable for wandb
+    os.environ["WANDB_API_KEY"] = api_key
+    
+    try:
+        import wandb
+        wandb.login(key=api_key, relogin=True)
+        print("[INFO] Successfully logged in to Wandb")
+        return True
+    except Exception as e:
+        print(f"[WARNING] Wandb login failed: {e}")
         return False
 
 # NCCL P2P workaround for hardware issues with NVLink
@@ -78,7 +106,7 @@ MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Usef
 
 # Distributed training configuration
 # 2 nodes, 8 GPUs per node = 16 GPUs total
-NUM_NODES = 1  # Changed from 2 due to NCCL P2P hardware issue on worker node
+NUM_NODES = 2
 GPUS_PER_NODE = 8
 
 
@@ -356,8 +384,10 @@ def main():
     print(f"Nodes: {NUM_NODES}, GPUs per node: {GPUS_PER_NODE}")
     print("=" * 80)
     
-    # Login to HuggingFace (for gated models)
-    login_huggingface()
+    # Load tokens and login to services
+    tokens = load_tokens()
+    login_huggingface(tokens)
+    login_wandb(tokens)
     
     # Load tokenizer
     print("Loading tokenizer...")
@@ -425,7 +455,7 @@ def main():
         "++ray_kwargs.ray_init.address=auto",
         
         # Actor config
-        "actor_rollout_ref.actor.ppo_mini_batch_size=32",  # Reduced for single node
+        "actor_rollout_ref.actor.ppo_mini_batch_size=64",  # 2 nodes x 8 GPUs
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.actor.ppo_epochs=1",
         
@@ -440,8 +470,8 @@ def main():
         "data.prompt_key=prompt",
         "data.max_prompt_length=2560",
         "data.max_response_length=1536",
-        "data.train_batch_size=32",  # Reduced for single node (8 GPUs)
-        "data.val_batch_size=16",
+        "data.train_batch_size=64",  # 2 nodes x 8 GPUs = 16 GPUs
+        "data.val_batch_size=32",
         
         # Trainer config
         f"trainer.project_name=grpo-omni-math",
