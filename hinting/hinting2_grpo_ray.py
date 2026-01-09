@@ -6,12 +6,67 @@ Uses Hydra to properly load verl's default configs and override specific values.
 """
 
 import os
+import apple_bolt as bolt
 
 # vLLM 0.8.5 V1 engine works fine, but keep this for compatibility with older versions
 os.environ.setdefault("VLLM_USE_V1", "0")
 
+# Tell wandb to save code with each run
+os.environ["WANDB_SAVE_CODE"] = "true"
+
 # Token file path (not tracked by git)
 TOKEN_FILE = os.path.join(os.path.dirname(__file__), "hf_token.txt")
+
+# System prompt file path
+SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
+
+# Which system prompt to use (from system_prompt.txt)
+SYSTEM_PROMPT_NAME = "default"
+
+HINT_LEVEL = 0
+
+def load_system_prompt(name: str = None):
+    """Load a named system prompt from file.
+    
+    File format: Multiple prompts separated by ===PROMPT: name=== headers.
+    
+    Args:
+        name: Name of the prompt to load. If None, uses SYSTEM_PROMPT_NAME.
+    
+    Returns:
+        The system prompt string.
+    """
+    if name is None:
+        name = SYSTEM_PROMPT_NAME
+    
+    with open(SYSTEM_PROMPT_FILE, 'r') as f:
+        content = f.read()
+    
+    # Parse prompts from file
+    prompts = {}
+    current_name = None
+    current_lines = []
+    
+    for line in content.split('\n'):
+        if line.startswith('===PROMPT:') and line.endswith('==='):
+            # Save previous prompt if exists
+            if current_name is not None:
+                prompts[current_name] = '\n'.join(current_lines).strip()
+            # Start new prompt
+            current_name = line[10:-3].strip()
+            current_lines = []
+        else:
+            current_lines.append(line)
+    
+    # Save last prompt
+    if current_name is not None:
+        prompts[current_name] = '\n'.join(current_lines).strip()
+    
+    if name not in prompts:
+        available = list(prompts.keys())
+        raise ValueError(f"System prompt '{name}' not found. Available: {available}")
+    
+    return prompts[name]
 
 
 def load_tokens():
@@ -101,12 +156,11 @@ except ImportError:
 # Configuration
 MODEL_PATH = "Qwen/Qwen2-Math-7B-Instruct"
 DATASET_NAME = "../newopenaioutputs/hints_dataset"  # Omni-MATH dataset
-OUTPUT_DIR = "../models/qwen2-math-7b-instruct_grpo_hints_dataset_verl"
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
 # Distributed training configuration
 # 2 nodes, 8 GPUs per node = 16 GPUs total
-NUM_NODES = 2
+NUM_NODES = 1
 GPUS_PER_NODE = 8
 
 
@@ -177,81 +231,40 @@ def compute_score(
         return 0.0
 
 
-def format_prompt(problem: str, partial_proof: str, hint: str) -> List[Dict[str, str]]:
-    messages = [
-        {
-            "role": "system",
-            "content":"""You are learning to solve mathematics problems. You will be given a math problem, a partial proof or solution, and a hint. Your task is to carefully complete the proof or solution, step by step, providing clear reasoning at each stage (do not skip steps), making appropriate use of the hint. Only after finishing the complete reasoning, write the final answer at the end, clearly enclosed in the \box{...} environment as is standard in LaTeX. 
+def format_prompt(problem: str, partial_proof: str, hint: str = None, system_prompt: str = None) -> List[Dict[str, str]]:
+    if system_prompt is None:
+        if hint:
+            system_prompt = load_system_prompt('default')
+        else:
+            system_prompt = load_system_prompt('onlypartialproof')
 
-- For each step, show the logical process and all intermediate computations or deductions.
-- Use the provided hint as needed to help guide your reasoning.
-- Only after reasoning is finished, put the final answer at the end, in its own line, using \box{...}
-- Use plain text with embedded LaTeX where mathematical symbols or equations are necessary.
+    if hint:
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": f"Problem: {problem}\n\nPartial proof: {partial_proof}\n\nHint: {hint}"
+            }
+        ]
+        return messages
+    
+    else:
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": f"Problem: {problem}\n\nPartial proof: {partial_proof}"
+            }
+        ]
+        return messages
 
-## Output Format
-
-Present your solution as a well-formatted, step-by-step proof or solution in plain text (not as a code block). Mathematical expressions and the boxed answer should use proper LaTeX syntax, e.g. \box{42}. 
-
-## Example
-
-**Example Input:**  
-Prove that the derivative of \(f(x) = x^2\) is \(2x\).  
-Partial proof:  
-The derivative of \(f(x)\) is defined as  
-\[
-f'(x) = \lim_{h \to 0} \frac{f(x+h) - f(x)}{h}
-\]
-Hint: Expand \((x+h)^2\) before applying the limit.
-
-**Example Output:**  
-Let's substitute \(f(x) = x^2\) into the definition:  
-\[
-f'(x) = \lim_{h \to 0} \frac{(x+h)^2 - x^2}{h}
-\]  
-Expand \((x+h)^2\) (using the hint):  
-\[
-(x+h)^2 = x^2 + 2xh + h^2
-\]  
-Subtract \(x^2\):  
-\[
-(x^2 + 2xh + h^2) - x^2 = 2xh + h^2
-\]  
-So,  
-\[
-f'(x) = \lim_{h \to 0} \frac{2xh + h^2}{h}
-\]  
-Divide numerator by \(h\):  
-\[
-= \lim_{h \to 0} (2x + h)
-\]  
-Take the limit as \(h \to 0\):  
-\[
-= 2x
-\]  
-
-\box{2x}
-
----
-
-**Reminders:**  
-- Complete the proof step by step, showing all logical reasoning before the boxed answer.
-- Use the hint provided in your reasoning.
-- The final answer must always appear at the end, in \box{...}. 
-
-**IMPORTANT INSTRUCTION SUMMARY:**  
-- Show step-by-step reasoning before the conclusion.
-- Use the hint as appropriate.
-- Place final answer boxed (in \box{...}) at the end."""
-        },
-        {
-            "role": "user",
-            "content": f"Problem: {problem}\n\nPartial proof: {partial_proof}\n\nHint: {hint}"
-        }
-    ]
-    return messages
-
-
-def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None, val_size: int = 64, max_prompt_tokens: int = 2560):
+def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None, val_size: int = 64, max_prompt_tokens: int = 2560, hint_level: int = 0):
     """Create RL dataset in verl format with train/val split.
     
     Args:
@@ -270,7 +283,7 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
     dataset = load_from_disk(dataset_path)
     
     # Format dataset - store messages as JSON for verl to parse
-    def format_dataset(examples, is_train: bool = True):
+    def format_dataset(examples, is_train: bool = True, hint_level: int = 0):
         """Format dataset examples for GRPO training."""
         prompts = []
         answers = []
@@ -278,14 +291,27 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
             examples['problem'], examples['partial_proof'], examples['final_answer'], examples['hints']
         ):
             # Only include if final answer exists AND hints is non-empty
-            if final_answer and hints and len(hints) > 0:
+            if final_answer and hints:
                 # Store messages as list of dicts - verl will apply chat template
-                if is_train:
-                    messages = format_prompt(problem, partial_proof, hints[-1])
-                elif len(hints) > 1:
-                    messages = format_prompt(problem, partial_proof, hints[-2])
-                prompts.append(messages)  # Store raw messages, not formatted string
-                answers.append(final_answer)
+                if not is_train:
+                    # Validation: no hints provided
+                    messages = format_prompt(problem, partial_proof)
+                    prompts.append(messages)
+                    answers.append(final_answer)
+                
+                elif hint_level >= 0:
+                    if len(hints) > hint_level:
+                        messages = format_prompt(problem, partial_proof, hints[-1 - hint_level])
+                        prompts.append(messages)
+                        answers.append(final_answer)
+                else:
+                    # hint_level < 0: use all hints
+                    for hint in hints:
+                        messages = format_prompt(problem, partial_proof, hint)
+                        prompts.append(messages)
+                        answers.append(final_answer)
+                
+
         
         return {"prompt": prompts, "answer": answers}
     
@@ -325,7 +351,7 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
     # Process dataset
     from functools import partial
     train_dataset = train_dataset.map(
-        partial(format_dataset, is_train=True),
+        partial(format_dataset, is_train=True, hint_level=hint_level),
         batched=True,
         remove_columns=train_dataset.column_names
     )
@@ -375,12 +401,22 @@ def get_verl_config_path():
 
 def main():
     """Main function to run GRPO training with verl and Ray."""
+    # Generate timestamp and experiment name for this run
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    special_name = f"hint_level_{HINT_LEVEL}"
+    experiment_name = f"grpo_omni_math_{special_name}_{timestamp}"
+    
+    # Construct output directory with timestamp and special_name
+    model_name = f"qwen2-math-7b_{special_name}_{timestamp}"
+    output_dir = os.path.join(bolt.ARTIFACT_DIR, model_name)
+    
     print("=" * 80)
     print("GRPO Training with verl and Ray")
     print("=" * 80)
     print(f"Model: {MODEL_PATH}")
     print(f"Dataset: {DATASET_NAME}")
-    print(f"Output: {OUTPUT_DIR}")
+    print(f"Output: {output_dir}")
+    print(f"Experiment: {experiment_name}")
     print(f"Nodes: {NUM_NODES}, GPUs per node: {GPUS_PER_NODE}")
     print("=" * 80)
     
@@ -401,7 +437,7 @@ def main():
     
     # Create RL dataset with train/val split
     print("Creating RL dataset...")
-    train_data, val_data = create_rl_dataset(tokenizer, DATASET_NAME, max_samples=MAX_NUM, val_size=64)  # 64 samples for validation
+    train_data, val_data = create_rl_dataset(tokenizer, DATASET_NAME, max_samples=MAX_NUM, val_size=64, hint_level=HINT_LEVEL)  # 64 samples for validation
     print(f"Created {len(train_data)} training samples, {len(val_data)} validation samples")
     
     # Save train dataset to parquet file
@@ -429,10 +465,6 @@ def main():
     # Initialize Hydra with verl's config directory
     initialize_config_dir(config_dir=config_path, version_base=None)
     
-    # Compose the config with our overrides
-    special_name = "richest_hint"
-    experiment_name = f"grpo_omni_math_{special_name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
     # Use Hydra's compose to load defaults and apply overrides
     overrides = [
         # Model path
@@ -447,7 +479,7 @@ def main():
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.9",
         "actor_rollout_ref.rollout.prompt_length=2560",
         "actor_rollout_ref.rollout.response_length=1536",
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8",
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
         
@@ -456,7 +488,7 @@ def main():
         
         # Actor config
         "actor_rollout_ref.actor.ppo_mini_batch_size=64",  # 2 nodes x 8 GPUs
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8",
         "actor_rollout_ref.actor.ppo_epochs=1",
         
         # Algorithm - GRPO
@@ -478,8 +510,8 @@ def main():
         f"trainer.experiment_name={experiment_name}",
         f"trainer.nnodes={NUM_NODES}",
         f"trainer.n_gpus_per_node={GPUS_PER_NODE}",
-        f"trainer.default_local_dir={OUTPUT_DIR}",
-        "trainer.total_epochs=3",
+        f"trainer.default_local_dir={output_dir}",
+        "trainer.total_epochs=5",
         "trainer.save_freq=500",  # Effectively disable checkpointing (no shared filesystem)
         "trainer.val_before_train=false",  # Skip validation before training (too slow)
         "trainer.test_freq=50",  # Validate every 50 training steps
@@ -494,6 +526,12 @@ def main():
         
         # Disable critic (not needed for GRPO)
         "++critic.enable=false",
+        
+        # Custom script parameters (for wandb logging)
+        f"++custom_params.hint_level={HINT_LEVEL}",
+        f"++custom_params.system_prompt_name={SYSTEM_PROMPT_NAME}",
+        f"++custom_params.max_samples={MAX_NUM}",
+        f"++custom_params.dataset_path={DATASET_NAME}",
     ]
     
     try:

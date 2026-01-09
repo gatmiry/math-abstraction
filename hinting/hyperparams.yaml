@@ -1,0 +1,68 @@
+# Hyperparameters for GRPO Training
+# Edit these values and they will be loaded by hinting2_grpo_ray.py
+
+# =============================================================================
+# Model & Dataset
+# =============================================================================
+model_path: "Qwen/Qwen2-Math-7B-Instruct"
+dataset_path: "../newopenaioutputs/hints_dataset"
+
+# =============================================================================
+# Hint Configuration
+# =============================================================================
+hint_level: 0                    # Which hint to use (-1 = all hints, 0 = richest, 1 = second richest, etc.)
+system_prompt_name: "default"    # Which system prompt to use from system_prompt.txt
+
+# =============================================================================
+# Distributed Training
+# =============================================================================
+num_nodes: 2
+gpus_per_node: 8
+
+# =============================================================================
+# Batch Sizes
+# =============================================================================
+train_batch_size: 64             # Total prompts per training step
+val_batch_size: 32
+ppo_mini_batch_size: 64          # Mini-batch size for PPO updates
+ppo_micro_batch_size_per_gpu: 8  # Micro-batch for gradient accumulation
+log_prob_micro_batch_size_per_gpu: 8  # Micro-batch for log prob computation
+
+# =============================================================================
+# Generation (vLLM Rollout)
+# =============================================================================
+rollout_n: 4                     # Number of generations per prompt (for GRPO)
+temperature: 1.0
+prompt_length: 2560              # Max prompt length in tokens
+response_length: 1536            # Max response length in tokens
+gpu_memory_utilization: 0.9
+
+# =============================================================================
+# Training
+# =============================================================================
+total_epochs: 3
+ppo_epochs: 1                    # PPO updates per batch (usually 1 for LLMs)
+save_freq: 500                   # Save checkpoint every N steps
+test_freq: 50                    # Validate every N steps
+
+# =============================================================================
+# Algorithm (GRPO)
+# =============================================================================
+adv_estimator: "grpo"
+use_kl_in_reward: false
+norm_adv_by_std_in_grpo: true
+
+# =============================================================================
+# Optimizer
+# =============================================================================
+learning_rate: 1.0e-6
+weight_decay: 0.01
+grad_clip: 1.0
+
+# =============================================================================
+# Data Filtering
+# =============================================================================
+max_samples: null                # Limit dataset size (null = use all)
+val_size: 64                     # Number of validation samples
+max_prompt_tokens: 2560          # Filter prompts longer than this
+

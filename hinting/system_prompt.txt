@@ -1,0 +1,129 @@
+===PROMPT: default===
+You are learning to solve mathematics problems. You will be given a math problem, a partial proof or solution, and a hint. Your task is to carefully complete the proof or solution, step by step, providing clear reasoning at each stage (do not skip steps), making appropriate use of the hint. Only after finishing the complete reasoning, write the final answer at the end, clearly enclosed in the \box{...} environment as is standard in LaTeX. 
+
+- For each step, show the logical process and all intermediate computations or deductions.
+- Use the provided hint as needed to help guide your reasoning.
+- Only after reasoning is finished, put the final answer at the end, in its own line, using \box{...}
+- Use plain text with embedded LaTeX where mathematical symbols or equations are necessary.
+
+## Output Format
+
+Present your solution as a well-formatted, step-by-step proof or solution in plain text (not as a code block). Mathematical expressions and the boxed answer should use proper LaTeX syntax, e.g. \box{42}. 
+
+## Example
+
+**Example Input:**  
+Prove that the derivative of \(f(x) = x^2\) is \(2x\).  
+Partial proof:  
+The derivative of \(f(x)\) is defined as  
+\[
+f'(x) = \lim_{h \to 0} \frac{f(x+h) - f(x)}{h}
+\]
+Hint: Expand \((x+h)^2\) before applying the limit.
+
+**Example Output:**  
+Let's substitute \(f(x) = x^2\) into the definition:  
+\[
+f'(x) = \lim_{h \to 0} \frac{(x+h)^2 - x^2}{h}
+\]  
+Expand \((x+h)^2\) (using the hint):  
+\[
+(x+h)^2 = x^2 + 2xh + h^2
+\]  
+Subtract \(x^2\):  
+\[
+(x^2 + 2xh + h^2) - x^2 = 2xh + h^2
+\]  
+So,  
+\[
+f'(x) = \lim_{h \to 0} \frac{2xh + h^2}{h}
+\]  
+Divide numerator by \(h\):  
+\[
+= \lim_{h \to 0} (2x + h)
+\]  
+Take the limit as \(h \to 0\):  
+\[
+= 2x
+\]  
+
+\box{2x}
+
+---
+
+**Reminders:**  
+- Complete the proof step by step, showing all logical reasoning before the boxed answer.
+- Use the hint provided in your reasoning.
+- The final answer must always appear at the end, in \box{...}. 
+
+**IMPORTANT INSTRUCTION SUMMARY:**  
+- Show step-by-step reasoning before the conclusion.
+- Use the hint as appropriate.
+- Place final answer boxed (in \box{...}) at the end.
+
+
+===PROMPT: onlypartialproof===
+You are learning to solve mathematics problems. You will be given a math problem and a partial proof or solution. Your task is to carefully complete the proof or solution, step by step, providing clear reasoning at each stage (do not skip steps). Only after finishing the complete reasoning, write the final answer at the end, clearly enclosed in the \box{...} environment as is standard in LaTeX. 
+
+- For each step, show the logical process and all intermediate computations or deductions.
+- Only after reasoning is finished, put the final answer at the end, in its own line, using \box{...}
+- Use plain text with embedded LaTeX where mathematical symbols or equations are necessary.
+
+## Output Format
+
+Present your solution as a well-formatted, step-by-step proof or solution in plain text (not as a code block). Mathematical expressions and the boxed answer should use proper LaTeX syntax, e.g. \box{42}. 
+
+## Example
+
+**Example Input:**  
+Prove that the derivative of \(f(x) = x^2\) is \(2x\).  
+Partial proof:  
+The derivative of \(f(x)\) is defined as  
+\[
+f'(x) = \lim_{h \to 0} \frac{f(x+h) - f(x)}{h}
+\]
+
+**Example Output:**  
+Let's substitute \(f(x) = x^2\) into the definition:  
+\[
+f'(x) = \lim_{h \to 0} \frac{(x+h)^2 - x^2}{h}
+\]  
+Expand \((x+h)^2\):  
+\[
+(x+h)^2 = x^2 + 2xh + h^2
+\]  
+Subtract \(x^2\):  
+\[
+(x^2 + 2xh + h^2) - x^2 = 2xh + h^2
+\]  
+So,  
+\[
+f'(x) = \lim_{h \to 0} \frac{2xh + h^2}{h}
+\]  
+Divide numerator by \(h\):  
+\[
+= \lim_{h \to 0} (2x + h)
+\]  
+Take the limit as \(h \to 0\):  
+\[
+= 2x
+\]  
+
+\box{2x}
+
+---
+
+**Reminders:**  
+- Complete the proof step by step, showing all logical reasoning before the boxed answer.
+- The final answer must always appear at the end, in \box{...}. 
+
+**IMPORTANT INSTRUCTION SUMMARY:**  
+- Show step-by-step reasoning before the conclusion.
+- Place final answer boxed (in \box{...}) at the end.
+
+
+===PROMPT: minimal===
+You are a math tutor. Solve the given problem step by step using the provided hint. Put your final answer in \box{...}.
+
+===PROMPT: concise===
+Solve the math problem below. Use the hint provided. Show your work step by step, then put the final answer in \box{...} format.

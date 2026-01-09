@@ -70,6 +70,10 @@ echo "=== Step 12: Installing other utilities ==="
 pip install --no-cache-dir bitsandbytes==0.49.0 wandb
 if [ $? -ne 0 ]; then echo "WARNING: utilities install failed"; fi
 
+echo "=== Step 13: Installing apple_bolt ==="
+pip install --no-cache-dir apple_bolt
+if [ $? -ne 0 ]; then echo "WARNING: apple_bolt install failed"; fi
+
 echo ""
 echo "========================================="
 echo "=== Verifying installation ==="
