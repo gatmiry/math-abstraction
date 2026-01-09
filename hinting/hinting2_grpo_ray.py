@@ -24,6 +24,7 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt.txt"
 SYSTEM_PROMPT_NAME = "default"
 
 HINT_LEVEL = 0
+VAL_SIZE = 128
 
 def load_system_prompt(name: str = None):
     """Load a named system prompt from file.
@@ -160,7 +161,7 @@ MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Usef
 
 # Distributed training configuration
 # 2 nodes, 8 GPUs per node = 16 GPUs total
-NUM_NODES = 1
+NUM_NODES = 2
 GPUS_PER_NODE = 8
 
 
@@ -264,7 +265,7 @@ def format_prompt(problem: str, partial_proof: str, hint: str = None, system_pro
         ]
         return messages
 
-def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None, val_size: int = 64, max_prompt_tokens: int = 2560, hint_level: int = 0):
+def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None, val_size: int = 128, max_prompt_tokens: int = 2560, hint_level: int = 0):
     """Create RL dataset in verl format with train/val split.
     
     Args:
@@ -437,7 +438,7 @@ def main():
     
     # Create RL dataset with train/val split
     print("Creating RL dataset...")
-    train_data, val_data = create_rl_dataset(tokenizer, DATASET_NAME, max_samples=MAX_NUM, val_size=64, hint_level=HINT_LEVEL)  # 64 samples for validation
+    train_data, val_data = create_rl_dataset(tokenizer, DATASET_NAME, max_samples=MAX_NUM, val_size=VAL_SIZE, hint_level=HINT_LEVEL)  # 64 samples for validation
     print(f"Created {len(train_data)} training samples, {len(val_data)} validation samples")
     
     # Save train dataset to parquet file
@@ -487,7 +488,7 @@ def main():
         "++ray_kwargs.ray_init.address=auto",
         
         # Actor config
-        "actor_rollout_ref.actor.ppo_mini_batch_size=64",  # 2 nodes x 8 GPUs
+        "actor_rollout_ref.actor.ppo_mini_batch_size=128",  # Must be <= train_batch_size
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8",
         "actor_rollout_ref.actor.ppo_epochs=1",
         
@@ -502,8 +503,8 @@ def main():
         "data.prompt_key=prompt",
         "data.max_prompt_length=2560",
         "data.max_response_length=1536",
-        "data.train_batch_size=64",  # 2 nodes x 8 GPUs = 16 GPUs
-        "data.val_batch_size=32",
+        "data.train_batch_size=128",  # 2 nodes x 8 GPUs = 16 GPUs
+        "data.val_batch_size=64",
         
         # Trainer config
         f"trainer.project_name=grpo-omni-math",
@@ -532,6 +533,7 @@ def main():
         f"++custom_params.system_prompt_name={SYSTEM_PROMPT_NAME}",
         f"++custom_params.max_samples={MAX_NUM}",
         f"++custom_params.dataset_path={DATASET_NAME}",
+        f"++custom_params.val_size={VAL_SIZE}",
     ]
     
     try:
