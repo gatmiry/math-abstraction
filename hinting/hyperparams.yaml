@@ -24,6 +24,17 @@ log_prob_micro_batch_size_per_gpu: 8 ## these specify the actuall final batch
 ppo_micro_batch_size_per_gpu: 8 ## and this
 ppo_mini_batch_size: 128 ### this is batch of prompts
 
+# =============================================================================
+# Distributed Training with 4 nodes
+# =============================================================================
+num_nodes: 4
+gpus_per_node: 8
+train_batch_size: 256 ## this is a batch of prompts, so should be larger than ppo_mini_batch_size
+rollout_n: 4
+log_prob_micro_batch_size_per_gpu: 8 ## these specify the actuall final batch
+ppo_micro_batch_size_per_gpu: 8 ## and this
+ppo_mini_batch_size: 256 ### this is batch of prompts
+
 
 # =============================================================================
 # Generation (vLLM Rollout)
