@@ -23,8 +23,8 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt.txt"
 # Which system prompt to use (from system_prompt.txt)
 SYSTEM_PROMPT_NAME = "default"
 
-HINT_LEVEL = 0
-VAL_SIZE = 128
+HINT_LEVEL = -1
+VAL_SIZE = 512
 
 def load_system_prompt(name: str = None):
     """Load a named system prompt from file.
@@ -160,8 +160,8 @@ DATASET_NAME = "../newopenaioutputs/hints_dataset"  # Omni-MATH dataset
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
 # Distributed training configuration
-# 2 nodes, 8 GPUs per node = 16 GPUs total
-NUM_NODES = 2
+# 1 node, 8 GPUs per node = 8 GPUs total
+NUM_NODES = 4
 GPUS_PER_NODE = 8
 
 
@@ -488,7 +488,7 @@ def main():
         "++ray_kwargs.ray_init.address=auto",
         
         # Actor config
-        "actor_rollout_ref.actor.ppo_mini_batch_size=128",  # Must be <= train_batch_size
+        "actor_rollout_ref.actor.ppo_mini_batch_size=256",  # Must be <= train_batch_size
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8",
         "actor_rollout_ref.actor.ppo_epochs=1",
         
@@ -503,8 +503,8 @@ def main():
         "data.prompt_key=prompt",
         "data.max_prompt_length=2560",
         "data.max_response_length=1536",
-        "data.train_batch_size=128",  # 2 nodes x 8 GPUs = 16 GPUs
-        "data.val_batch_size=64",
+        "data.train_batch_size=256",  # 2 nodes x 8 GPUs = 16 GPUs
+        "data.val_batch_size=128",
         
         # Trainer config
         f"trainer.project_name=grpo-omni-math",
@@ -513,7 +513,7 @@ def main():
         f"trainer.n_gpus_per_node={GPUS_PER_NODE}",
         f"trainer.default_local_dir={output_dir}",
         "trainer.total_epochs=5",
-        "trainer.save_freq=500",  # Effectively disable checkpointing (no shared filesystem)
+        "trainer.save_freq=250",  # Effectively disable checkpointing (no shared filesystem)
         "trainer.val_before_train=false",  # Skip validation before training (too slow)
         "trainer.test_freq=50",  # Validate every 50 training steps
         "trainer.log_val_generations=3",  # Log N validation samples to wandb
