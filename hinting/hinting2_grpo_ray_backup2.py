@@ -6,7 +6,6 @@ Uses Hydra to properly load verl's default configs and override specific values.
 """
 
 import os
-import argparse
 import apple_bolt as bolt
 
 # vLLM 0.8.5 V1 engine works fine, but keep this for compatibility with older versions
@@ -24,7 +23,7 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt.txt"
 # Which system prompt to use (from system_prompt.txt)
 SYSTEM_PROMPT_NAME = "default"
 
-HINT_LEVEL = 1
+HINT_LEVEL = 0
 VAL_SIZE = 512
 
 def load_system_prompt(name: str = None):
@@ -156,36 +155,9 @@ except ImportError:
     pass  # verl 0.4.x may not have this
 
 # Configuration
-DEFAULT_MODEL_PATH = "Qwen/Qwen2-Math-7B-Instruct"
+MODEL_PATH = "Qwen/Qwen2-Math-7B-Instruct"
 DATASET_NAME = "../newopenaioutputs/hints_dataset"  # Omni-MATH dataset
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
-
-
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="GRPO Training for math problem solving")
-    parser.add_argument(
-        "--model-path",
-        type=str,
-        default=None,
-        help="Path to a local HuggingFace-format model to start training from. "
-             "Must contain tokenizer files (vocab.json, etc.). "
-             "If not provided, uses the default HuggingFace model."
-    )
-    parser.add_argument(
-        "--resume-from",
-        type=str,
-        default=None,
-        help="Path to a verl checkpoint directory to resume training from. "
-             "e.g., /path/to/model_dir/global_step_50"
-    )
-    parser.add_argument(
-        "--hint-level",
-        type=int,
-        default=None,
-        help="Which hint level to use (overrides HINT_LEVEL constant)"
-    )
-    return parser.parse_args()
 
 # Distributed training configuration
 # 2 nodes, 8 GPUs per node = 16 GPUs total
@@ -430,63 +402,22 @@ def get_verl_config_path():
 
 def main():
     """Main function to run GRPO training with verl and Ray."""
-    # Parse command line arguments
-    args = parse_args()
-    
-    # Determine model path (command line arg or default)
-    # --model-path: Use a different base model (must have tokenizer files)
-    # --resume-from: Resume from a verl checkpoint (uses default model + loads weights)
-    model_path = args.model_path if args.model_path else DEFAULT_MODEL_PATH
-    
-    # Determine hint level (command line arg or constant)
-    hint_level = args.hint_level if args.hint_level is not None else HINT_LEVEL
-    
-    # Extract base model name for output naming
-    if args.resume_from:
-        # Resuming from verl checkpoint
-        path_parts = args.resume_from.rstrip('/').split('/')
-        # Find the main model directory (skip "global_step_X", etc.)
-        base_model_name = None
-        for part in reversed(path_parts):
-            if part and not part.startswith('global_step'):
-                base_model_name = part
-                break
-        if not base_model_name:
-            base_model_name = "checkpoint"
-    elif args.model_path:
-        # Using a different base model
-        path_parts = args.model_path.rstrip('/').split('/')
-        base_model_name = path_parts[-1].lower() if path_parts else "custom"
-    else:
-        # Using default HuggingFace model
-        base_model_name = model_path.split('/')[-1].lower()
-    
     # Generate timestamp and experiment name for this run
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    special_name = f"hint_level_{hint_level}"
-    
-    # Add "resumed" to name if loading from checkpoint
-    if args.resume_from:
-        special_name = f"{special_name}_resumed"
-    
+    special_name = f"hint_level_{HINT_LEVEL}"
     experiment_name = f"grpo_omni_math_{special_name}_{timestamp}"
     
-    # Construct output directory with timestamp, special_name, and base model indicator
-    model_name = f"qwen2-math-7b_{special_name}_{timestamp}_from_{base_model_name}"
+    # Construct output directory with timestamp and special_name
+    model_name = f"qwen2-math-7b_{special_name}_{timestamp}"
     output_dir = os.path.join(bolt.ARTIFACT_DIR, model_name)
     
     print("=" * 80)
     print("GRPO Training with verl and Ray")
     print("=" * 80)
-    print(f"Model: {model_path}")
-    if args.resume_from:
-        print(f"  Resuming from checkpoint: {args.resume_from}")
-    elif args.model_path:
-        print(f"  (Using custom model path)")
+    print(f"Model: {MODEL_PATH}")
     print(f"Dataset: {DATASET_NAME}")
     print(f"Output: {output_dir}")
     print(f"Experiment: {experiment_name}")
-    print(f"Hint Level: {hint_level}")
     print(f"Nodes: {NUM_NODES}, GPUs per node: {GPUS_PER_NODE}")
     print("=" * 80)
     
@@ -495,11 +426,10 @@ def main():
     login_huggingface(tokens)
     login_wandb(tokens)
     
-    # Load tokenizer (use default model for tokenizer if resuming from checkpoint)
+    # Load tokenizer
     print("Loading tokenizer...")
-    tokenizer_path = DEFAULT_MODEL_PATH  # Always use base model tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_path,
+        MODEL_PATH,
         trust_remote_code=True
     )
     
@@ -508,7 +438,7 @@ def main():
     
     # Create RL dataset with train/val split
     print("Creating RL dataset...")
-    train_data, val_data = create_rl_dataset(tokenizer, DATASET_NAME, max_samples=MAX_NUM, val_size=VAL_SIZE, hint_level=hint_level)
+    train_data, val_data = create_rl_dataset(tokenizer, DATASET_NAME, max_samples=MAX_NUM, val_size=VAL_SIZE, hint_level=HINT_LEVEL)  # 64 samples for validation
     print(f"Created {len(train_data)} training samples, {len(val_data)} validation samples")
     
     # Save train dataset to parquet file
@@ -537,18 +467,10 @@ def main():
     initialize_config_dir(config_dir=config_path, version_base=None)
     
     # Use Hydra's compose to load defaults and apply overrides
-    # Always use base model for tokenizer (checkpoints don't have tokenizer files)
-    tokenizer_path = DEFAULT_MODEL_PATH
-    
     overrides = [
         # Model path
-        f"actor_rollout_ref.model.path={model_path}",
+        f"actor_rollout_ref.model.path={MODEL_PATH}",
         "actor_rollout_ref.model.trust_remote_code=true",
-        
-        # Tokenizer path (always use base model, checkpoints don't have tokenizer)
-        f"data.tokenizer={tokenizer_path}",
-        f"reward_model.model.input_tokenizer={tokenizer_path}",
-        f"critic.model.tokenizer_path={tokenizer_path}",
         
         # Rollout config for GRPO - using vLLM
         "actor_rollout_ref.rollout.name=vllm",
@@ -591,7 +513,7 @@ def main():
         f"trainer.n_gpus_per_node={GPUS_PER_NODE}",
         f"trainer.default_local_dir={output_dir}",
         "trainer.total_epochs=5",
-        "trainer.save_freq=50",  # Save checkpoint every N steps
+        "trainer.save_freq=500",  # Effectively disable checkpointing (no shared filesystem)
         "trainer.val_before_train=false",  # Skip validation before training (too slow)
         "trainer.test_freq=50",  # Validate every 50 training steps
         "trainer.log_val_generations=3",  # Log N validation samples to wandb
@@ -607,19 +529,12 @@ def main():
         "++critic.enable=false",
         
         # Custom script parameters (for wandb logging)
-        f"++custom_params.hint_level={hint_level}",
+        f"++custom_params.hint_level={HINT_LEVEL}",
         f"++custom_params.system_prompt_name={SYSTEM_PROMPT_NAME}",
         f"++custom_params.max_samples={MAX_NUM}",
         f"++custom_params.dataset_path={DATASET_NAME}",
         f"++custom_params.val_size={VAL_SIZE}",
-        f"++custom_params.model_path={model_path}",
-        f"++custom_params.resumed_from_checkpoint={args.resume_from is not None}",
     ]
-    
-    # Add resume_from_path if resuming from checkpoint
-    if args.resume_from:
-        overrides.append(f"trainer.resume_from_path={args.resume_from}")
-        print(f"[INFO] Will resume from checkpoint: {args.resume_from}")
     
     try:
         config = compose(config_name="ppo_trainer", overrides=overrides)
