@@ -24,7 +24,7 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt.txt"
 # Which system prompt to use (from system_prompt.txt)
 SYSTEM_PROMPT_NAME = "default"
 
-HINT_LEVEL = 1
+HINT_LEVEL = 0
 VAL_SIZE = 512
 
 def load_system_prompt(name: str = None):
@@ -360,10 +360,10 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
     
     # Limit dataset to last MAX_NUM rows if specified
     if max_samples is not None and max_samples > 0:
-        original_size = len(formatted_dataset)
-        start_idx = max(0, len(formatted_dataset) - max_samples)
-        formatted_dataset = formatted_dataset.select(range(start_idx, len(formatted_dataset)))
-        print(f"[INFO] Limited dataset from {original_size} to {len(formatted_dataset)} rows (using last {max_samples} rows)")
+        original_size = len(dataset)
+        start_idx = max(0, len(dataset) - max_samples)
+        dataset = dataset.select(range(start_idx, len(dataset)))
+        print(f"[INFO] Limited dataset from {original_size} to {len(dataset)} rows (using last {max_samples} rows)")
     
     
     
@@ -426,6 +426,139 @@ def get_verl_config_path():
     verl_path = os.path.dirname(verl.__file__)
     config_path = os.path.join(verl_path, "trainer", "config")
     return config_path
+
+
+def gather_checkpoint_to_head_node(checkpoint_dir: str, output_dir: str, num_nodes: int, gpus_per_node: int):
+    """
+    Gather all FSDP checkpoint shards from worker nodes to the head node.
+    
+    This keeps the checkpoint in verl's native format so it can be:
+    - Used directly with --resume-from for continued training
+    - Loaded with verl's inference utilities
+    
+    Args:
+        checkpoint_dir: Path to the checkpoint directory (e.g., /path/to/global_step_50)
+        output_dir: Where to save the gathered checkpoint on head node
+        num_nodes: Number of nodes used in training
+        gpus_per_node: GPUs per node
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    import shutil
+    
+    world_size = num_nodes * gpus_per_node
+    actor_dir = os.path.join(checkpoint_dir, "actor")
+    output_actor_dir = os.path.join(output_dir, "actor")
+    
+    print(f"[Gather] Collecting checkpoint shards from {num_nodes} nodes...")
+    print(f"[Gather] World size: {world_size}")
+    print(f"[Gather] Source: {actor_dir}")
+    print(f"[Gather] Destination: {output_dir}")
+    
+    # Create output directory
+    os.makedirs(output_actor_dir, exist_ok=True)
+    
+    # Define Ray remote function to read checkpoint files from each node
+    @ray.remote
+    def get_checkpoint_files(checkpoint_path: str):
+        """Get list of checkpoint files and their contents from this node."""
+        import os
+        
+        files_data = {}
+        if os.path.exists(checkpoint_path):
+            for filename in os.listdir(checkpoint_path):
+                if filename.endswith(".pt"):
+                    filepath = os.path.join(checkpoint_path, filename)
+                    # Read file as bytes
+                    with open(filepath, 'rb') as f:
+                        files_data[filename] = f.read()
+                    print(f"[Node] Read {filename} ({len(files_data[filename])} bytes)")
+        return files_data
+    
+    # Get list of all node IPs from Ray
+    nodes = ray.nodes()
+    node_ips = [node["NodeManagerAddress"] for node in nodes if node["Alive"]]
+    print(f"[Gather] Found {len(node_ips)} alive nodes: {node_ips}")
+    
+    # Schedule gather tasks on each node
+    gather_tasks = []
+    for node_ip in node_ips:
+        # Try to run on specific node using scheduling strategy
+        task = get_checkpoint_files.options(
+            resources={f"node:{node_ip}": 0.001}
+        ).remote(actor_dir)
+        gather_tasks.append((node_ip, task))
+    
+    # Also try without node constraint as fallback (will run on any available node)
+    # This helps if node labels aren't set up
+    fallback_task = get_checkpoint_files.remote(actor_dir)
+    
+    # Collect results
+    all_files = {}
+    
+    # First try node-specific tasks
+    for node_ip, task in gather_tasks:
+        try:
+            result = ray.get(task, timeout=300)  # 5 min timeout
+            for filename, data in result.items():
+                if filename not in all_files:
+                    all_files[filename] = data
+                    print(f"[Gather] Got {filename} from {node_ip}")
+        except Exception as e:
+            print(f"[Gather] Failed to get files from {node_ip}: {e}")
+    
+    # Try fallback if we don't have all files
+    expected_model_files = world_size
+    model_files_count = sum(1 for f in all_files if f.startswith("model_world_size_"))
+    
+    if model_files_count < expected_model_files:
+        print(f"[Gather] Only got {model_files_count}/{expected_model_files} model shards, trying fallback...")
+        try:
+            result = ray.get(fallback_task, timeout=300)
+            for filename, data in result.items():
+                if filename not in all_files:
+                    all_files[filename] = data
+                    print(f"[Gather] Got {filename} from fallback")
+        except Exception as e:
+            print(f"[Gather] Fallback also failed: {e}")
+    
+    # Write all collected files to output directory
+    print(f"[Gather] Writing {len(all_files)} files to {output_actor_dir}")
+    for filename, data in all_files.items():
+        output_path = os.path.join(output_actor_dir, filename)
+        with open(output_path, 'wb') as f:
+            f.write(data)
+        print(f"[Gather] Wrote {filename}")
+    
+    # Copy the latest_checkpointed_iteration.txt if it exists
+    parent_dir = os.path.dirname(checkpoint_dir)
+    iteration_file = os.path.join(parent_dir, "latest_checkpointed_iteration.txt")
+    if os.path.exists(iteration_file):
+        output_parent = os.path.dirname(output_dir)
+        os.makedirs(output_parent, exist_ok=True)
+        shutil.copy2(iteration_file, os.path.join(output_parent, "latest_checkpointed_iteration.txt"))
+        print(f"[Gather] Copied latest_checkpointed_iteration.txt")
+    
+    # Verify we got all shards
+    model_files = [f for f in all_files if f.startswith("model_world_size_")]
+    optim_files = [f for f in all_files if f.startswith("optim_world_size_")]
+    extra_files = [f for f in all_files if f.startswith("extra_state_world_size_")]
+    
+    print(f"\n[Gather] Summary:")
+    print(f"  - Model shards: {len(model_files)}/{world_size}")
+    print(f"  - Optim shards: {len(optim_files)}/{world_size}")
+    print(f"  - Extra state shards: {len(extra_files)}/{world_size}")
+    
+    if len(model_files) == world_size:
+        print(f"\n✓ Successfully gathered complete checkpoint to: {output_dir}")
+        print(f"  Use with: python hinting2_grpo_ray.py --resume-from {output_dir}")
+        return True
+    else:
+        missing_ranks = set(range(world_size)) - {int(f.split("_")[-1].replace(".pt", "")) for f in model_files}
+        print(f"\n✗ Incomplete checkpoint - missing ranks: {sorted(missing_ranks)}")
+        print(f"  The missing shards may be on nodes that are no longer accessible.")
+        return False
 
 
 def main():
@@ -647,6 +780,41 @@ def main():
     try:
         run_ppo(config)
         print("Training completed successfully!")
+        
+        # After training, gather checkpoint shards from all nodes to head node
+        print("\n" + "=" * 80)
+        print("Gathering checkpoint shards to head node...")
+        print("=" * 80)
+        
+        # Find the latest checkpoint
+        latest_checkpoint_file = os.path.join(output_dir, "latest_checkpointed_iteration.txt")
+        if os.path.exists(latest_checkpoint_file):
+            with open(latest_checkpoint_file, 'r') as f:
+                latest_step = f.read().strip()
+            checkpoint_dir = os.path.join(output_dir, f"global_step_{latest_step}")
+            
+            # Gather to a consolidated directory on head node
+            gathered_dir = os.path.join(output_dir, "gathered_checkpoint", f"global_step_{latest_step}")
+            
+            print(f"Found latest checkpoint at step {latest_step}")
+            
+            # Gather all shards to head node (keeps verl's native format)
+            success = gather_checkpoint_to_head_node(
+                checkpoint_dir=checkpoint_dir,
+                output_dir=gathered_dir,
+                num_nodes=NUM_NODES,
+                gpus_per_node=GPUS_PER_NODE
+            )
+            
+            if success:
+                print(f"\n✓ Complete checkpoint gathered to: {gathered_dir}")
+                print(f"  Resume training with: python hinting2_grpo_ray.py --resume-from {gathered_dir}")
+            else:
+                print("\n✗ Checkpoint gathering incomplete - some shards may be missing")
+                print("  The partial checkpoint is still at the gathered location.")
+        else:
+            print(f"[WARNING] No checkpoint found at {latest_checkpoint_file}")
+            
     except Exception as e:
         print(f"Error during training: {e}")
         import traceback
