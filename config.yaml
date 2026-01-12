@@ -1,0 +1,40 @@
+name: 'Math Hinting'
+description: 'Task that sends live logs and user metrics'
+tags: [pytorch, cuda]
+project_id: mlr_s_gatmiry
+priority: 1
+setup_command: 'bash ./hinting/install-node.sh'
+command: 'python -m venv myenv && source myenv/bin/activate && bash hinting/install-node.sh && source hinting/my_env_vars.sh'
+#command: 'export GLOO_SOCKET_IFNAME=eth0 && export NCCL_SOCKET_IFNAME=eth0 && export RAY_DISABLE_DASHBOARD=1'
+# permissions:
+#   owners: '<OD group or user>'
+#   viewers: '<OD group or user>'
+parameters:
+  learning_rate: 0.1
+  random_seed: 123
+  
+cluster_options:
+  aws:
+    instance_type: p5.48xlarge
+    
+resources:
+  # LATER: this docker image is only needed temporarily until Bolt updates the default to be this one
+  docker_image: docker.apple.com/iris/iris:latest
+  cluster: aws_4
+  #instance_type: p5.48xlarge
+  task_type: 8gpu
+  timeout: 14d
+  disk_gb: 2048
+
+permissions:
+    viewers:
+        - mlr
+        - turi-bolt-support
+
+attribution:
+  project: LLM-Abstraction
+  development_type: training
+  foundation_model: false
+  model_type: text
+  model_size: 7B
+  spend: dev

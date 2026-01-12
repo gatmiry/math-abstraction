@@ -50,7 +50,7 @@ if [ $? -ne 0 ]; then echo "ERROR: transformers ecosystem install failed"; exit 
 echo "=== Step 9: Building flash_attn from source (this takes 10-20 minutes) ==="
 echo "Building with: CUDA $(nvcc --version 2>/dev/null | grep release | awk '{print $6}' || echo 'unknown')"
 echo "PyTorch version: $(python -c 'import torch; print(torch.__version__)')"
-pip install --no-cache-dir flash-attn==2.8.3 --no-build-isolation
+pip install --no-cache-dir flash-attn==2.7.3 --no-build-isolation
 if [ $? -ne 0 ]; then 
     echo "ERROR: flash_attn build failed"
     echo "If build fails, you can skip flash_attn and use eager attention instead:"
