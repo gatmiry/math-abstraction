@@ -160,6 +160,10 @@ DEFAULT_MODEL_PATH = "Qwen/Qwen2-Math-7B-Instruct"
 DATASET_NAME = "../newopenaioutputs/hints_dataset"  # Omni-MATH dataset
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
+# Training hyperparameters
+TRAIN_BATCH_SIZE = 256
+TOTAL_EPOCHS = 5
+
 
 def parse_args():
     """Parse command line arguments."""
@@ -428,6 +432,93 @@ def get_verl_config_path():
     return config_path
 
 
+def distribute_checkpoint_to_all_nodes(checkpoint_dir: str, target_dir: str):
+    """
+    Distribute checkpoint shards from head node to all worker nodes.
+    
+    This is needed because verl's FSDP checkpoint loading expects each node
+    to have ALL shards available locally.
+    
+    Args:
+        checkpoint_dir: Path to the gathered checkpoint (with all shards)
+        target_dir: Path where checkpoint should be placed on all nodes
+    
+    Returns:
+        True if successful
+    """
+    actor_dir = os.path.join(checkpoint_dir, "actor")
+    target_actor_dir = os.path.join(target_dir, "actor")
+    
+    # Read all checkpoint files from head node
+    print(f"[Distribute] Reading checkpoint from {actor_dir}...")
+    files_data = {}
+    for filename in os.listdir(actor_dir):
+        if filename.endswith(".pt"):
+            filepath = os.path.join(actor_dir, filename)
+            with open(filepath, 'rb') as f:
+                files_data[filename] = f.read()
+            print(f"[Distribute] Read {filename} ({len(files_data[filename]) // 1024 // 1024} MB)")
+    
+    # Also read data.pt if it exists
+    data_pt_path = os.path.join(checkpoint_dir, "data.pt")
+    data_pt_content = None
+    if os.path.exists(data_pt_path):
+        with open(data_pt_path, 'rb') as f:
+            data_pt_content = f.read()
+        print(f"[Distribute] Read data.pt")
+    
+    print(f"[Distribute] Total files to distribute: {len(files_data)}")
+    
+    # Define Ray remote function to write files on each node
+    @ray.remote
+    def write_checkpoint_files(files: dict, target_path: str, data_pt: bytes = None):
+        """Write checkpoint files to this node."""
+        import os
+        os.makedirs(target_path, exist_ok=True)
+        
+        written = 0
+        for filename, data in files.items():
+            filepath = os.path.join(target_path, filename)
+            with open(filepath, 'wb') as f:
+                f.write(data)
+            written += 1
+        
+        # Write data.pt to parent directory
+        if data_pt is not None:
+            parent_dir = os.path.dirname(target_path)
+            data_pt_path = os.path.join(parent_dir, "data.pt")
+            with open(data_pt_path, 'wb') as f:
+                f.write(data_pt)
+        
+        import socket
+        return f"{socket.gethostname()}: wrote {written} files to {target_path}"
+    
+    # Get all nodes
+    nodes = ray.nodes()
+    node_ips = [node["NodeManagerAddress"] for node in nodes if node["Alive"]]
+    print(f"[Distribute] Distributing to {len(node_ips)} nodes: {node_ips}")
+    
+    # Schedule write tasks on each node
+    tasks = []
+    for node_ip in node_ips:
+        task = write_checkpoint_files.options(
+            resources={f"node:{node_ip}": 0.001}
+        ).remote(files_data, target_actor_dir, data_pt_content)
+        tasks.append((node_ip, task))
+    
+    # Wait for all writes to complete
+    for node_ip, task in tasks:
+        try:
+            result = ray.get(task, timeout=600)  # 10 min timeout for large files
+            print(f"[Distribute] {result}")
+        except Exception as e:
+            print(f"[Distribute] Failed on {node_ip}: {e}")
+            return False
+    
+    print(f"[Distribute] ✓ Checkpoint distributed to all nodes at: {target_dir}")
+    return True
+
+
 def gather_checkpoint_to_head_node(checkpoint_dir: str, output_dir: str, num_nodes: int, gpus_per_node: int):
     """
     Gather all FSDP checkpoint shards from worker nodes to the head node.
@@ -644,6 +735,11 @@ def main():
     train_data, val_data = create_rl_dataset(tokenizer, DATASET_NAME, max_samples=MAX_NUM, val_size=VAL_SIZE, hint_level=hint_level)
     print(f"Created {len(train_data)} training samples, {len(val_data)} validation samples")
     
+    # Calculate total training steps (same formula verl uses)
+    num_batches_per_epoch = len(train_data) // TRAIN_BATCH_SIZE
+    total_training_steps = num_batches_per_epoch * TOTAL_EPOCHS
+    print(f"Calculated total_training_steps: {num_batches_per_epoch} batches/epoch × {TOTAL_EPOCHS} epochs = {total_training_steps}")
+    
     # Save train dataset to parquet file
     print("Saving datasets to parquet...")
     df_train = pd.DataFrame(train_data)
@@ -714,7 +810,7 @@ def main():
         "data.prompt_key=prompt",
         "data.max_prompt_length=2560",
         "data.max_response_length=1536",
-        "data.train_batch_size=256",  # 2 nodes x 8 GPUs = 16 GPUs
+        f"data.train_batch_size={TRAIN_BATCH_SIZE}",
         "data.val_batch_size=64",
         
         # Trainer config
@@ -723,10 +819,10 @@ def main():
         f"trainer.nnodes={NUM_NODES}",
         f"trainer.n_gpus_per_node={GPUS_PER_NODE}",
         f"trainer.default_local_dir={output_dir}",
-        "trainer.total_epochs=5",
+        f"trainer.total_epochs={TOTAL_EPOCHS}",
         "trainer.save_freq=50",  # Save checkpoint every N steps
         "trainer.val_before_train=false",  # Skip validation before training (too slow)
-        "trainer.test_freq=50",  # Validate every 50 training steps
+        "trainer.test_freq=5",  # Validate every 50 training steps
         "trainer.log_val_generations=3",  # Log N validation samples to wandb
         
         # Custom reward function (use ++ to add or override)
@@ -751,7 +847,47 @@ def main():
     
     # Add resume_from_path if resuming from checkpoint
     if args.resume_from:
+        # Validate that the path contains global_step_ (required by verl)
+        if "global_step_" not in args.resume_from:
+            print(f"[ERROR] --resume-from path must contain 'global_step_X' directory")
+            print(f"        Given: {args.resume_from}")
+            print(f"        Example: {args.resume_from}/global_step_50")
+            sys.exit(1)
+        
+        # Initialize Ray early to distribute checkpoint to all nodes
+        print("[INFO] Initializing Ray for checkpoint distribution...")
+        if not ray.is_initialized():
+            ray.init(address='auto')
+        
+        # Distribute checkpoint from head node to all worker nodes
+        # This is necessary because verl expects ALL shards to be available on each node
+        print(f"[INFO] Distributing checkpoint to all nodes...")
+        
+        success = distribute_checkpoint_to_all_nodes(
+            checkpoint_dir=args.resume_from,
+            target_dir=args.resume_from  # Same path on all nodes
+        )
+        
+        if not success:
+            print("[ERROR] Failed to distribute checkpoint to all nodes")
+            sys.exit(1)
+        
+        # Must set resume_mode to 'resume_path' for verl to use the checkpoint
+        overrides.append("trainer.resume_mode=resume_path")
         overrides.append(f"trainer.resume_from_path={args.resume_from}")
+        
+        # Extract step number from checkpoint path and set total_training_steps
+        # This is needed because verl calculates total_training_steps = dataset_size * epochs
+        # and training exits when global_steps >= total_training_steps
+        step_match = re.search(r'global_step_(\d+)', args.resume_from)
+        if step_match:
+            resume_step = int(step_match.group(1))
+            # When resuming, add another full training cycle to the resume step
+            new_total = resume_step + total_training_steps
+            print(f"[INFO] Resuming from step {resume_step}, adding {total_training_steps} more steps")
+            print(f"[INFO] New total_training_steps: {new_total}")
+            overrides.append(f"trainer.total_training_steps={new_total}")
+        
         print(f"[INFO] Will resume from checkpoint: {args.resume_from}")
     
     try:
