@@ -1,0 +1,35 @@
+{
+  "rounds": [
+    {
+      "round": 1,
+      "pairs_found": 66,
+      "strongest_acc": 0.15555555555555556,
+      "weakest_acc": 0.1,
+      "strongest_correct": 14,
+      "strongest_total": 90,
+      "weakest_correct": 9,
+      "weakest_total": 90
+    },
+    {
+      "round": 2,
+      "pairs_found": 72,
+      "strongest_acc": 0.15555555555555556,
+      "weakest_acc": 0.08888888888888889,
+      "strongest_correct": 14,
+      "strongest_total": 90,
+      "weakest_correct": 8,
+      "weakest_total": 90
+    },
+    {
+      "round": 3,
+      "pairs_found": 59,
+      "strongest_acc": 0.16666666666666666,
+      "weakest_acc": 0.08888888888888889,
+      "strongest_correct": 15,
+      "strongest_total": 90,
+      "weakest_correct": 8,
+      "weakest_total": 90
+    }
+  ],
+  "final_model": "/mnt/task_wrapper/user_output/artifacts/iterative_distillation/round_3/model/final"
+}

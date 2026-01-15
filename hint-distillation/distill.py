@@ -23,11 +23,13 @@ import pandas as pd
 from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForSeq2Seq
+import apple_bolt as bolt
 
 # Paths
 HINTS_DATASET = "../newopenaioutputs/hints_dataset"
 MODEL_PATH = "Qwen/Qwen2-Math-7B-Instruct"
-OUTPUT_DIR = "./distillation_data"
+OUTPUT_DIR = os.path.join(bolt.ARTIFACT_DIR, "distillation_data")
+TEST_SIZE = 512  # Hold out for evaluation
 
 SYSTEM_PROMPT = """You are learning to solve mathematics problems. You will be given a math problem, a partial proof or solution, and a hint. Your task is to carefully complete the proof or solution, step by step, providing clear reasoning at each stage (do not skip steps), making appropriate use of the hint. Only after finishing the complete reasoning, write the final answer at the end, clearly enclosed in the \\box{...} environment as is standard in LaTeX. 
 
@@ -87,16 +89,37 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--limit", type=int, default=None, help="Limit number of problems")
+    parser.add_argument("--test-size", type=int, default=TEST_SIZE, help="Number of problems to hold out for evaluation")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for train/test split")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
 
     # Load dataset
     print(f"Loading dataset from {args.dataset}")
-    dataset = load_from_disk(args.dataset)
+    full_dataset = load_from_disk(args.dataset)
     if args.limit:
-        dataset = dataset.select(range(min(args.limit, len(dataset))))
-    print(f"Loaded {len(dataset)} problems")
+        full_dataset = full_dataset.select(range(min(args.limit, len(full_dataset))))
+    print(f"Loaded {len(full_dataset)} problems")
+
+    # Split into train and test
+    import random
+    random.seed(args.seed)
+    all_indices = list(range(len(full_dataset)))
+    random.shuffle(all_indices)
+    
+    test_indices = all_indices[:args.test_size]
+    train_indices = all_indices[args.test_size:]
+    
+    # Save test indices for evaluation
+    test_indices_path = os.path.join(args.output, "test_indices.json")
+    with open(test_indices_path, "w") as f:
+        json.dump(test_indices, f)
+    print(f"Saved {len(test_indices)} test indices to {test_indices_path}")
+    
+    # Use only train set for distillation
+    dataset = full_dataset.select(train_indices)
+    print(f"Train set: {len(dataset)} problems, Test set: {len(test_indices)} problems")
 
     # Initialize vLLM (tensor_parallel must divide attention heads, 28 for Qwen2-7B)
     # Use 4 GPUs for tensor parallelism (28 / 4 = 7)
@@ -158,6 +181,8 @@ def main():
     stats = {"total_problems": len(dataset), "pairs_found": 0, "all_correct": 0, "none_correct": 0}
 
     for prob_idx, row in enumerate(dataset):
+        if prob_idx not in results_by_problem:
+            continue  # Problem had no hints or was skipped
         problem = row["problem"]
         partial_proof = row["partial_proof"]
         results = results_by_problem[prob_idx]

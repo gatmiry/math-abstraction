@@ -10,6 +10,7 @@ Run with:
 import os
 import argparse
 import torch
+import torch.distributed as dist
 from datasets import load_from_disk
 from transformers import (
     AutoTokenizer,
@@ -17,6 +18,8 @@ from transformers import (
     TrainingArguments,
     Trainer,
 )
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 
 MODEL_PATH = "Qwen/Qwen2-Math-7B-Instruct"
 DATA_PATH = "./distillation_data/sft_dataset"
@@ -44,6 +47,22 @@ def tokenize_messages(example, tokenizer, max_length=4096):
     # Create labels: -100 for prompt tokens (don't compute loss), actual ids for response
     labels = [-100] * len(prompt_tokens["input_ids"]) + input_ids[len(prompt_tokens["input_ids"]):]
     labels = labels[:len(input_ids)]  # Ensure same length
+    
+    # FIX: Don't train on tokens after the LAST EOS - this prevents the model from 
+    # learning to continue generating after <|im_end|>, which causes degenerate repetition
+    # Note: There are multiple EOS tokens (one per message), we want the LAST one
+    eos_token_id = tokenizer.eos_token_id
+    # Find the last occurrence of EOS token
+    eos_idx = None
+    for i in range(len(input_ids) - 1, -1, -1):
+        if input_ids[i] == eos_token_id:
+            eos_idx = i
+            break
+    
+    if eos_idx is not None:
+        # Set all labels after the last EOS to -100 (don't train on them)
+        for i in range(eos_idx + 1, len(labels)):
+            labels[i] = -100
     
     return {
         "input_ids": input_ids,
@@ -116,9 +135,42 @@ def main():
     print("Starting training...")
     trainer.train()
     
-    # Save final model
-    trainer.save_model(os.path.join(args.output, "final"))
-    print(f"Model saved to {args.output}/final")
+    # Save final model - properly handle FSDP state dict consolidation
+    final_path = os.path.join(args.output, "final")
+    
+    # Get the underlying model (unwrap FSDP if needed)
+    if hasattr(trainer.model, "module"):
+        # Model is wrapped (DDP or FSDP)
+        unwrapped_model = trainer.model.module
+    else:
+        unwrapped_model = trainer.model
+    
+    # Check if we're using FSDP and handle state dict properly
+    if isinstance(trainer.model, FSDP):
+        # Use FSDP's proper state dict consolidation
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(trainer.model, StateDictType.FULL_STATE_DICT, save_policy):
+            state_dict = trainer.model.state_dict()
+            
+            # Only save on rank 0
+            if dist.get_rank() == 0:
+                # Load a fresh model to save (to avoid FSDP wrapper issues)
+                save_model = AutoModelForCausalLM.from_pretrained(
+                    args.model,
+                    torch_dtype=torch.bfloat16,
+                    trust_remote_code=True,
+                )
+                save_model.load_state_dict(state_dict)
+                save_model.save_pretrained(final_path)
+                tokenizer.save_pretrained(final_path)
+                print(f"Model saved to {final_path}")
+        
+        # Barrier to ensure all ranks wait for save to complete
+        dist.barrier()
+    else:
+        # Not FSDP, use standard save
+        trainer.save_model(final_path)
+        print(f"Model saved to {final_path}")
 
 
 if __name__ == "__main__":

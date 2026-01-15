@@ -1,0 +1,33 @@
+{
+  "citation": "",
+  "description": "",
+  "features": {
+    "messages": {
+      "feature": {
+        "content": {
+          "dtype": "string",
+          "_type": "Value"
+        },
+        "role": {
+          "dtype": "string",
+          "_type": "Value"
+        }
+      },
+      "_type": "List"
+    },
+    "problem": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "weak_hint_rank": {
+      "dtype": "int64",
+      "_type": "Value"
+    },
+    "strong_hint_rank": {
+      "dtype": "int64",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": ""
+}

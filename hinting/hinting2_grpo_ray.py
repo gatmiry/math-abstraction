@@ -24,7 +24,7 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt.txt"
 # Which system prompt to use (from system_prompt.txt)
 SYSTEM_PROMPT_NAME = "default"
 
-HINT_LEVEL = 0
+HINT_LEVEL = -1
 VAL_SIZE = 512
 
 def load_system_prompt(name: str = None):
@@ -161,8 +161,9 @@ DATASET_NAME = "../newopenaioutputs/hints_dataset"  # Omni-MATH dataset
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
 # Training hyperparameters
-TRAIN_BATCH_SIZE = 256
-TOTAL_EPOCHS = 5
+TRAIN_BATCH_SIZE = 224
+TOTAL_EPOCHS = 15
+TEST_BATCH_SIZE = 256
 
 
 def parse_args():
@@ -193,7 +194,7 @@ def parse_args():
 
 # Distributed training configuration
 # 2 nodes, 8 GPUs per node = 16 GPUs total
-NUM_NODES = 4
+NUM_NODES = 7
 GPUS_PER_NODE = 8
 
 
@@ -795,7 +796,7 @@ def main():
         "++ray_kwargs.ray_init.address=auto",
         
         # Actor config
-        "actor_rollout_ref.actor.ppo_mini_batch_size=256",  # Must be <= train_batch_size
+        f"actor_rollout_ref.actor.ppo_mini_batch_size={TRAIN_BATCH_SIZE}",  # Must be <= train_batch_size
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8",
         "actor_rollout_ref.actor.ppo_epochs=1",
         
@@ -811,7 +812,7 @@ def main():
         "data.max_prompt_length=2560",
         "data.max_response_length=1536",
         f"data.train_batch_size={TRAIN_BATCH_SIZE}",
-        "data.val_batch_size=64",
+        f"data.val_batch_size={TEST_BATCH_SIZE}",
         
         # Trainer config
         f"trainer.project_name=grpo-omni-math",
@@ -821,7 +822,7 @@ def main():
         f"trainer.default_local_dir={output_dir}",
         f"trainer.total_epochs={TOTAL_EPOCHS}",
         "trainer.save_freq=50",  # Save checkpoint every N steps
-        "trainer.val_before_train=false",  # Skip validation before training (too slow)
+        "trainer.val_before_train=true",  # Skip validation before training (too slow)
         "trainer.test_freq=5",  # Validate every 50 training steps
         "trainer.log_val_generations=3",  # Log N validation samples to wandb
         
