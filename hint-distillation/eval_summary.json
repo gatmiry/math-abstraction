@@ -2,33 +2,33 @@
   "rounds": [
     {
       "round": 1,
-      "pairs_found": 66,
-      "strongest_acc": 0.15555555555555556,
-      "weakest_acc": 0.1,
-      "strongest_correct": 14,
-      "strongest_total": 90,
-      "weakest_correct": 9,
-      "weakest_total": 90
+      "pairs_found": 650,
+      "strongest_acc": 0.3697478991596639,
+      "weakest_acc": 0.19117647058823528,
+      "strongest_correct": 176,
+      "strongest_total": 476,
+      "weakest_correct": 91,
+      "weakest_total": 476
     },
     {
       "round": 2,
-      "pairs_found": 72,
-      "strongest_acc": 0.15555555555555556,
-      "weakest_acc": 0.08888888888888889,
-      "strongest_correct": 14,
-      "strongest_total": 90,
-      "weakest_correct": 8,
-      "weakest_total": 90
+      "pairs_found": 670,
+      "strongest_acc": 0.3592436974789916,
+      "weakest_acc": 0.18487394957983194,
+      "strongest_correct": 171,
+      "strongest_total": 476,
+      "weakest_correct": 88,
+      "weakest_total": 476
     },
     {
       "round": 3,
-      "pairs_found": 59,
-      "strongest_acc": 0.16666666666666666,
-      "weakest_acc": 0.08888888888888889,
-      "strongest_correct": 15,
-      "strongest_total": 90,
-      "weakest_correct": 8,
-      "weakest_total": 90
+      "pairs_found": 672,
+      "strongest_acc": 0.3634453781512605,
+      "weakest_acc": 0.1953781512605042,
+      "strongest_correct": 173,
+      "strongest_total": 476,
+      "weakest_correct": 93,
+      "weakest_total": 476
     }
   ],
   "final_model": "/mnt/task_wrapper/user_output/artifacts/iterative_distillation/round_3/model/final"

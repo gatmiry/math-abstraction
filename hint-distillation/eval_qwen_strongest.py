@@ -41,6 +41,8 @@ def main():
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL_PATH, help="Model path or HF repo")
     parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT, help="Output JSON path")
     parser.add_argument("--limit", type=int, default=100, help="Number of problems to evaluate")
+    parser.add_argument("--max-num-seqs", type=int, default=None, help="vLLM max_num_seqs override")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=None, help="vLLM gpu_memory_utilization override")
     args = parser.parse_args()
 
     # Load dataset
@@ -53,12 +55,17 @@ def main():
     
     # Load model
     print(f"Loading {args.model}...")
-    llm = LLM(
-        model=args.model,
-        tensor_parallel_size=4,
-        trust_remote_code=True,
-        dtype="bfloat16",
-    )
+    llm_kwargs = {
+        "model": args.model,
+        "tensor_parallel_size": 4,
+        "trust_remote_code": True,
+        "dtype": "bfloat16",
+    }
+    if args.max_num_seqs is not None:
+        llm_kwargs["max_num_seqs"] = args.max_num_seqs
+    if args.gpu_memory_utilization is not None:
+        llm_kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization
+    llm = LLM(**llm_kwargs)
     
     sampling_params = SamplingParams(
         temperature=0.7,
