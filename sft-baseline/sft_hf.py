@@ -41,13 +41,13 @@ def load_tokens():
 
 
 def format_example(example, tokenizer):
-    """Format problem + solution into chat format."""
+    """Format problem + solution into chat format. Returns (full_text, prompt_text) for masking."""
     problem = example.get("problem", "")
     solution = example.get("ground_truth_solution", "")
     answer = example.get("final_answer", "")
     
     if not problem or not solution:
-        return None
+        return None, None
     
     # Add boxed answer if missing
     if answer and "\\box" not in solution:
@@ -59,8 +59,17 @@ def format_example(example, tokenizer):
         {"role": "assistant", "content": solution}
     ]
     
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    return text
+    # Full text with assistant response
+    full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    
+    # Prompt only (system + user) to find where assistant starts
+    prompt_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Problem: {problem}"},
+    ]
+    prompt_text = tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
+    
+    return full_text, prompt_text
 
 
 def main():
@@ -92,29 +101,53 @@ def main():
     print(f"Loading dataset: {DATASET_PATH}")
     dataset = load_from_disk(DATASET_PATH)
     
+    # Split FIRST before any processing - matches eval_checkpoint_vllm.py split
+    # This ensures the test set is held out and never seen during training
+    print("Splitting dataset (test_size=0.1, seed=42) to match eval script...")
+    raw_split = dataset.train_test_split(test_size=0.1, seed=42)
+    train_raw = raw_split["train"]
+    holdout_raw = raw_split["test"]
+    print(f"Raw split - Train: {len(train_raw)}, Holdout (not used): {len(holdout_raw)}")
+    
     def tokenize(example):
-        text = format_example(example, tokenizer)
-        if text is None:
+        full_text, prompt_text = format_example(example, tokenizer)
+        if full_text is None:
             return {"input_ids": [], "attention_mask": [], "labels": []}
         
+        # Tokenize full text
         encoded = tokenizer(
-            text,
+            full_text,
             truncation=True,
             max_length=2048,
             padding=False,
         )
-        encoded["labels"] = encoded["input_ids"].copy()
+        
+        # Tokenize prompt to find where assistant response starts
+        prompt_encoded = tokenizer(
+            prompt_text,
+            truncation=True,
+            max_length=2048,
+            padding=False,
+        )
+        prompt_len = len(prompt_encoded["input_ids"])
+        
+        # Create labels: mask non-assistant tokens with -100
+        labels = encoded["input_ids"].copy()
+        labels[:prompt_len] = [-100] * prompt_len
+        encoded["labels"] = labels
+        
         return encoded
     
-    tokenized = dataset.map(tokenize, remove_columns=dataset.column_names)
+    # Tokenize only the train split (holdout is never used)
+    tokenized = train_raw.map(tokenize, remove_columns=train_raw.column_names)
     tokenized = tokenized.filter(lambda x: len(x["input_ids"]) > 0)
     
-    # Split train/val
-    split = tokenized.train_test_split(test_size=0.1, seed=42)
-    train_dataset = split["train"]
-    eval_dataset = split["test"]
+    # Split train into train/val for training monitoring (small val from train set)
+    train_val_split = tokenized.train_test_split(test_size=0.05, seed=42)
+    train_dataset = train_val_split["train"]
+    eval_dataset = train_val_split["test"]
     
-    print(f"Train: {len(train_dataset)}, Eval: {len(eval_dataset)}")
+    print(f"Train: {len(train_dataset)}, Val (from train): {len(eval_dataset)}")
     
     # Training arguments with FSDP
     training_args = TrainingArguments(

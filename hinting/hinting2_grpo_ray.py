@@ -161,8 +161,8 @@ DATASET_NAME = "../newopenaioutputs/hints_dataset"  # Omni-MATH dataset
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
 # Training hyperparameters
-TRAIN_BATCH_SIZE = 224
-TOTAL_EPOCHS = 15
+TRAIN_BATCH_SIZE = 256
+TOTAL_EPOCHS = 50
 TEST_BATCH_SIZE = 256
 
 
