@@ -24,6 +24,7 @@ from tqdm import tqdm
 os.environ["WANDB_SAVE_CODE"] = "true"
 os.environ["NCCL_IGNORE_DISABLED_P2P"] = "1"
 os.environ["NCCL_P2P_DISABLE"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"  # Reduce memory fragmentation
 
 import apple_bolt as bolt
 
@@ -361,13 +362,13 @@ def parse_args():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=64,
+        default=32,
         help="Global training batch size"
     )
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-5,
+        default=1e-6,  # Reduced by 10x from 1e-5
         help="Learning rate"
     )
     parser.add_argument(
@@ -379,19 +380,19 @@ def parse_args():
     parser.add_argument(
         "--eval-freq",
         type=int,
-        default=5,
+        default=1,
         help="Run evaluation every N steps"
     )
     parser.add_argument(
         "--max-length",
         type=int,
-        default=4096,
+        default=2048,  # Reduced from 4096 to fit in GPU memory
         help="Maximum sequence length"
     )
     parser.add_argument(
         "--eval-batch-size",
         type=int,
-        default=4,
+        default=2,  # Reduced for memory safety during generation
         help="Batch size for evaluation generation"
     )
     parser.add_argument(
@@ -405,6 +406,11 @@ def parse_args():
         type=int,
         default=None,
         help="Maximum number of training samples (None = all)"
+    )
+    parser.add_argument(
+        "--skip-generation-eval",
+        action="store_true",
+        help="Skip generation-based evaluation (only use loss-based validation)"
     )
     return parser.parse_args()
 
@@ -461,11 +467,17 @@ def main():
         TRAIN_DATASET_PATH,
         max_samples=args.max_train_samples
     )
-    eval_data = create_eval_dataset(
-        tokenizer,
-        EVAL_DATASET_PATH,
-        val_size=args.eval_samples
-    )
+    
+    # Create eval data for generation eval (skip if flag is set)
+    if args.skip_generation_eval:
+        print("[INFO] Skipping generation evaluation (--skip-generation-eval)")
+        eval_data = []
+    else:
+        eval_data = create_eval_dataset(
+            tokenizer,
+            EVAL_DATASET_PATH,
+            val_size=args.eval_samples
+        )
     
     # Save datasets to parquet
     print("\nSaving datasets to parquet...")
@@ -505,12 +517,16 @@ def main():
         "model.trust_remote_code=true",
         "model.enable_gradient_checkpointing=true",
         "model.strategy=fsdp",
+# NOTE: CPU offloading is disabled because it makes generation eval extremely slow (CPU inference)
+        # If you hit OOM, reduce max_length or batch_size instead
+        # "model.fsdp_config.cpu_offload=true",  # Offload optimizer to CPU to save GPU memory
+        # "model.fsdp_config.offload_params=true",  # Offload params to CPU
         
         # Data
         f"data.train_files={train_parquet}",
         f"data.val_files={val_parquet}",
         f"data.train_batch_size={args.batch_size}",
-        "data.micro_batch_size_per_gpu=2",
+        "data.micro_batch_size_per_gpu=1",
         f"data.max_length={args.max_length}",
         "data.truncation=left",
         # Use multiturn format for messages
