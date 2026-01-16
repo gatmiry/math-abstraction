@@ -82,7 +82,7 @@ def extract_boxed_answer(text: str) -> Optional[str]:
 
 
 def normalize_answer(answer: str) -> str:
-    """Normalize answer for comparison."""
+    """Normalize answer for basic string comparison."""
     if answer is None:
         return ""
     ans = answer.strip()
@@ -92,12 +92,58 @@ def normalize_answer(answer: str) -> str:
     return ans.lower()
 
 
+def parse_latex_to_sympy(latex_str: str):
+    """Try to parse LaTeX string to SymPy expression using latex2sympy2."""
+    try:
+        from latex2sympy2 import latex2sympy
+        
+        # Clean up the LaTeX string
+        latex_str = latex_str.strip()
+        # Handle common LaTeX patterns
+        latex_str = latex_str.replace('\\dfrac', '\\frac')
+        latex_str = latex_str.replace('\\tfrac', '\\frac')
+        
+        expr = latex2sympy(latex_str)
+        return expr
+    except Exception:
+        return None
+
+
 def check_answer(generated: str, ground_truth: str) -> bool:
-    """Check if generated answer matches ground truth."""
+    """Check if generated answer matches ground truth using symbolic comparison."""
     gen_ans = extract_boxed_answer(generated)
     if gen_ans is None:
         return False
-    return normalize_answer(gen_ans) == normalize_answer(ground_truth)
+    
+    # First try exact string match (after normalization)
+    if normalize_answer(gen_ans) == normalize_answer(ground_truth):
+        return True
+    
+    # Try symbolic comparison using SymPy
+    try:
+        from sympy import simplify, N
+        
+        gen_expr = parse_latex_to_sympy(gen_ans)
+        gt_expr = parse_latex_to_sympy(ground_truth)
+        
+        if gen_expr is not None and gt_expr is not None:
+            # Check if expressions are symbolically equal
+            diff = simplify(gen_expr - gt_expr)
+            if diff == 0:
+                return True
+            
+            # Try numerical comparison for expressions that can't be simplified symbolically
+            try:
+                gen_val = complex(N(gen_expr))
+                gt_val = complex(N(gt_expr))
+                if abs(gen_val - gt_val) < 1e-9:
+                    return True
+            except (TypeError, ValueError):
+                pass
+    except Exception:
+        pass
+    
+    return False
 
 
 def generate_and_find_pairs(model_path: str, dataset, args):
