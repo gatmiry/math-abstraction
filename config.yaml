@@ -24,7 +24,7 @@ resources:
   #instance_type: p5.48xlarge
   task_type: 8gpu
   timeout: 14d
-  disk_gb: 2048
+  disk_gb: 8192
 
 permissions:
     viewers:

@@ -156,7 +156,7 @@ except ImportError:
     pass  # verl 0.4.x may not have this
 
 # Configuration
-DEFAULT_MODEL_PATH = "Qwen/Qwen3-4B-Instruct"
+DEFAULT_MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507"
 DATASET_NAME = "../newopenaioutputs/hints_dataset"  # Omni-MATH dataset
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
@@ -194,7 +194,7 @@ def parse_args():
 
 # Distributed training configuration
 # 2 nodes, 8 GPUs per node = 16 GPUs total
-NUM_NODES = 7
+NUM_NODES = 4
 GPUS_PER_NODE = 8
 
 
@@ -785,10 +785,12 @@ def main():
         "actor_rollout_ref.rollout.n=4",  # Multiple generations for GRPO
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.9",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.7",
         "actor_rollout_ref.rollout.prompt_length=2560",
         "actor_rollout_ref.rollout.response_length=4096",
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8",
+        "actor_rollout_ref.rollout.max_model_len=6656",
+        "actor_rollout_ref.rollout.max_num_batched_tokens=6656",
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
         
@@ -797,7 +799,7 @@ def main():
         
         # Actor config
         f"actor_rollout_ref.actor.ppo_mini_batch_size={TRAIN_BATCH_SIZE}",  # Must be <= train_batch_size
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.actor.ppo_epochs=1",
         
         # Algorithm - GRPO
