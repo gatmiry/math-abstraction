@@ -156,7 +156,7 @@ except ImportError:
     pass  # verl 0.4.x may not have this
 
 # Configuration
-DEFAULT_MODEL_PATH = "Qwen/Qwen3-4B-Instruct"
+DEFAULT_MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507"
 DATASET_NAME = "../newopenaioutputs/hints_dataset"  # Omni-MATH dataset
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
@@ -697,7 +697,7 @@ def main():
     experiment_name = f"grpo_omni_math_{special_name}_{timestamp}"
     
     # Construct output directory with timestamp, special_name, and base model indicator
-    model_name = f"qwen2-math-7b_{special_name}_{timestamp}_from_{base_model_name}"
+    model_name = f"qwen3-4b-instruct-2507_{special_name}_{timestamp}_from_{base_model_name}"
     output_dir = os.path.join(bolt.ARTIFACT_DIR, model_name)
     
     print("=" * 80)
