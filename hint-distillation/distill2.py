@@ -23,7 +23,7 @@ import apple_bolt as bolt
 
 # Paths
 HINTS_DATASET = "../newopenaioutputs/hints_dataset"
-MODEL_PATH = "Qwen/Qwen2-Math-7B-Instruct"
+MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507"
 OUTPUT_DIR = os.path.join(bolt.ARTIFACT_DIR, "iterative_distillation")
 TEST_SIZE = 512
 SAVE_STEPS = 50  # Save checkpoint every N steps
@@ -346,7 +346,7 @@ def main():
     parser.add_argument("--dataset", type=str, default=HINTS_DATASET)
     parser.add_argument("--output", type=str, default=OUTPUT_DIR)
     parser.add_argument("--rounds", type=int, default=5, help="Number of distillation rounds")
-    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--test-size", type=int, default=TEST_SIZE)
