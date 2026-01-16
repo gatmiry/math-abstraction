@@ -28,19 +28,31 @@ OUTPUT_DIR = os.path.join(bolt.ARTIFACT_DIR, "iterative_distillation")
 TEST_SIZE = 512
 SAVE_STEPS = 50  # Save checkpoint every N steps
 
-SYSTEM_PROMPT = """You are learning to solve mathematics problems. You will be given a math problem, a partial proof or solution, and a hint. Your task is to carefully complete the proof or solution, step by step, providing clear reasoning at each stage (do not skip steps), making appropriate use of the hint. Only after finishing the complete reasoning, write the final answer at the end, clearly enclosed in the \\box{...} environment as is standard in LaTeX. 
+SYSTEM_PROMPT_WITH_HINT = """You are learning to solve mathematics problems. You will be given a math problem, a partial proof or solution, and a hint. Your task is to carefully complete the proof or solution, step by step, providing clear reasoning at each stage (do not skip steps), making appropriate use of the hint. Only after finishing the complete reasoning, write the final answer at the end, clearly enclosed in the \\box{...} environment as is standard in LaTeX. 
 
 - For each step, show the logical process and all intermediate computations or deductions.
 - Use the provided hint as needed to help guide your reasoning.
 - Only after reasoning is finished, put the final answer at the end, in its own line, using \\box{...}
 - Use plain text with embedded LaTeX where mathematical symbols or equations are necessary."""
 
+SYSTEM_PROMPT_NO_HINT = """You are learning to solve mathematics problems. You will be given a math problem and a partial proof or solution. Your task is to carefully complete the proof or solution, step by step, providing clear reasoning at each stage (do not skip steps). Only after finishing the complete reasoning, write the final answer at the end, clearly enclosed in the \\box{...} environment as is standard in LaTeX. 
 
-def format_prompt(problem: str, partial_proof: str, hint: str) -> List[Dict[str, str]]:
-    """Format a prompt with hint."""
+- For each step, show the logical process and all intermediate computations or deductions.
+- Only after reasoning is finished, put the final answer at the end, in its own line, using \\box{...}
+- Use plain text with embedded LaTeX where mathematical symbols or equations are necessary."""
+
+
+def format_prompt(problem: str, partial_proof: str, hint: str = None) -> List[Dict[str, str]]:
+    """Format a prompt with optional hint."""
+    if hint:
+        system_prompt = SYSTEM_PROMPT_WITH_HINT
+        user_content = f"Problem: {problem}\n\nPartial proof: {partial_proof}\n\nHint: {hint}"
+    else:
+        system_prompt = SYSTEM_PROMPT_NO_HINT
+        user_content = f"Problem: {problem}\n\nPartial proof: {partial_proof}"
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Problem: {problem}\n\nPartial proof: {partial_proof}\n\nHint: {hint}"}
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content}
     ]
 
 
@@ -185,7 +197,7 @@ def generate_and_find_pairs(model_path: str, dataset, args):
 
 
 def evaluate_on_holdout(model_path: str, full_dataset, test_indices: List[int], args):
-    """Evaluate model on holdout test set."""
+    """Evaluate model on holdout test set. Returns results dict and list of generations."""
     from vllm import LLM, SamplingParams
     
     os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
@@ -201,9 +213,9 @@ def evaluate_on_holdout(model_path: str, full_dataset, test_indices: List[int], 
     tokenizer = llm.get_tokenizer()
     sampling_params = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
 
-    # Prepare prompts for strongest and weakest hints
+    # Prepare prompts for no hint, weakest hint, and strongest hint
     all_prompts = []
-    prompt_metadata = []  # (test_idx, hint_type, ground_truth)
+    prompt_metadata = []  # (test_idx, hint_type, ground_truth, problem, hint, partial_proof)
 
     for test_idx in tqdm(test_indices, desc="Preparing eval prompts"):
         row = full_dataset[test_idx]
@@ -215,29 +227,47 @@ def evaluate_on_holdout(model_path: str, full_dataset, test_indices: List[int], 
         if not hints:
             continue
 
-        # Test with weakest hint (hints[0]) and strongest hint (hints[-1])
-        for hint_type, hint in [("weakest", hints[0]), ("strongest", hints[-1])]:
+        # Test with no hint, weakest hint (hints[0]), and strongest hint (hints[-1])
+        for hint_type, hint in [("no_hint", None), ("weakest", hints[0]), ("strongest", hints[-1])]:
             messages = format_prompt(problem, partial_proof, hint)
             prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             all_prompts.append(prompt_text)
-            prompt_metadata.append((test_idx, hint_type, ground_truth))
+            prompt_metadata.append((test_idx, hint_type, ground_truth, problem, hint, partial_proof))
 
     # Generate responses
     print(f"Generating {len(all_prompts)} eval responses...")
     outputs = llm.generate(all_prompts, sampling_params)
 
-    # Evaluate
-    results = {"weakest": {"correct": 0, "total": 0}, "strongest": {"correct": 0, "total": 0}}
+    # Evaluate and collect generations
+    results = {
+        "no_hint": {"correct": 0, "total": 0},
+        "weakest": {"correct": 0, "total": 0},
+        "strongest": {"correct": 0, "total": 0}
+    }
+    generations = []  # List of all generations with metadata
 
-    for output, (test_idx, hint_type, gt) in zip(outputs, prompt_metadata):
+    for output, (test_idx, hint_type, gt, problem, hint, partial_proof) in zip(outputs, prompt_metadata):
         response = output.outputs[0].text
+        predicted_answer = extract_boxed_answer(response)
         correct = check_answer(response, gt)
         results[hint_type]["total"] += 1
         if correct:
             results[hint_type]["correct"] += 1
+        
+        generations.append({
+            "test_idx": test_idx,
+            "hint_type": hint_type,
+            "problem": problem,
+            "partial_proof": partial_proof,
+            "hint": hint,
+            "ground_truth": gt,
+            "predicted_answer": predicted_answer,
+            "response": response,
+            "correct": correct,
+        })
 
     # Calculate accuracies
-    for hint_type in ["strongest", "weakest"]:
+    for hint_type in ["no_hint", "weakest", "strongest"]:
         total = results[hint_type]["total"]
         correct = results[hint_type]["correct"]
         results[hint_type]["accuracy"] = correct / total if total > 0 else 0.0
@@ -247,7 +277,7 @@ def evaluate_on_holdout(model_path: str, full_dataset, test_indices: List[int], 
     gc.collect()
     torch.cuda.empty_cache()
 
-    return results
+    return results, generations
 
 
 def finetune_model(model_path: str, distillation_pairs: List[Dict], output_path: str, args):
@@ -312,6 +342,12 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
+    
+    # Create distillation_performance folders
+    perf_dir = os.path.join(os.path.dirname(__file__), "distillation_performance")
+    generations_dir = os.path.join(perf_dir, "mid_generations")
+    os.makedirs(perf_dir, exist_ok=True)
+    os.makedirs(generations_dir, exist_ok=True)
 
     # Load and split dataset
     print(f"Loading dataset from {args.dataset}")
@@ -339,6 +375,60 @@ def main():
     # Iterative distillation loop
     current_model = args.model
     all_round_stats = []
+
+    # Evaluate base model (round 0) before any training
+    print(f"\n{'='*60}")
+    print(f"ROUND 0 (BASE MODEL EVALUATION)")
+    print(f"{'='*60}")
+    print(f"Evaluating base model: {current_model}")
+    
+    base_eval_results, base_generations = evaluate_on_holdout(current_model, full_dataset, test_indices, args)
+    
+    base_stats = {
+        "round": 0,
+        "model": current_model,
+        "pairs_found": 0,
+        "eval_no_hint_acc": base_eval_results["no_hint"]["accuracy"],
+        "eval_strongest_acc": base_eval_results["strongest"]["accuracy"],
+        "eval_weakest_acc": base_eval_results["weakest"]["accuracy"],
+        "eval_no_hint_correct": base_eval_results["no_hint"]["correct"],
+        "eval_no_hint_total": base_eval_results["no_hint"]["total"],
+        "eval_strongest_correct": base_eval_results["strongest"]["correct"],
+        "eval_strongest_total": base_eval_results["strongest"]["total"],
+        "eval_weakest_correct": base_eval_results["weakest"]["correct"],
+        "eval_weakest_total": base_eval_results["weakest"]["total"],
+    }
+    all_round_stats.append(base_stats)
+    
+    print(f"[Round 0] Base Model Eval Results:")
+    print(f"  NO HINT: {base_eval_results['no_hint']['correct']}/{base_eval_results['no_hint']['total']} = {base_eval_results['no_hint']['accuracy']*100:.1f}%")
+    print(f"  WEAKEST hint: {base_eval_results['weakest']['correct']}/{base_eval_results['weakest']['total']} = {base_eval_results['weakest']['accuracy']*100:.1f}%")
+    print(f"  STRONGEST hint: {base_eval_results['strongest']['correct']}/{base_eval_results['strongest']['total']} = {base_eval_results['strongest']['accuracy']*100:.1f}%")
+    
+    # Save base model performance and generations
+    base_perf = {
+        "round": 0,
+        "model": current_model,
+        "pairs_found": 0,
+        "no_hint_accuracy": base_eval_results["no_hint"]["accuracy"],
+        "no_hint_correct": base_eval_results["no_hint"]["correct"],
+        "no_hint_total": base_eval_results["no_hint"]["total"],
+        "weakest_accuracy": base_eval_results["weakest"]["accuracy"],
+        "weakest_correct": base_eval_results["weakest"]["correct"],
+        "weakest_total": base_eval_results["weakest"]["total"],
+        "strongest_accuracy": base_eval_results["strongest"]["accuracy"],
+        "strongest_correct": base_eval_results["strongest"]["correct"],
+        "strongest_total": base_eval_results["strongest"]["total"],
+    }
+    perf_path = os.path.join(perf_dir, "round_0_performance.json")
+    with open(perf_path, "w") as f:
+        json.dump(base_perf, f, indent=2)
+    print(f"  Performance saved to {perf_path}")
+    
+    gen_path = os.path.join(generations_dir, "round_0_generations.json")
+    with open(gen_path, "w") as f:
+        json.dump(base_generations, f, indent=2)
+    print(f"  Generations saved to {gen_path}")
 
     for round_num in range(1, args.rounds + 1):
         print(f"\n{'='*60}")
@@ -379,24 +469,54 @@ def main():
         
         # Step 3: Evaluate on holdout set
         print(f"\n[Round {round_num}] Step 3: Evaluating on holdout set...")
-        eval_results = evaluate_on_holdout(current_model, full_dataset, test_indices, args)
+        eval_results, eval_generations = evaluate_on_holdout(current_model, full_dataset, test_indices, args)
         
         # Add eval results to stats
+        stats["eval_no_hint_acc"] = eval_results["no_hint"]["accuracy"]
         stats["eval_strongest_acc"] = eval_results["strongest"]["accuracy"]
         stats["eval_weakest_acc"] = eval_results["weakest"]["accuracy"]
+        stats["eval_no_hint_correct"] = eval_results["no_hint"]["correct"]
+        stats["eval_no_hint_total"] = eval_results["no_hint"]["total"]
         stats["eval_strongest_correct"] = eval_results["strongest"]["correct"]
         stats["eval_strongest_total"] = eval_results["strongest"]["total"]
         stats["eval_weakest_correct"] = eval_results["weakest"]["correct"]
         stats["eval_weakest_total"] = eval_results["weakest"]["total"]
         
         print(f"[Round {round_num}] Eval Results:")
-        print(f"  STRONGEST hint: {eval_results['strongest']['correct']}/{eval_results['strongest']['total']} = {eval_results['strongest']['accuracy']*100:.1f}%")
+        print(f"  NO HINT: {eval_results['no_hint']['correct']}/{eval_results['no_hint']['total']} = {eval_results['no_hint']['accuracy']*100:.1f}%")
         print(f"  WEAKEST hint: {eval_results['weakest']['correct']}/{eval_results['weakest']['total']} = {eval_results['weakest']['accuracy']*100:.1f}%")
+        print(f"  STRONGEST hint: {eval_results['strongest']['correct']}/{eval_results['strongest']['total']} = {eval_results['strongest']['accuracy']*100:.1f}%")
         
         # Save eval results for this round
         eval_path = os.path.join(round_dir, "eval_results.json")
         with open(eval_path, "w") as f:
             json.dump(eval_results, f, indent=2)
+        
+        # Save performance and generations to distillation_performance folder
+        round_perf = {
+            "round": round_num,
+            "model": current_model,
+            "pairs_found": stats["pairs_found"],
+            "no_hint_accuracy": eval_results["no_hint"]["accuracy"],
+            "no_hint_correct": eval_results["no_hint"]["correct"],
+            "no_hint_total": eval_results["no_hint"]["total"],
+            "weakest_accuracy": eval_results["weakest"]["accuracy"],
+            "weakest_correct": eval_results["weakest"]["correct"],
+            "weakest_total": eval_results["weakest"]["total"],
+            "strongest_accuracy": eval_results["strongest"]["accuracy"],
+            "strongest_correct": eval_results["strongest"]["correct"],
+            "strongest_total": eval_results["strongest"]["total"],
+        }
+        perf_path = os.path.join(perf_dir, f"round_{round_num}_performance.json")
+        with open(perf_path, "w") as f:
+            json.dump(round_perf, f, indent=2)
+        print(f"  Performance saved to {perf_path}")
+        
+        # Save generations to mid_generations folder
+        gen_path = os.path.join(generations_dir, f"round_{round_num}_generations.json")
+        with open(gen_path, "w") as f:
+            json.dump(eval_generations, f, indent=2)
+        print(f"  Generations saved to {gen_path}")
 
     # Save summary
     summary_path = os.path.join(args.output, "summary.json")
@@ -418,12 +538,15 @@ def main():
             eval_summary["rounds"].append({
                 "round": s["round"],
                 "pairs_found": s["pairs_found"],
-                "strongest_acc": s["eval_strongest_acc"],
+                "no_hint_acc": s["eval_no_hint_acc"],
                 "weakest_acc": s["eval_weakest_acc"],
-                "strongest_correct": s["eval_strongest_correct"],
-                "strongest_total": s["eval_strongest_total"],
+                "strongest_acc": s["eval_strongest_acc"],
+                "no_hint_correct": s["eval_no_hint_correct"],
+                "no_hint_total": s["eval_no_hint_total"],
                 "weakest_correct": s["eval_weakest_correct"],
                 "weakest_total": s["eval_weakest_total"],
+                "strongest_correct": s["eval_strongest_correct"],
+                "strongest_total": s["eval_strongest_total"],
             })
     with open(eval_summary_path, "w") as f:
         json.dump(eval_summary, f, indent=2)
@@ -439,7 +562,7 @@ def main():
     for s in all_round_stats:
         pairs_info = f"{s['pairs_found']} pairs"
         if "eval_strongest_acc" in s:
-            eval_info = f"eval: strong={s['eval_strongest_acc']*100:.1f}%, weak={s['eval_weakest_acc']*100:.1f}%"
+            eval_info = f"eval: no_hint={s['eval_no_hint_acc']*100:.1f}%, weak={s['eval_weakest_acc']*100:.1f}%, strong={s['eval_strongest_acc']*100:.1f}%"
             print(f"  Round {s['round']}: {pairs_info}, {eval_info}")
         else:
             print(f"  Round {s['round']}: {pairs_info}")
