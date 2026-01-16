@@ -134,6 +134,7 @@ os.environ["NCCL_P2P_DISABLE"] = "1"
 
 import re
 import sys
+import random
 import ray
 import tempfile
 import datetime
@@ -163,7 +164,7 @@ MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Usef
 # Training hyperparameters
 TRAIN_BATCH_SIZE = 256
 TOTAL_EPOCHS = 50
-TEST_BATCH_SIZE = 256
+TEST_BATCH_SIZE = 512
 
 
 def parse_args():
@@ -199,16 +200,18 @@ GPUS_PER_NODE = 8
 
 
 def extract_boxed_answer(text: str) -> Optional[str]:
-    """Extract answer from \\boxed{...} at the end of text."""
-    # Find the last \\boxed{ and extract content handling nested braces
-    matches = list(re.finditer(r'\\boxed\{', text))
+    """Extract answer from \\box{...} or \\boxed{...} using proper brace matching."""
+    # Find all occurrences of \box{ or \boxed{
+    matches = list(re.finditer(r'\\box(ed)?\{', text))
     if not matches:
         return None
     
+    # Use the last occurrence (final answer is typically at the end)
     start_pos = matches[-1].end()
     depth = 1
     i = start_pos
     
+    # Match braces properly to handle nested expressions like \frac{...}{...}
     while i < len(text) and depth > 0:
         if text[i] == '{':
             depth += 1
@@ -225,8 +228,11 @@ def normalize_answer(answer: str) -> str:
     """Normalize answer for comparison."""
     if answer is None:
         return ""
-    # Remove extra whitespace and convert to lowercase
-    return answer.strip().lower()
+    ans = answer.strip()
+    ans = re.sub(r'\s+', '', ans)
+    ans = ans.replace('\\left', '').replace('\\right', '')
+    ans = ans.replace('\\,', '').replace('\\;', '').replace('\\:', '')
+    return ans.lower()
 
 
 def compute_score(
@@ -380,8 +386,13 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
     print(f"[INFO] Split dataset: {train_size} train, {val_size_actual} val")
     
 
-    train_dataset = dataset.select(range(0, train_size))
-    val_dataset = dataset.select(range(train_size, total_size))
+    # Random split to avoid dataset ordering bias
+    indices = list(range(total_size))
+    random.Random(42).shuffle(indices)
+    val_indices = indices[:val_size_actual]
+    train_indices = indices[val_size_actual:]
+    train_dataset = dataset.select(train_indices)
+    val_dataset = dataset.select(val_indices)
     # Process dataset
     from functools import partial
     train_dataset = train_dataset.map(
