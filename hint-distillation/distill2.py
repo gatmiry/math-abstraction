@@ -23,7 +23,7 @@ import apple_bolt as bolt
 
 # Paths
 HINTS_DATASET = "../newopenaioutputs/hints_dataset"
-MODEL_PATH = "Qwen/Qwen2-Math-7B-Instruct"
+MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507"
 OUTPUT_DIR = os.path.join(bolt.ARTIFACT_DIR, "iterative_distillation")
 TEST_SIZE = 512
 SAVE_STEPS = 50  # Save checkpoint every N steps
@@ -82,7 +82,7 @@ def extract_boxed_answer(text: str) -> Optional[str]:
 
 
 def normalize_answer(answer: str) -> str:
-    """Normalize answer for comparison."""
+    """Normalize answer for basic string comparison."""
     if answer is None:
         return ""
     ans = answer.strip()
@@ -92,12 +92,58 @@ def normalize_answer(answer: str) -> str:
     return ans.lower()
 
 
+def parse_latex_to_sympy(latex_str: str):
+    """Try to parse LaTeX string to SymPy expression using latex2sympy2."""
+    try:
+        from latex2sympy2 import latex2sympy
+        
+        # Clean up the LaTeX string
+        latex_str = latex_str.strip()
+        # Handle common LaTeX patterns
+        latex_str = latex_str.replace('\\dfrac', '\\frac')
+        latex_str = latex_str.replace('\\tfrac', '\\frac')
+        
+        expr = latex2sympy(latex_str)
+        return expr
+    except Exception:
+        return None
+
+
 def check_answer(generated: str, ground_truth: str) -> bool:
-    """Check if generated answer matches ground truth."""
+    """Check if generated answer matches ground truth using symbolic comparison."""
     gen_ans = extract_boxed_answer(generated)
     if gen_ans is None:
         return False
-    return normalize_answer(gen_ans) == normalize_answer(ground_truth)
+    
+    # First try exact string match (after normalization)
+    if normalize_answer(gen_ans) == normalize_answer(ground_truth):
+        return True
+    
+    # Try symbolic comparison using SymPy
+    try:
+        from sympy import simplify, N
+        
+        gen_expr = parse_latex_to_sympy(gen_ans)
+        gt_expr = parse_latex_to_sympy(ground_truth)
+        
+        if gen_expr is not None and gt_expr is not None:
+            # Check if expressions are symbolically equal
+            diff = simplify(gen_expr - gt_expr)
+            if diff == 0:
+                return True
+            
+            # Try numerical comparison for expressions that can't be simplified symbolically
+            try:
+                gen_val = complex(N(gen_expr))
+                gt_val = complex(N(gt_expr))
+                if abs(gen_val - gt_val) < 1e-9:
+                    return True
+            except (TypeError, ValueError):
+                pass
+    except Exception:
+        pass
+    
+    return False
 
 
 def generate_and_find_pairs(model_path: str, dataset, args):
@@ -211,13 +257,28 @@ def generate_and_find_pairs(model_path: str, dataset, args):
     return distillation_pairs, stats
 
 
-def evaluate_on_holdout(model_path: str, full_dataset, test_indices: List[int], args):
-    """Evaluate model on holdout test set. Returns results dict and list of generations."""
+def evaluate_on_holdout(model_path: str, full_dataset, test_indices: List[int], args, 
+                        eval_weakest: bool = False, eval_strongest: bool = False):
+    """Evaluate model on holdout test set. Returns results dict and list of generations.
+    
+    By default only evaluates without hints. Use eval_weakest and eval_strongest flags
+    to also evaluate with weakest/strongest hints.
+    """
     from vllm import LLM, SamplingParams
     
     os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
     
+    # Determine which hint types to evaluate
+    hint_types_to_eval = [("no_hint", None)]  # Always evaluate no_hint
+    if eval_weakest:
+        hint_types_to_eval.append(("weakest", "weakest"))
+    if eval_strongest:
+        hint_types_to_eval.append(("strongest", "strongest"))
+    
+    hint_type_names = [ht[0] for ht in hint_types_to_eval]
     print(f"Evaluating model {model_path} on {len(test_indices)} holdout problems...")
+    print(f"  Hint types: {hint_type_names}")
+    
     llm = LLM(
         model=model_path,
         tensor_parallel_size=4,
@@ -228,7 +289,7 @@ def evaluate_on_holdout(model_path: str, full_dataset, test_indices: List[int], 
     tokenizer = llm.get_tokenizer()
     sampling_params = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
 
-    # Prepare prompts for no hint, weakest hint, and strongest hint
+    # Prepare prompts based on selected hint types
     all_prompts = []
     prompt_metadata = []  # (test_idx, hint_type, ground_truth, problem, hint, partial_proof)
 
@@ -242,8 +303,20 @@ def evaluate_on_holdout(model_path: str, full_dataset, test_indices: List[int], 
         if not hints:
             continue
 
-        # Test with no hint, weakest hint (hints[0]), and strongest hint (hints[-1])
-        for hint_type, hint in [("no_hint", None), ("weakest", hints[0]), ("strongest", hints[-1])]:
+        # Build list of (hint_type_name, actual_hint) for this problem
+        prompts_for_problem = []
+        for hint_type_name, hint_marker in hint_types_to_eval:
+            if hint_marker is None:
+                actual_hint = None
+            elif hint_marker == "weakest":
+                actual_hint = hints[0]
+            elif hint_marker == "strongest":
+                actual_hint = hints[-1]
+            else:
+                actual_hint = None
+            prompts_for_problem.append((hint_type_name, actual_hint))
+        
+        for hint_type, hint in prompts_for_problem:
             messages = format_prompt(problem, partial_proof, hint)
             prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             all_prompts.append(prompt_text)
@@ -254,11 +327,9 @@ def evaluate_on_holdout(model_path: str, full_dataset, test_indices: List[int], 
     outputs = llm.generate(all_prompts, sampling_params)
 
     # Evaluate and collect generations
-    results = {
-        "no_hint": {"correct": 0, "total": 0},
-        "weakest": {"correct": 0, "total": 0},
-        "strongest": {"correct": 0, "total": 0}
-    }
+    results = {}
+    for hint_type_name in hint_type_names:
+        results[hint_type_name] = {"correct": 0, "total": 0}
     generations = []  # List of all generations with metadata
 
     for output, (test_idx, hint_type, gt, problem, hint, partial_proof) in zip(outputs, prompt_metadata):
@@ -282,7 +353,7 @@ def evaluate_on_holdout(model_path: str, full_dataset, test_indices: List[int], 
         })
 
     # Calculate accuracies
-    for hint_type in ["no_hint", "weakest", "strongest"]:
+    for hint_type in hint_type_names:
         total = results[hint_type]["total"]
         correct = results[hint_type]["correct"]
         results[hint_type]["accuracy"] = correct / total if total > 0 else 0.0
@@ -346,7 +417,7 @@ def main():
     parser.add_argument("--dataset", type=str, default=HINTS_DATASET)
     parser.add_argument("--output", type=str, default=OUTPUT_DIR)
     parser.add_argument("--rounds", type=int, default=5, help="Number of distillation rounds")
-    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--test-size", type=int, default=TEST_SIZE)
@@ -354,6 +425,8 @@ def main():
     parser.add_argument("--epochs-per-round", type=int, default=1, help="Epochs per finetuning round")
     parser.add_argument("--lr", type=float, default=2e-6)
     parser.add_argument("--save-steps", type=int, default=SAVE_STEPS, help="Save checkpoint every N steps")
+    parser.add_argument("--eval-weakest", action="store_true", help="Also evaluate with weakest hint on holdout set")
+    parser.add_argument("--eval-strongest", action="store_true", help="Also evaluate with strongest hint on holdout set")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -397,28 +470,35 @@ def main():
     print(f"{'='*60}")
     print(f"Evaluating base model: {current_model}")
     
-    base_eval_results, base_generations = evaluate_on_holdout(current_model, full_dataset, test_indices, args)
+    base_eval_results, base_generations = evaluate_on_holdout(
+        current_model, full_dataset, test_indices, args,
+        eval_weakest=args.eval_weakest, eval_strongest=args.eval_strongest
+    )
     
     base_stats = {
         "round": 0,
         "model": current_model,
         "pairs_found": 0,
         "eval_no_hint_acc": base_eval_results["no_hint"]["accuracy"],
-        "eval_strongest_acc": base_eval_results["strongest"]["accuracy"],
-        "eval_weakest_acc": base_eval_results["weakest"]["accuracy"],
         "eval_no_hint_correct": base_eval_results["no_hint"]["correct"],
         "eval_no_hint_total": base_eval_results["no_hint"]["total"],
-        "eval_strongest_correct": base_eval_results["strongest"]["correct"],
-        "eval_strongest_total": base_eval_results["strongest"]["total"],
-        "eval_weakest_correct": base_eval_results["weakest"]["correct"],
-        "eval_weakest_total": base_eval_results["weakest"]["total"],
     }
+    if args.eval_weakest:
+        base_stats["eval_weakest_acc"] = base_eval_results["weakest"]["accuracy"]
+        base_stats["eval_weakest_correct"] = base_eval_results["weakest"]["correct"]
+        base_stats["eval_weakest_total"] = base_eval_results["weakest"]["total"]
+    if args.eval_strongest:
+        base_stats["eval_strongest_acc"] = base_eval_results["strongest"]["accuracy"]
+        base_stats["eval_strongest_correct"] = base_eval_results["strongest"]["correct"]
+        base_stats["eval_strongest_total"] = base_eval_results["strongest"]["total"]
     all_round_stats.append(base_stats)
     
     print(f"[Round 0] Base Model Eval Results:")
     print(f"  NO HINT: {base_eval_results['no_hint']['correct']}/{base_eval_results['no_hint']['total']} = {base_eval_results['no_hint']['accuracy']*100:.1f}%")
-    print(f"  WEAKEST hint: {base_eval_results['weakest']['correct']}/{base_eval_results['weakest']['total']} = {base_eval_results['weakest']['accuracy']*100:.1f}%")
-    print(f"  STRONGEST hint: {base_eval_results['strongest']['correct']}/{base_eval_results['strongest']['total']} = {base_eval_results['strongest']['accuracy']*100:.1f}%")
+    if args.eval_weakest:
+        print(f"  WEAKEST hint: {base_eval_results['weakest']['correct']}/{base_eval_results['weakest']['total']} = {base_eval_results['weakest']['accuracy']*100:.1f}%")
+    if args.eval_strongest:
+        print(f"  STRONGEST hint: {base_eval_results['strongest']['correct']}/{base_eval_results['strongest']['total']} = {base_eval_results['strongest']['accuracy']*100:.1f}%")
     
     # Save base model performance and generations
     base_perf = {
@@ -428,13 +508,15 @@ def main():
         "no_hint_accuracy": base_eval_results["no_hint"]["accuracy"],
         "no_hint_correct": base_eval_results["no_hint"]["correct"],
         "no_hint_total": base_eval_results["no_hint"]["total"],
-        "weakest_accuracy": base_eval_results["weakest"]["accuracy"],
-        "weakest_correct": base_eval_results["weakest"]["correct"],
-        "weakest_total": base_eval_results["weakest"]["total"],
-        "strongest_accuracy": base_eval_results["strongest"]["accuracy"],
-        "strongest_correct": base_eval_results["strongest"]["correct"],
-        "strongest_total": base_eval_results["strongest"]["total"],
     }
+    if args.eval_weakest:
+        base_perf["weakest_accuracy"] = base_eval_results["weakest"]["accuracy"]
+        base_perf["weakest_correct"] = base_eval_results["weakest"]["correct"]
+        base_perf["weakest_total"] = base_eval_results["weakest"]["total"]
+    if args.eval_strongest:
+        base_perf["strongest_accuracy"] = base_eval_results["strongest"]["accuracy"]
+        base_perf["strongest_correct"] = base_eval_results["strongest"]["correct"]
+        base_perf["strongest_total"] = base_eval_results["strongest"]["total"]
     perf_path = os.path.join(perf_dir, "round_0_performance.json")
     with open(perf_path, "w") as f:
         json.dump(base_perf, f, indent=2)
@@ -484,23 +566,30 @@ def main():
         
         # Step 3: Evaluate on holdout set
         print(f"\n[Round {round_num}] Step 3: Evaluating on holdout set...")
-        eval_results, eval_generations = evaluate_on_holdout(current_model, full_dataset, test_indices, args)
+        eval_results, eval_generations = evaluate_on_holdout(
+            current_model, full_dataset, test_indices, args,
+            eval_weakest=args.eval_weakest, eval_strongest=args.eval_strongest
+        )
         
         # Add eval results to stats
         stats["eval_no_hint_acc"] = eval_results["no_hint"]["accuracy"]
-        stats["eval_strongest_acc"] = eval_results["strongest"]["accuracy"]
-        stats["eval_weakest_acc"] = eval_results["weakest"]["accuracy"]
         stats["eval_no_hint_correct"] = eval_results["no_hint"]["correct"]
         stats["eval_no_hint_total"] = eval_results["no_hint"]["total"]
-        stats["eval_strongest_correct"] = eval_results["strongest"]["correct"]
-        stats["eval_strongest_total"] = eval_results["strongest"]["total"]
-        stats["eval_weakest_correct"] = eval_results["weakest"]["correct"]
-        stats["eval_weakest_total"] = eval_results["weakest"]["total"]
+        if args.eval_weakest:
+            stats["eval_weakest_acc"] = eval_results["weakest"]["accuracy"]
+            stats["eval_weakest_correct"] = eval_results["weakest"]["correct"]
+            stats["eval_weakest_total"] = eval_results["weakest"]["total"]
+        if args.eval_strongest:
+            stats["eval_strongest_acc"] = eval_results["strongest"]["accuracy"]
+            stats["eval_strongest_correct"] = eval_results["strongest"]["correct"]
+            stats["eval_strongest_total"] = eval_results["strongest"]["total"]
         
         print(f"[Round {round_num}] Eval Results:")
         print(f"  NO HINT: {eval_results['no_hint']['correct']}/{eval_results['no_hint']['total']} = {eval_results['no_hint']['accuracy']*100:.1f}%")
-        print(f"  WEAKEST hint: {eval_results['weakest']['correct']}/{eval_results['weakest']['total']} = {eval_results['weakest']['accuracy']*100:.1f}%")
-        print(f"  STRONGEST hint: {eval_results['strongest']['correct']}/{eval_results['strongest']['total']} = {eval_results['strongest']['accuracy']*100:.1f}%")
+        if args.eval_weakest:
+            print(f"  WEAKEST hint: {eval_results['weakest']['correct']}/{eval_results['weakest']['total']} = {eval_results['weakest']['accuracy']*100:.1f}%")
+        if args.eval_strongest:
+            print(f"  STRONGEST hint: {eval_results['strongest']['correct']}/{eval_results['strongest']['total']} = {eval_results['strongest']['accuracy']*100:.1f}%")
         
         # Save eval results for this round
         eval_path = os.path.join(round_dir, "eval_results.json")
@@ -515,13 +604,15 @@ def main():
             "no_hint_accuracy": eval_results["no_hint"]["accuracy"],
             "no_hint_correct": eval_results["no_hint"]["correct"],
             "no_hint_total": eval_results["no_hint"]["total"],
-            "weakest_accuracy": eval_results["weakest"]["accuracy"],
-            "weakest_correct": eval_results["weakest"]["correct"],
-            "weakest_total": eval_results["weakest"]["total"],
-            "strongest_accuracy": eval_results["strongest"]["accuracy"],
-            "strongest_correct": eval_results["strongest"]["correct"],
-            "strongest_total": eval_results["strongest"]["total"],
         }
+        if args.eval_weakest:
+            round_perf["weakest_accuracy"] = eval_results["weakest"]["accuracy"]
+            round_perf["weakest_correct"] = eval_results["weakest"]["correct"]
+            round_perf["weakest_total"] = eval_results["weakest"]["total"]
+        if args.eval_strongest:
+            round_perf["strongest_accuracy"] = eval_results["strongest"]["accuracy"]
+            round_perf["strongest_correct"] = eval_results["strongest"]["correct"]
+            round_perf["strongest_total"] = eval_results["strongest"]["total"]
         perf_path = os.path.join(perf_dir, f"round_{round_num}_performance.json")
         with open(perf_path, "w") as f:
             json.dump(round_perf, f, indent=2)
@@ -549,20 +640,23 @@ def main():
         "final_model": current_model,
     }
     for s in all_round_stats:
-        if "eval_strongest_acc" in s:
-            eval_summary["rounds"].append({
+        if "eval_no_hint_acc" in s:
+            round_summary = {
                 "round": s["round"],
                 "pairs_found": s["pairs_found"],
                 "no_hint_acc": s["eval_no_hint_acc"],
-                "weakest_acc": s["eval_weakest_acc"],
-                "strongest_acc": s["eval_strongest_acc"],
                 "no_hint_correct": s["eval_no_hint_correct"],
                 "no_hint_total": s["eval_no_hint_total"],
-                "weakest_correct": s["eval_weakest_correct"],
-                "weakest_total": s["eval_weakest_total"],
-                "strongest_correct": s["eval_strongest_correct"],
-                "strongest_total": s["eval_strongest_total"],
-            })
+            }
+            if "eval_weakest_acc" in s:
+                round_summary["weakest_acc"] = s["eval_weakest_acc"]
+                round_summary["weakest_correct"] = s["eval_weakest_correct"]
+                round_summary["weakest_total"] = s["eval_weakest_total"]
+            if "eval_strongest_acc" in s:
+                round_summary["strongest_acc"] = s["eval_strongest_acc"]
+                round_summary["strongest_correct"] = s["eval_strongest_correct"]
+                round_summary["strongest_total"] = s["eval_strongest_total"]
+            eval_summary["rounds"].append(round_summary)
     with open(eval_summary_path, "w") as f:
         json.dump(eval_summary, f, indent=2)
     print(f"Evaluation summary saved to {eval_summary_path}")
@@ -576,8 +670,13 @@ def main():
     print("\nRound-by-round stats:")
     for s in all_round_stats:
         pairs_info = f"{s['pairs_found']} pairs"
-        if "eval_strongest_acc" in s:
-            eval_info = f"eval: no_hint={s['eval_no_hint_acc']*100:.1f}%, weak={s['eval_weakest_acc']*100:.1f}%, strong={s['eval_strongest_acc']*100:.1f}%"
+        if "eval_no_hint_acc" in s:
+            eval_parts = [f"no_hint={s['eval_no_hint_acc']*100:.1f}%"]
+            if "eval_weakest_acc" in s:
+                eval_parts.append(f"weak={s['eval_weakest_acc']*100:.1f}%")
+            if "eval_strongest_acc" in s:
+                eval_parts.append(f"strong={s['eval_strongest_acc']*100:.1f}%")
+            eval_info = f"eval: {', '.join(eval_parts)}"
             print(f"  Round {s['round']}: {pairs_info}, {eval_info}")
         else:
             print(f"  Round {s['round']}: {pairs_info}")
