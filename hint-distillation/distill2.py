@@ -57,12 +57,27 @@ def format_prompt(problem: str, partial_proof: str, hint: str = None) -> List[Di
 
 
 def extract_boxed_answer(text: str) -> Optional[str]:
-    """Extract answer from \\box{...} or \\boxed{...}."""
-    patterns = [r'\\box\{([^}]+)\}', r'\\boxed\{([^}]+)\}']
-    for pattern in patterns:
-        matches = re.findall(pattern, text)
-        if matches:
-            return matches[-1].strip()
+    """Extract answer from \\box{...} or \\boxed{...} using proper brace matching."""
+    # Find all occurrences of \box{ or \boxed{
+    matches = list(re.finditer(r'\\box(ed)?\{', text))
+    if not matches:
+        return None
+    
+    # Use the last occurrence (final answer is typically at the end)
+    start_pos = matches[-1].end()
+    depth = 1
+    i = start_pos
+    
+    # Match braces properly to handle nested expressions like \frac{...}{...}
+    while i < len(text) and depth > 0:
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+        i += 1
+    
+    if depth == 0:
+        return text[start_pos:i-1].strip()
     return None
 
 
@@ -330,7 +345,7 @@ def main():
     parser.add_argument("--model", type=str, default=MODEL_PATH)
     parser.add_argument("--dataset", type=str, default=HINTS_DATASET)
     parser.add_argument("--output", type=str, default=OUTPUT_DIR)
-    parser.add_argument("--rounds", type=int, default=3, help="Number of distillation rounds")
+    parser.add_argument("--rounds", type=int, default=5, help="Number of distillation rounds")
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--limit", type=int, default=None)
