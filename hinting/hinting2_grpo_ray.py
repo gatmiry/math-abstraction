@@ -156,7 +156,7 @@ except ImportError:
     pass  # verl 0.4.x may not have this
 
 # Configuration
-DEFAULT_MODEL_PATH = "Qwen/Qwen2-Math-7B-Instruct"
+DEFAULT_MODEL_PATH = "Qwen/Qwen3-4B-Instruct"
 DATASET_NAME = "../newopenaioutputs/hints_dataset"  # Omni-MATH dataset
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
@@ -787,7 +787,7 @@ def main():
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.9",
         "actor_rollout_ref.rollout.prompt_length=2560",
-        "actor_rollout_ref.rollout.response_length=1536",
+        "actor_rollout_ref.rollout.response_length=4096",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8",
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
