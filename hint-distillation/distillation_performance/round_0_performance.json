@@ -1,0 +1,14 @@
+{
+  "round": 0,
+  "model": "Qwen/Qwen2-Math-7B-Instruct",
+  "pairs_found": 0,
+  "no_hint_accuracy": 0.17436974789915966,
+  "no_hint_correct": 83,
+  "no_hint_total": 476,
+  "weakest_accuracy": 0.1869747899159664,
+  "weakest_correct": 89,
+  "weakest_total": 476,
+  "strongest_accuracy": 0.33403361344537813,
+  "strongest_correct": 159,
+  "strongest_total": 476
+}

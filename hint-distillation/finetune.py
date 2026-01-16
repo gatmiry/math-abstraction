@@ -18,8 +18,6 @@ from transformers import (
     TrainingArguments,
     Trainer,
 )
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 
 MODEL_PATH = "Qwen/Qwen2-Math-7B-Instruct"
 DATA_PATH = "./distillation_data/sft_dataset"
@@ -116,7 +114,7 @@ def main():
     model = get_peft_model(model, config)
     model.print_trainable_parameters()
     
-    # Training arguments with FSDP
+    # Training arguments with DDP (FSDP has issues with LoRA + gradient_checkpointing)
     training_args = TrainingArguments(
         output_dir=args.output,
         num_train_epochs=args.epochs,
@@ -127,9 +125,9 @@ def main():
         logging_steps=10,
         save_strategy="epoch",
         save_total_limit=2,
-        fsdp="full_shard auto_wrap",
-        fsdp_config={"fsdp_transformer_layer_cls_to_wrap": "Qwen2DecoderLayer"},
+        ddp_find_unused_parameters=False,
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},  # Required for LoRA
         report_to="none",
     )
     
@@ -148,45 +146,24 @@ def main():
     # Save final model - merge LoRA weights and save full model
     final_path = os.path.join(args.output, "final")
     
-    # Check if we're using FSDP and handle state dict properly
-    if isinstance(trainer.model, FSDP):
-        # Use FSDP's proper state dict consolidation
-        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(trainer.model, StateDictType.FULL_STATE_DICT, save_policy):
-            state_dict = trainer.model.state_dict()
-            
-            # Only save on rank 0
-            if dist.get_rank() == 0:
-                # Load a fresh PEFT model and load the state dict
-                from peft import get_peft_model
-                save_model = AutoModelForCausalLM.from_pretrained(
-                    args.model,
-                    torch_dtype=torch.bfloat16,
-                    trust_remote_code=True,
-                )
-                save_model = get_peft_model(save_model, config)
-                save_model.load_state_dict(state_dict)
-                
-                # Merge LoRA weights into base model and save
-                merged_model = save_model.merge_and_unload()
-                merged_model.save_pretrained(final_path)
-                tokenizer.save_pretrained(final_path)
-                print(f"Merged model saved to {final_path}")
-        
-        # Barrier to ensure all ranks wait for save to complete
-        dist.barrier()
-    else:
-        # Not FSDP - get the PEFT model, merge LoRA weights, and save
+    # Only save on rank 0
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if local_rank == 0:
+        # Get the PEFT model (unwrap DDP if needed)
         if hasattr(trainer.model, "module"):
             peft_model = trainer.model.module
         else:
             peft_model = trainer.model
         
-        # Merge LoRA weights into base model
+        # Merge LoRA weights into base model and save
         merged_model = peft_model.merge_and_unload()
         merged_model.save_pretrained(final_path)
         tokenizer.save_pretrained(final_path)
         print(f"Merged model saved to {final_path}")
+    
+    # Barrier to ensure all ranks wait for save to complete
+    if dist.is_initialized():
+        dist.barrier()
 
 
 if __name__ == "__main__":
