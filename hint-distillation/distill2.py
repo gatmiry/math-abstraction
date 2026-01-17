@@ -28,28 +28,42 @@ OUTPUT_DIR = os.path.join(bolt.ARTIFACT_DIR, "iterative_distillation")
 TEST_SIZE = 512
 SAVE_STEPS = 50  # Save checkpoint every N steps
 
-SYSTEM_PROMPT_WITH_HINT = """You are learning to solve mathematics problems. You will be given a math problem, a partial proof or solution, and a hint. Your task is to carefully complete the proof or solution, step by step, providing clear reasoning at each stage (do not skip steps), making appropriate use of the hint. Only after finishing the complete reasoning, write the final answer at the end, clearly enclosed in the \\box{...} environment as is standard in LaTeX. 
+SYSTEM_PROMPT_WITH_HINT = """You are a mathematics problem solver. You will be given a problem, the beginning of a solution, and a hint. Your task is to CONTINUE the solution EXACTLY from where it left off - do not restart or repeat what's already written. Pick up the reasoning from the last sentence and complete the proof.
 
-- For each step, show the logical process and all intermediate computations or deductions.
-- Use the provided hint as needed to help guide your reasoning.
-- Only after reasoning is finished, put the final answer at the end, in its own line, using \\box{...}
-- Use plain text with embedded LaTeX where mathematical symbols or equations are necessary."""
+- Continue directly from the partial solution provided - do not restate the problem or start over
+- Use the hint to guide your continuation
+- Show clear step-by-step reasoning for all remaining steps
+- End with the final answer in \\box{...} format"""
 
-SYSTEM_PROMPT_NO_HINT = """You are learning to solve mathematics problems. You will be given a math problem and a partial proof or solution. Your task is to carefully complete the proof or solution, step by step, providing clear reasoning at each stage (do not skip steps). Only after finishing the complete reasoning, write the final answer at the end, clearly enclosed in the \\box{...} environment as is standard in LaTeX. 
+SYSTEM_PROMPT_NO_HINT = """You are a mathematics problem solver. You will be given a problem and the beginning of a solution. Your task is to CONTINUE the solution EXACTLY from where it left off - do not restart or repeat what's already written. Pick up the reasoning from the last sentence and complete the proof.
 
-- For each step, show the logical process and all intermediate computations or deductions.
-- Only after reasoning is finished, put the final answer at the end, in its own line, using \\box{...}
-- Use plain text with embedded LaTeX where mathematical symbols or equations are necessary."""
+- Continue directly from the partial solution provided - do not restate the problem or start over
+- Show clear step-by-step reasoning for all remaining steps
+- End with the final answer in \\box{...} format"""
 
 
 def format_prompt(problem: str, partial_proof: str, hint: str = None) -> List[Dict[str, str]]:
-    """Format a prompt with optional hint."""
+    """Format a prompt with optional hint, explicitly asking model to continue from partial proof."""
     if hint:
         system_prompt = SYSTEM_PROMPT_WITH_HINT
-        user_content = f"Problem: {problem}\n\nPartial proof: {partial_proof}\n\nHint: {hint}"
+        user_content = f"""Problem: {problem}
+
+Here is the beginning of a solution. Continue EXACTLY from where it leaves off (do not restart):
+
+{partial_proof}
+
+Hint for continuation: {hint}
+
+Now continue the solution from this point:"""
     else:
         system_prompt = SYSTEM_PROMPT_NO_HINT
-        user_content = f"Problem: {problem}\n\nPartial proof: {partial_proof}"
+        user_content = f"""Problem: {problem}
+
+Here is the beginning of a solution. Continue EXACTLY from where it leaves off (do not restart):
+
+{partial_proof}
+
+Now continue the solution from this point:"""
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content}
@@ -427,6 +441,7 @@ def main():
     parser.add_argument("--save-steps", type=int, default=SAVE_STEPS, help="Save checkpoint every N steps")
     parser.add_argument("--eval-weakest", action="store_true", help="Also evaluate with weakest hint on holdout set")
     parser.add_argument("--eval-strongest", action="store_true", help="Also evaluate with strongest hint on holdout set")
+    parser.add_argument("--test-freq", type=int, default=1, help="Evaluate on holdout every N rounds (default: every round)")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -564,65 +579,69 @@ def main():
         current_model = new_model_path
         print(f"[Round {round_num}] New model: {current_model}")
         
-        # Step 3: Evaluate on holdout set
-        print(f"\n[Round {round_num}] Step 3: Evaluating on holdout set...")
-        eval_results, eval_generations = evaluate_on_holdout(
-            current_model, full_dataset, test_indices, args,
-            eval_weakest=args.eval_weakest, eval_strongest=args.eval_strongest
-        )
-        
-        # Add eval results to stats
-        stats["eval_no_hint_acc"] = eval_results["no_hint"]["accuracy"]
-        stats["eval_no_hint_correct"] = eval_results["no_hint"]["correct"]
-        stats["eval_no_hint_total"] = eval_results["no_hint"]["total"]
-        if args.eval_weakest:
-            stats["eval_weakest_acc"] = eval_results["weakest"]["accuracy"]
-            stats["eval_weakest_correct"] = eval_results["weakest"]["correct"]
-            stats["eval_weakest_total"] = eval_results["weakest"]["total"]
-        if args.eval_strongest:
-            stats["eval_strongest_acc"] = eval_results["strongest"]["accuracy"]
-            stats["eval_strongest_correct"] = eval_results["strongest"]["correct"]
-            stats["eval_strongest_total"] = eval_results["strongest"]["total"]
-        
-        print(f"[Round {round_num}] Eval Results:")
-        print(f"  NO HINT: {eval_results['no_hint']['correct']}/{eval_results['no_hint']['total']} = {eval_results['no_hint']['accuracy']*100:.1f}%")
-        if args.eval_weakest:
-            print(f"  WEAKEST hint: {eval_results['weakest']['correct']}/{eval_results['weakest']['total']} = {eval_results['weakest']['accuracy']*100:.1f}%")
-        if args.eval_strongest:
-            print(f"  STRONGEST hint: {eval_results['strongest']['correct']}/{eval_results['strongest']['total']} = {eval_results['strongest']['accuracy']*100:.1f}%")
-        
-        # Save eval results for this round
-        eval_path = os.path.join(round_dir, "eval_results.json")
-        with open(eval_path, "w") as f:
-            json.dump(eval_results, f, indent=2)
-        
-        # Save performance and generations to distillation_performance folder
-        round_perf = {
-            "round": round_num,
-            "model": current_model,
-            "pairs_found": stats["pairs_found"],
-            "no_hint_accuracy": eval_results["no_hint"]["accuracy"],
-            "no_hint_correct": eval_results["no_hint"]["correct"],
-            "no_hint_total": eval_results["no_hint"]["total"],
-        }
-        if args.eval_weakest:
-            round_perf["weakest_accuracy"] = eval_results["weakest"]["accuracy"]
-            round_perf["weakest_correct"] = eval_results["weakest"]["correct"]
-            round_perf["weakest_total"] = eval_results["weakest"]["total"]
-        if args.eval_strongest:
-            round_perf["strongest_accuracy"] = eval_results["strongest"]["accuracy"]
-            round_perf["strongest_correct"] = eval_results["strongest"]["correct"]
-            round_perf["strongest_total"] = eval_results["strongest"]["total"]
-        perf_path = os.path.join(perf_dir, f"round_{round_num}_performance.json")
-        with open(perf_path, "w") as f:
-            json.dump(round_perf, f, indent=2)
-        print(f"  Performance saved to {perf_path}")
-        
-        # Save generations to mid_generations folder
-        gen_path = os.path.join(generations_dir, f"round_{round_num}_generations.json")
-        with open(gen_path, "w") as f:
-            json.dump(eval_generations, f, indent=2)
-        print(f"  Generations saved to {gen_path}")
+        # Step 3: Evaluate on holdout set (only every test_freq rounds)
+        should_eval = (round_num % args.test_freq == 0) or (round_num == args.rounds)
+        if should_eval:
+            print(f"\n[Round {round_num}] Step 3: Evaluating on holdout set...")
+            eval_results, eval_generations = evaluate_on_holdout(
+                current_model, full_dataset, test_indices, args,
+                eval_weakest=args.eval_weakest, eval_strongest=args.eval_strongest
+            )
+            
+            # Add eval results to stats
+            stats["eval_no_hint_acc"] = eval_results["no_hint"]["accuracy"]
+            stats["eval_no_hint_correct"] = eval_results["no_hint"]["correct"]
+            stats["eval_no_hint_total"] = eval_results["no_hint"]["total"]
+            if args.eval_weakest:
+                stats["eval_weakest_acc"] = eval_results["weakest"]["accuracy"]
+                stats["eval_weakest_correct"] = eval_results["weakest"]["correct"]
+                stats["eval_weakest_total"] = eval_results["weakest"]["total"]
+            if args.eval_strongest:
+                stats["eval_strongest_acc"] = eval_results["strongest"]["accuracy"]
+                stats["eval_strongest_correct"] = eval_results["strongest"]["correct"]
+                stats["eval_strongest_total"] = eval_results["strongest"]["total"]
+            
+            print(f"[Round {round_num}] Eval Results:")
+            print(f"  NO HINT: {eval_results['no_hint']['correct']}/{eval_results['no_hint']['total']} = {eval_results['no_hint']['accuracy']*100:.1f}%")
+            if args.eval_weakest:
+                print(f"  WEAKEST hint: {eval_results['weakest']['correct']}/{eval_results['weakest']['total']} = {eval_results['weakest']['accuracy']*100:.1f}%")
+            if args.eval_strongest:
+                print(f"  STRONGEST hint: {eval_results['strongest']['correct']}/{eval_results['strongest']['total']} = {eval_results['strongest']['accuracy']*100:.1f}%")
+            
+            # Save eval results for this round
+            eval_path = os.path.join(round_dir, "eval_results.json")
+            with open(eval_path, "w") as f:
+                json.dump(eval_results, f, indent=2)
+            
+            # Save performance and generations to distillation_performance folder
+            round_perf = {
+                "round": round_num,
+                "model": current_model,
+                "pairs_found": stats["pairs_found"],
+                "no_hint_accuracy": eval_results["no_hint"]["accuracy"],
+                "no_hint_correct": eval_results["no_hint"]["correct"],
+                "no_hint_total": eval_results["no_hint"]["total"],
+            }
+            if args.eval_weakest:
+                round_perf["weakest_accuracy"] = eval_results["weakest"]["accuracy"]
+                round_perf["weakest_correct"] = eval_results["weakest"]["correct"]
+                round_perf["weakest_total"] = eval_results["weakest"]["total"]
+            if args.eval_strongest:
+                round_perf["strongest_accuracy"] = eval_results["strongest"]["accuracy"]
+                round_perf["strongest_correct"] = eval_results["strongest"]["correct"]
+                round_perf["strongest_total"] = eval_results["strongest"]["total"]
+            perf_path = os.path.join(perf_dir, f"round_{round_num}_performance.json")
+            with open(perf_path, "w") as f:
+                json.dump(round_perf, f, indent=2)
+            print(f"  Performance saved to {perf_path}")
+            
+            # Save generations to mid_generations folder
+            gen_path = os.path.join(generations_dir, f"round_{round_num}_generations.json")
+            with open(gen_path, "w") as f:
+                json.dump(eval_generations, f, indent=2)
+            print(f"  Generations saved to {gen_path}")
+        else:
+            print(f"\n[Round {round_num}] Skipping evaluation (test_freq={args.test_freq})")
 
     # Save summary
     summary_path = os.path.join(args.output, "summary.json")

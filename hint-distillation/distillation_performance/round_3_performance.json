@@ -1,14 +1,8 @@
 {
   "round": 3,
   "model": "/mnt/task_wrapper/user_output/artifacts/iterative_distillation/round_3/model/final",
-  "pairs_found": 581,
-  "no_hint_accuracy": 0.32563025210084034,
-  "no_hint_correct": 155,
-  "no_hint_total": 476,
-  "weakest_accuracy": 0.3319327731092437,
-  "weakest_correct": 158,
-  "weakest_total": 476,
-  "strongest_accuracy": 0.45168067226890757,
-  "strongest_correct": 215,
-  "strongest_total": 476
+  "pairs_found": 623,
+  "no_hint_accuracy": 0.36134453781512604,
+  "no_hint_correct": 172,
+  "no_hint_total": 476
 }

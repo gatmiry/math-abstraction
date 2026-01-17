@@ -2,13 +2,7 @@
   "round": 0,
   "model": "Qwen/Qwen3-4B-Instruct-2507",
   "pairs_found": 0,
-  "no_hint_accuracy": 0.3130252100840336,
-  "no_hint_correct": 149,
-  "no_hint_total": 476,
-  "weakest_accuracy": 0.35294117647058826,
-  "weakest_correct": 168,
-  "weakest_total": 476,
-  "strongest_accuracy": 0.4474789915966387,
-  "strongest_correct": 213,
-  "strongest_total": 476
+  "no_hint_accuracy": 0.3634453781512605,
+  "no_hint_correct": 173,
+  "no_hint_total": 476
 }
