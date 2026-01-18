@@ -1,0 +1,3 @@
+interaction:
+  - class_name: sbys_hinting.sbys_grpo.PromptUpdateInteraction
+    config: {}
