@@ -284,8 +284,10 @@ class PromptUpdateInteraction(BaseInteraction):
 
     def __init__(self, config):
         super().__init__(config)
-        self._state = {}
-
+        self.guide_steps_count = 0
+        self.unable_index = 0
+        self.able_index = 0
+        self.try_index = 0
     ##generate_response returns a 4‑tuple:
     # 1) should_terminate_sequence (bool)
     # 2) content (str) — the user message to add (or reset)
@@ -293,13 +295,16 @@ class PromptUpdateInteraction(BaseInteraction):
     # 4) metrics (dict) — any extra info to log
 
     async def generate_response(self, instance_id, messages, **kwargs):
+        initial_state = kwargs.get("state", {})
         ground_truth = kwargs.get("ground_truth")
         sbys_solution = kwargs.get("sbys_solution")
-        print(f"[PromptUpdateInteraction] sbys_solution={sbys_solution}")
-        initial_state = kwargs.get("state", {})
-        state = self._state.setdefault(
-            instance_id, dict(initial_state) if isinstance(initial_state, dict) else {}
-        )
+        if self.guide_steps_count == 0:
+            ## this means this is the first round
+            ## now initialized guide_steps_count and unable_index and able_index
+            self.guide_steps_count = len(sbys_solution)
+            self.able_index = self.guide_steps_count
+        
+        #print(f"[PromptUpdateInteraction] sbys_solution={sbys_solution}")
         last_assistant = ""
         for msg in reversed(messages):
             if msg.get("role") == "assistant":
@@ -312,33 +317,43 @@ class PromptUpdateInteraction(BaseInteraction):
         state["last_reward"] = reward
         state["last_answer"] = boxed_answer
 
-        if reward >= 1.0:
-            self._state.pop(instance_id, None)
+        if reward >= 0.9 and self.try_index == 0:
+            ## this means the method can solve the problem without any partial proofs, so we are done with this problem!
+            print(f"[PromptUpdateInteraction] Removing instance {instance_id} because guide steps completed")
             return True, "", reward, {"correct": True}
 
-        feedback = (
-            f"Attempt {state['attempt']} was incorrect.\n"
-            "Previous attempt was incorrect.\n"
-            f"Extracted answer: {boxed_answer}\n"
-            "Please try again and end with the final answer in \\box{...}."
-        )
+        ## here is the logic for specifying the next try_index
+        import math
+        if self.try_index <= self.unable_index and reward > 0.5:
+            self.able_index = self.try_index
+            if self.try_index == self.unable_index:
+                self.try_index = self.try_index - 1
+            else:
+                self.try_index = self.try_index - (self.unable_index - self.try_index)
+            self.try_index = max(self.try_index, 0)
+        elif self.try_index >= self.able_index and reward < 0.5:
+            self.unable_index = self.try_index
+            if self.try_index == self.able_index:
+                self.try_index = self.try_index + 1
+            else:
+                self.try_index = self.try_index + (self.try_index - self.able_index)
+            self.try_index = min(self.try_index, self.guide_steps_count)
+        else:
+            if reward < 0.5:
+                self.unable_index = self.try_index
+                self.try_index = math.ceil((self.try_index + self.able_index) / 2)
+            else:
+                self.able_index = self.try_index
+                self.try_index = math.floor((self.try_index + self.unable_index) / 2)
+
+
+        partial_answer = sbys_solution[:self.try_index].join("\n")
         updated_prompt = (
-            f"{feedback}\n"
-            f"State: {state}\n"
-            "Please produce a full solution and end with the final answer in \\box{...}."
+            f"problem: {problem}\n"
+            f"partial_proof: {partial_answer}\n"
+            f"Please produce a full solution and end with the final answer in \\box{...}."
         )
-        return False, f"{PROMPT_RESET_PREFIX}{updated_prompt}", reward, {"correct": False}
-
-
-def _reset_request_prompt(self, processing_class, new_user_content: str) -> None:
-    system_msg = None
-    for msg in self.messages:
-        if msg.role == "system":
-            system_msg = msg
-            break
-    if system_msg is None:
-        system_msg = Message(role="system", content="You are a helpful assistant.")
-    self.messages = [system_msg, Message(role="user", content=new_user_content)]
+        return False, f"{PROMPT_RESET_PREFIX}{updated_prompt}", reward, {new_try_index: new_try_index}
 
     tools = [tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None
     multi_modal_data = self.multi_modal_data or {}
