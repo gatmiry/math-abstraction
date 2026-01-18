@@ -1,35 +1,47 @@
 {
   "rounds": [
     {
+      "round": 0,
+      "pairs_found": 0,
+      "no_hint_acc": 0.35294117647058826,
+      "no_hint_correct": 168,
+      "no_hint_total": 476
+    },
+    {
       "round": 1,
-      "pairs_found": 650,
-      "strongest_acc": 0.3697478991596639,
-      "weakest_acc": 0.19117647058823528,
-      "strongest_correct": 176,
-      "strongest_total": 476,
-      "weakest_correct": 91,
-      "weakest_total": 476
+      "pairs_found": 626,
+      "no_hint_acc": 0.37815126050420167,
+      "no_hint_correct": 180,
+      "no_hint_total": 476
     },
     {
       "round": 2,
-      "pairs_found": 670,
-      "strongest_acc": 0.3592436974789916,
-      "weakest_acc": 0.18487394957983194,
-      "strongest_correct": 171,
-      "strongest_total": 476,
-      "weakest_correct": 88,
-      "weakest_total": 476
+      "pairs_found": 627,
+      "no_hint_acc": 0.3634453781512605,
+      "no_hint_correct": 173,
+      "no_hint_total": 476
     },
     {
       "round": 3,
-      "pairs_found": 672,
-      "strongest_acc": 0.3634453781512605,
-      "weakest_acc": 0.1953781512605042,
-      "strongest_correct": 173,
-      "strongest_total": 476,
-      "weakest_correct": 93,
-      "weakest_total": 476
+      "pairs_found": 623,
+      "no_hint_acc": 0.36134453781512604,
+      "no_hint_correct": 172,
+      "no_hint_total": 476
+    },
+    {
+      "round": 4,
+      "pairs_found": 627,
+      "no_hint_acc": 0.3697478991596639,
+      "no_hint_correct": 176,
+      "no_hint_total": 476
+    },
+    {
+      "round": 5,
+      "pairs_found": 624,
+      "no_hint_acc": 0.3634453781512605,
+      "no_hint_correct": 173,
+      "no_hint_total": 476
     }
   ],
-  "final_model": "/mnt/task_wrapper/user_output/artifacts/iterative_distillation/round_3/model/final"
+  "final_model": "/mnt/task_wrapper/user_output/artifacts/iterative_distillation/round_5/model/final"
 }
