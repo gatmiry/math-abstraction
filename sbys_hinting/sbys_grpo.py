@@ -19,10 +19,10 @@ os.environ["WANDB_SAVE_CODE"] = "true"
 TOKEN_FILE = os.path.join(os.path.dirname(__file__), "hf_token.txt")
 
 # System prompt file path
-SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
+SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full_solution.txt")
 
-# Which system prompt to use (from system_prompt.txt)
-SYSTEM_PROMPT_NAME = "default"
+# Which system prompt to use (from system_prompt_full_solution.txt)
+SYSTEM_PROMPT_NAME = "full_solution_simple"
 
 HINT_LEVEL = -1
 VAL_SIZE = 512
@@ -166,7 +166,7 @@ except ImportError:
 
 # Configuration
 DEFAULT_MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507"
-DATASET_NAME = "../newopenaioutputs/hints_dataset"  # Omni-MATH dataset
+DATASET_NAME = os.path.join(os.path.dirname(__file__), "outputs", "sbys_proofs_dataset")
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
 # Training hyperparameters
@@ -428,38 +428,21 @@ def install_prompt_reset_hook():
     AsyncRolloutRequest.add_user_message = patched_add_user_message
 
 
-def format_prompt(problem: str, partial_proof: str, hint: str = None, system_prompt: str = None) -> List[Dict[str, str]]:
+def format_prompt(problem: str, system_prompt: str = None) -> List[Dict[str, str]]:
     if system_prompt is None:
-        if hint:
-            system_prompt = load_system_prompt('default')
-        else:
-            system_prompt = load_system_prompt('onlypartialproof')
+        system_prompt = load_system_prompt(SYSTEM_PROMPT_NAME)
 
-    if hint:
-        messages = [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": f"Problem: {problem}\n\nPartial proof: {partial_proof}\n\nHint: {hint}"
-            }
-        ]
-        return messages
-    
-    else:
-        messages = [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": f"Problem: {problem}\n\nPartial proof: {partial_proof}"
-            }
-        ]
-        return messages
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt
+        },
+        {
+            "role": "user",
+            "content": f"Problem: {problem}"
+        }
+    ]
+    return messages
 
 def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None, val_size: int = 128, max_prompt_tokens: int = 2560, hint_level: int = 0):
     """Create RL dataset in verl format with train/val split.
@@ -480,37 +463,21 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
     dataset = load_from_disk(dataset_path)
     
     # Format dataset - store messages as JSON for verl to parse
-    def format_dataset(examples, is_train: bool = True, hint_level: int = 0):
+    def format_dataset(examples):
         """Format dataset examples for GRPO training."""
         prompts = []
         answers = []
-        for problem, partial_proof, final_answer, hints in zip(
-            examples['problem'], examples['partial_proof'], examples['final_answer'], examples['hints']
+        sbys_solutions = []
+        for problem, final_answer, sbys_solution in zip(
+            examples['problem'], examples['final_answer'], examples['sbys_solution']
         ):
-            # Only include if final answer exists AND hints is non-empty
-            if final_answer and hints:
-                # Store messages as list of dicts - verl will apply chat template
-                if not is_train:
-                    # Validation: no hints provided
-                    messages = format_prompt(problem, partial_proof)
-                    prompts.append(messages)
-                    answers.append(final_answer)
-                
-                elif hint_level >= 0:
-                    if len(hints) > hint_level:
-                        messages = format_prompt(problem, partial_proof, hints[-1 - hint_level])
-                        prompts.append(messages)
-                        answers.append(final_answer)
-                else:
-                    # hint_level < 0: use all hints
-                    for hint in hints:
-                        messages = format_prompt(problem, partial_proof, hint)
-                        prompts.append(messages)
-                        answers.append(final_answer)
-                
+            if final_answer:
+                messages = format_prompt(problem)
+                prompts.append(messages)
+                answers.append(final_answer)
+                sbys_solutions.append(sbys_solution)
 
-        
-        return {"prompt": prompts, "answer": answers}
+        return {"prompt": prompts, "answer": answers, "sbys_solution": sbys_solutions}
     
     # Split into train and val
     
@@ -553,12 +520,12 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
     # Process dataset
     from functools import partial
     train_dataset = train_dataset.map(
-        partial(format_dataset, is_train=True, hint_level=hint_level),
+        format_dataset,
         batched=True,
         remove_columns=train_dataset.column_names
     )
     val_dataset = val_dataset.map(
-        partial(format_dataset, is_train=False),
+        format_dataset,
         batched=True,
         remove_columns=val_dataset.column_names
     )
