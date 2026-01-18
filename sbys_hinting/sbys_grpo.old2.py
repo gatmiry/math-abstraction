@@ -19,10 +19,10 @@ os.environ["WANDB_SAVE_CODE"] = "true"
 TOKEN_FILE = os.path.join(os.path.dirname(__file__), "hf_token.txt")
 
 # System prompt file path
-SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full_solution.txt")
+SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
 
-# Which system prompt to use (from system_prompt_full_solution.txt)
-SYSTEM_PROMPT_NAME = "full_solution_simple"
+# Which system prompt to use (from system_prompt.txt)
+SYSTEM_PROMPT_NAME = "default"
 
 HINT_LEVEL = -1
 VAL_SIZE = 512
@@ -30,8 +30,6 @@ PROMPT_UPDATE_ENABLED = True
 PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 3
 PROMPT_UPDATE_MAX_USER_TURNS = 3
 PROMPT_RESET_PREFIX = "__RESET_PROMPT__\n"
-PROMPT_RESET_SYSTEM_TAG = "__SYSTEM__\n"
-PROMPT_RESET_USER_TAG = "__USER__\n"
 
 def load_system_prompt(name: str = None):
     """Load a named system prompt from file.
@@ -168,7 +166,7 @@ except ImportError:
 
 # Configuration
 DEFAULT_MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507"
-DATASET_NAME = os.path.join(os.path.dirname(__file__), "outputs", "sbys_proofs_dataset")
+DATASET_NAME = "../newopenaioutputs/hints_dataset"  # Omni-MATH dataset
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
 # Training hyperparameters
@@ -287,10 +285,7 @@ class PromptUpdateInteraction(BaseInteraction):
     def __init__(self, config):
         super().__init__(config)
         self._state = {}
-        self.guide_steps_count = 0
-        self.unable_index = 0
-        self.able_index = 0
-        self.try_index = 0
+
     ##generate_response returns a 4‑tuple:
     # 1) should_terminate_sequence (bool)
     # 2) content (str) — the user message to add (or reset)
@@ -298,20 +293,13 @@ class PromptUpdateInteraction(BaseInteraction):
     # 4) metrics (dict) — any extra info to log
 
     async def generate_response(self, instance_id, messages, **kwargs):
+        ground_truth = kwargs.get("ground_truth")
+        sbys_solution = kwargs.get("sbys_solution")
+        print(f"[PromptUpdateInteraction] sbys_solution={sbys_solution}")
         initial_state = kwargs.get("state", {})
         state = self._state.setdefault(
             instance_id, dict(initial_state) if isinstance(initial_state, dict) else {}
         )
-        ground_truth = kwargs.get("ground_truth")
-        sbys_solution = kwargs.get("sbys_solution") or []
-        problem = kwargs.get("problem")
-        if self.guide_steps_count == 0:
-            ## this means this is the first round
-            ## now initialized guide_steps_count and unable_index and able_index
-            self.guide_steps_count = len(sbys_solution)
-            self.able_index = self.guide_steps_count
-        
-        #print(f"[PromptUpdateInteraction] sbys_solution={sbys_solution}")
         last_assistant = ""
         for msg in reversed(messages):
             if msg.get("role") == "assistant":
@@ -324,69 +312,32 @@ class PromptUpdateInteraction(BaseInteraction):
         state["last_reward"] = reward
         state["last_answer"] = boxed_answer
 
-        if reward >= 0.9 and self.try_index == 0:
-            ## this means the method can solve the problem without any partial proofs, so we are done with this problem!
-            print(f"[PromptUpdateInteraction] Removing instance {instance_id} because guide steps completed")
+        if reward >= 1.0:
+            self._state.pop(instance_id, None)
             return True, "", reward, {"correct": True}
 
-        ## here is the logic for specifying the next try_index
-        import math
-        if self.try_index <= self.unable_index and reward > 0.5:
-            self.able_index = self.try_index
-            if self.try_index == self.unable_index:
-                self.try_index = self.try_index - 1
-            else:
-                self.try_index = self.try_index - (self.unable_index - self.try_index)
-            self.try_index = max(self.try_index, 0)
-        elif self.try_index >= self.able_index and reward < 0.5:
-            self.unable_index = self.try_index
-            if self.try_index == self.able_index:
-                self.try_index = self.try_index + 1
-            else:
-                self.try_index = self.try_index + (self.try_index - self.able_index)
-            self.try_index = min(self.try_index, self.guide_steps_count)
-        else:
-            if reward < 0.5:
-                self.unable_index = self.try_index
-                self.try_index = math.ceil((self.try_index + self.able_index) / 2)
-            else:
-                self.able_index = self.try_index
-                self.try_index = math.floor((self.try_index + self.unable_index) / 2)
-
-
-        partial_answer = "\n".join(sbys_solution[:self.try_index])
-        if self.try_index > 0:
-            updated_prompt = (
-                f"Problem: {problem}\n"
-                f"Incomplete proof: {partial_answer}\n"
-                #f"Please produce a full solution and end with the final answer in \\box{...}."
-            )
-        else:
-            updated_prompt = (
-                f"Problem: {problem}\n"
-                #f"Please produce a full solution and end with the final answer in \\box{...}."
-            )
-        system_prompt_name = "full_solution_with_hint" if self.try_index == 0 else "full_solution_simple"
-        system_prompt = load_system_prompt(system_prompt_name)
-        reset_payload = (
-            f"{PROMPT_RESET_PREFIX}"
-            f"{PROMPT_RESET_SYSTEM_TAG}{system_prompt}\n"
-            f"{PROMPT_RESET_USER_TAG}{updated_prompt}"
+        feedback = (
+            f"Attempt {state['attempt']} was incorrect.\n"
+            "Previous attempt was incorrect.\n"
+            f"Extracted answer: {boxed_answer}\n"
+            "Please try again and end with the final answer in \\box{...}."
         )
-        return False, reset_payload, reward, {"try_index": self.try_index}
+        updated_prompt = (
+            f"{feedback}\n"
+            f"State: {state}\n"
+            "Please produce a full solution and end with the final answer in \\box{...}."
+        )
+        return False, f"{PROMPT_RESET_PREFIX}{updated_prompt}", reward, {"correct": False}
 
-def _reset_request_prompt(self, processing_class, new_user_content: str, new_system_content: Optional[str] = None) -> None:
-    if new_system_content is None:
-        system_msg = None
-        for msg in self.messages:
-            if msg.role == "system":
-                system_msg = msg
-                break
-        if system_msg is None:
-            system_msg = Message(role="system", content="You are a helpful assistant.")
-    else:
-        system_msg = Message(role="system", content=new_system_content)
 
+def _reset_request_prompt(self, processing_class, new_user_content: str) -> None:
+    system_msg = None
+    for msg in self.messages:
+        if msg.role == "system":
+            system_msg = msg
+            break
+    if system_msg is None:
+        system_msg = Message(role="system", content="You are a helpful assistant.")
     self.messages = [system_msg, Message(role="user", content=new_user_content)]
 
     tools = [tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None
@@ -453,16 +404,8 @@ def install_prompt_reset_hook():
 
     def patched_add_user_message(self, processing_class, content: str):
         if content.startswith(PROMPT_RESET_PREFIX):
-            payload = content[len(PROMPT_RESET_PREFIX) :]
-            new_system_content = None
-            new_user_content = payload
-            if payload.startswith(PROMPT_RESET_SYSTEM_TAG):
-                payload = payload[len(PROMPT_RESET_SYSTEM_TAG) :]
-                if PROMPT_RESET_USER_TAG in payload:
-                    system_part, user_part = payload.split(PROMPT_RESET_USER_TAG, 1)
-                    new_system_content = system_part.rstrip("\n")
-                    new_user_content = user_part
-            _reset_request_prompt(self, processing_class, new_user_content, new_system_content)
+            new_user_content = content[len(PROMPT_RESET_PREFIX) :]
+            _reset_request_prompt(self, processing_class, new_user_content)
             return
         return original_add_user_message(self, processing_class, content)
 
@@ -470,21 +413,38 @@ def install_prompt_reset_hook():
     AsyncRolloutRequest.add_user_message = patched_add_user_message
 
 
-def format_prompt(problem: str, system_prompt: str = None) -> List[Dict[str, str]]:
+def format_prompt(problem: str, partial_proof: str, hint: str = None, system_prompt: str = None) -> List[Dict[str, str]]:
     if system_prompt is None:
-        system_prompt = load_system_prompt(SYSTEM_PROMPT_NAME)
+        if hint:
+            system_prompt = load_system_prompt('default')
+        else:
+            system_prompt = load_system_prompt('onlypartialproof')
 
-    messages = [
-        {
-            "role": "system",
-            "content": system_prompt
-        },
-        {
-            "role": "user",
-            "content": f"Problem: {problem}"
-        }
-    ]
-    return messages
+    if hint:
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": f"Problem: {problem}\n\nPartial proof: {partial_proof}\n\nHint: {hint}"
+            }
+        ]
+        return messages
+    
+    else:
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": f"Problem: {problem}\n\nPartial proof: {partial_proof}"
+            }
+        ]
+        return messages
 
 def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None, val_size: int = 128, max_prompt_tokens: int = 2560, hint_level: int = 0):
     """Create RL dataset in verl format with train/val split.
@@ -505,23 +465,37 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
     dataset = load_from_disk(dataset_path)
     
     # Format dataset - store messages as JSON for verl to parse
-    def format_dataset(examples):
+    def format_dataset(examples, is_train: bool = True, hint_level: int = 0):
         """Format dataset examples for GRPO training."""
         prompts = []
         answers = []
-        sbys_solutions = []
-        problems = []
-        for problem, final_answer, sbys_solution in zip(
-            examples['problem'], examples['final_answer'], examples['sbys_solution']
+        for problem, partial_proof, final_answer, hints in zip(
+            examples['problem'], examples['partial_proof'], examples['final_answer'], examples['hints']
         ):
-            if final_answer:
-                messages = format_prompt(problem)
-                prompts.append(messages)
-                answers.append(final_answer)
-                sbys_solutions.append(sbys_solution)
-                problems.append(problem)
+            # Only include if final answer exists AND hints is non-empty
+            if final_answer and hints:
+                # Store messages as list of dicts - verl will apply chat template
+                if not is_train:
+                    # Validation: no hints provided
+                    messages = format_prompt(problem, partial_proof)
+                    prompts.append(messages)
+                    answers.append(final_answer)
+                
+                elif hint_level >= 0:
+                    if len(hints) > hint_level:
+                        messages = format_prompt(problem, partial_proof, hints[-1 - hint_level])
+                        prompts.append(messages)
+                        answers.append(final_answer)
+                else:
+                    # hint_level < 0: use all hints
+                    for hint in hints:
+                        messages = format_prompt(problem, partial_proof, hint)
+                        prompts.append(messages)
+                        answers.append(final_answer)
+                
 
-        return {"prompt": prompts, "answer": answers, "sbys_solution": sbys_solutions, "problem": problems}
+        
+        return {"prompt": prompts, "answer": answers}
     
     # Split into train and val
     
@@ -564,12 +538,12 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
     # Process dataset
     from functools import partial
     train_dataset = train_dataset.map(
-        format_dataset,
+        partial(format_dataset, is_train=True, hint_level=hint_level),
         batched=True,
         remove_columns=train_dataset.column_names
     )
     val_dataset = val_dataset.map(
-        format_dataset,
+        partial(format_dataset, is_train=False),
         batched=True,
         remove_columns=val_dataset.column_names
     )
@@ -595,18 +569,15 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
                     "ground_truth": item["answer"],
                     "state": {"attempt": 0},
                     "sbys_solution": item.get("sbys_solution"),
-                    "problem": item.get("problem"),
                 }
-            row = {
+            rl_data.append({
                 "prompt": item["prompt"],  # List of message dicts with 'role' and 'content'
                 "reward_model": {
                     "ground_truth": item["answer"],
                 },
                 "data_source": "omni_math",  # Identifier for reward function
-            }
-            if extra_info:
-                row["extra_info"] = extra_info
-            rl_data.append(row)
+                "extra_info": extra_info,
+            })
         return rl_data
     
     train_data = to_verl_format(train_dataset, enable_interaction=True)
