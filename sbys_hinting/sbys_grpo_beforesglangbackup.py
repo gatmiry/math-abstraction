@@ -163,19 +163,6 @@ try:
     # NCCL P2P workaround for hardware issues
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_IGNORE_DISABLED_P2P"] = "1"
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_P2P_DISABLE"] = "1"
-    # Add CUDA library paths for sglang subprocesses
-    cuda_lib_paths = [
-        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib",
-        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cublas/lib",
-        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cudnn/lib",
-        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cufft/lib",
-        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/nccl/lib",
-    ]
-    existing_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-    PPO_RAY_RUNTIME_ENV["env_vars"]["LD_LIBRARY_PATH"] = ":".join(cuda_lib_paths) + ":" + existing_ld_path
-    # Add sglang to pip packages for workers
-    PPO_RAY_RUNTIME_ENV.setdefault("pip", [])
-    PPO_RAY_RUNTIME_ENV["pip"].append("sglang[all]==0.4.6.post1")
 except ImportError:
     pass  # verl 0.4.x may not have this
 
@@ -218,7 +205,7 @@ def parse_args():
 
 # Distributed training configuration
 # 2 nodes, 8 GPUs per node = 16 GPUs total
-NUM_NODES = 1  # Testing with single node first
+NUM_NODES = 4
 GPUS_PER_NODE = 8
 
 
@@ -285,21 +272,7 @@ def compute_score(
     # Extract boxed answer from solution
     boxed_answer = extract_boxed_answer(solution_str)
     boxed_normalized = normalize_answer(boxed_answer)
-    
-    # Also extract boxed content from ground_truth if it has \boxed{}
-    gt_boxed = extract_boxed_answer(ground_truth)
-    if gt_boxed is not None:
-        answer_normalized = normalize_answer(gt_boxed)
-    else:
-        answer_normalized = normalize_answer(ground_truth)
-    
-    # Debug logging (sample 1 in 50)
-    import random
-    if random.random() < 0.02:
-        print(f"[compute_score DEBUG] ground_truth={ground_truth[:80] if ground_truth else None}...")
-        print(f"[compute_score DEBUG] boxed_answer={boxed_answer[:80] if boxed_answer else None}...")
-        print(f"[compute_score DEBUG] boxed_normalized={boxed_normalized[:50] if boxed_normalized else None}")
-        print(f"[compute_score DEBUG] answer_normalized={answer_normalized[:50] if answer_normalized else None}")
+    answer_normalized = normalize_answer(ground_truth)
     
     # Compare normalized answers
     if boxed_normalized and answer_normalized and boxed_normalized == answer_normalized:
@@ -325,7 +298,6 @@ class PromptUpdateInteraction(BaseInteraction):
     # 4) metrics (dict) — any extra info to log
 
     async def generate_response(self, instance_id, messages, **kwargs):
-        print(f"[PromptUpdateInteraction] generate_response called! instance_id={instance_id}")
         initial_state = kwargs.get("state", {})
         state = self._state.setdefault(
             instance_id, dict(initial_state) if isinstance(initial_state, dict) else {}
@@ -333,7 +305,6 @@ class PromptUpdateInteraction(BaseInteraction):
         ground_truth = kwargs.get("ground_truth")
         sbys_solution = kwargs.get("sbys_solution") or []
         problem = kwargs.get("problem")
-        print(f"[PromptUpdateInteraction] ground_truth={ground_truth[:50] if ground_truth else None}...")
         if self.guide_steps_count == 0:
             ## this means this is the first round
             ## now initialized guide_steps_count and unable_index and able_index
@@ -503,17 +474,17 @@ def format_prompt(problem: str, system_prompt: str = None) -> List[Dict[str, str
     if system_prompt is None:
         system_prompt = load_system_prompt(SYSTEM_PROMPT_NAME)
 
-        messages = [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt
+        },
+        {
+            "role": "user",
             "content": f"Problem: {problem}"
-            }
-        ]
-        return messages
+        }
+    ]
+    return messages
 
 def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None, val_size: int = 128, max_prompt_tokens: int = 2560, hint_level: int = 0):
     """Create RL dataset in verl format with train/val split.
@@ -549,7 +520,7 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
                 answers.append(final_answer)
                 sbys_solutions.append(sbys_solution)
                 problems.append(problem)
-        
+
         return {"prompt": prompts, "answer": answers, "sbys_solution": sbys_solutions, "problem": problems}
     
     # Split into train and val
@@ -1047,7 +1018,6 @@ def main():
         "data.max_response_length=1536",
         f"data.train_batch_size={TRAIN_BATCH_SIZE}",
         f"data.val_batch_size={TEST_BATCH_SIZE}",
-        "data.return_raw_chat=true",  # Required for sglang rollout
         
         # Trainer config
         f"trainer.project_name=grpo-omni-math",
