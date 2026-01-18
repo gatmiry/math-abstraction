@@ -30,6 +30,8 @@ PROMPT_UPDATE_ENABLED = True
 PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 3
 PROMPT_UPDATE_MAX_USER_TURNS = 3
 PROMPT_RESET_PREFIX = "__RESET_PROMPT__\n"
+PROMPT_RESET_SYSTEM_TAG = "__SYSTEM__\n"
+PROMPT_RESET_USER_TAG = "__USER__\n"
 
 def load_system_prompt(name: str = None):
     """Load a named system prompt from file.
@@ -284,6 +286,7 @@ class PromptUpdateInteraction(BaseInteraction):
 
     def __init__(self, config):
         super().__init__(config)
+        self._state = {}
         self.guide_steps_count = 0
         self.unable_index = 0
         self.able_index = 0
@@ -296,8 +299,12 @@ class PromptUpdateInteraction(BaseInteraction):
 
     async def generate_response(self, instance_id, messages, **kwargs):
         initial_state = kwargs.get("state", {})
+        state = self._state.setdefault(
+            instance_id, dict(initial_state) if isinstance(initial_state, dict) else {}
+        )
         ground_truth = kwargs.get("ground_truth")
-        sbys_solution = kwargs.get("sbys_solution")
+        sbys_solution = kwargs.get("sbys_solution") or []
+        problem = kwargs.get("problem")
         if self.guide_steps_count == 0:
             ## this means this is the first round
             ## now initialized guide_steps_count and unable_index and able_index
@@ -347,13 +354,40 @@ class PromptUpdateInteraction(BaseInteraction):
                 self.try_index = math.floor((self.try_index + self.unable_index) / 2)
 
 
-        partial_answer = sbys_solution[:self.try_index].join("\n")
-        updated_prompt = (
-            f"problem: {problem}\n"
-            f"partial_proof: {partial_answer}\n"
-            f"Please produce a full solution and end with the final answer in \\box{...}."
+        partial_answer = "\n".join(sbys_solution[:self.try_index])
+        if self.try_index > 0:
+            updated_prompt = (
+                f"Problem: {problem}\n"
+                f"Partial proof: {partial_answer}\n"
+                f"Please produce a full solution and end with the final answer in \\box{...}."
+            )
+        else:
+            updated_prompt = (
+                f"Problem: {problem}\n"
+                f"Please produce a full solution and end with the final answer in \\box{...}."
+            )
+        system_prompt_name = "full_solution_with_hint" if self.try_index == 0 else "full_solution_simple"
+        system_prompt = load_system_prompt(system_prompt_name)
+        reset_payload = (
+            f"{PROMPT_RESET_PREFIX}"
+            f"{PROMPT_RESET_SYSTEM_TAG}{system_prompt}\n"
+            f"{PROMPT_RESET_USER_TAG}{updated_prompt}"
         )
-        return False, f"{PROMPT_RESET_PREFIX}{updated_prompt}", reward, {new_try_index: new_try_index}
+        return False, reset_payload, reward, {"try_index": self.try_index}
+
+def _reset_request_prompt(self, processing_class, new_user_content: str, new_system_content: Optional[str] = None) -> None:
+    if new_system_content is None:
+        system_msg = None
+        for msg in self.messages:
+            if msg.role == "system":
+                system_msg = msg
+                break
+        if system_msg is None:
+            system_msg = Message(role="system", content="You are a helpful assistant.")
+    else:
+        system_msg = Message(role="system", content=new_system_content)
+
+    self.messages = [system_msg, Message(role="user", content=new_user_content)]
 
     tools = [tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None
     multi_modal_data = self.multi_modal_data or {}
@@ -419,8 +453,16 @@ def install_prompt_reset_hook():
 
     def patched_add_user_message(self, processing_class, content: str):
         if content.startswith(PROMPT_RESET_PREFIX):
-            new_user_content = content[len(PROMPT_RESET_PREFIX) :]
-            _reset_request_prompt(self, processing_class, new_user_content)
+            payload = content[len(PROMPT_RESET_PREFIX) :]
+            new_system_content = None
+            new_user_content = payload
+            if payload.startswith(PROMPT_RESET_SYSTEM_TAG):
+                payload = payload[len(PROMPT_RESET_SYSTEM_TAG) :]
+                if PROMPT_RESET_USER_TAG in payload:
+                    system_part, user_part = payload.split(PROMPT_RESET_USER_TAG, 1)
+                    new_system_content = system_part.rstrip("\n")
+                    new_user_content = user_part
+            _reset_request_prompt(self, processing_class, new_user_content, new_system_content)
             return
         return original_add_user_message(self, processing_class, content)
 
@@ -468,6 +510,7 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
         prompts = []
         answers = []
         sbys_solutions = []
+        problems = []
         for problem, final_answer, sbys_solution in zip(
             examples['problem'], examples['final_answer'], examples['sbys_solution']
         ):
@@ -476,8 +519,9 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
                 prompts.append(messages)
                 answers.append(final_answer)
                 sbys_solutions.append(sbys_solution)
+                problems.append(problem)
 
-        return {"prompt": prompts, "answer": answers, "sbys_solution": sbys_solutions}
+        return {"prompt": prompts, "answer": answers, "sbys_solution": sbys_solutions, "problem": problems}
     
     # Split into train and val
     
@@ -551,6 +595,7 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
                     "ground_truth": item["answer"],
                     "state": {"attempt": 0},
                     "sbys_solution": item.get("sbys_solution"),
+                    "problem": item.get("problem"),
                 }
             rl_data.append({
                 "prompt": item["prompt"],  # List of message dicts with 'role' and 'content'
