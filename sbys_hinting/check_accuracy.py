@@ -35,8 +35,8 @@ def normalize_latex(answer: str) -> str:
         return ""
     ans = answer.strip()
     
-    # Remove display math delimiters \[ \] and \( \)
-    ans = re.sub(r'\\\[|\\\]|\\\(|\\\)', '', ans)
+    # Remove display math delimiters \[ \] and \( \) and $
+    ans = re.sub(r'\\\[|\\\]|\\\(|\\\)|\$', '', ans)
     
     # Remove nested \boxed{}
     ans = re.sub(r'\\boxed?\{([^{}]*)\}', r'\1', ans)
@@ -178,22 +178,30 @@ def check_answer(generated: str, ground_truth: str) -> bool:
     
     # Method 3c: Handle ± expansion
     # "1 ± √5" should match "1 + √5, 1 - √5"
+    # "±π/12" should match "π/12, -π/12"
     def expand_pm(s):
-        # Expand x ± y to [x+y, x-y]
+        # Expand x ± y to [x+y, x-y] or ±y to [y, -y]
         s_norm = normalize_latex(s)
         if '±' in s_norm:
-            # Find pattern like a±b
             parts = re.split(r',', s_norm)
             expanded = []
             for part in parts:
+                part = part.strip()
                 if '±' in part:
-                    match = re.match(r'(.+?)±(.+)', part)
-                    if match:
-                        a, b = match.groups()
-                        expanded.append(f"{a.strip()}+{b.strip()}")
-                        expanded.append(f"{a.strip()}-{b.strip()}")
+                    # Check if ± is at start (like ±π/12)
+                    if part.startswith('±'):
+                        rest = part[1:]  # Remove ±
+                        expanded.append(rest)
+                        expanded.append(f"-{rest}")
                     else:
-                        expanded.append(part)
+                        # Pattern like a±b
+                        match = re.match(r'(.+?)±(.+)', part)
+                        if match:
+                            a, b = match.groups()
+                            expanded.append(f"{a.strip()}+{b.strip()}")
+                            expanded.append(f"{a.strip()}-{b.strip()}")
+                        else:
+                            expanded.append(part)
                 else:
                     expanded.append(part)
             return sorted(expanded)
@@ -202,6 +210,56 @@ def check_answer(generated: str, ground_truth: str) -> bool:
     gt_expanded_pm = expand_pm(ground_truth)
     gen_items = sorted([normalize_latex(x.strip()) for x in gen_ans.split(',')]) if ',' in gen_ans else None
     if gt_expanded_pm and gen_items and gt_expanded_pm == gen_items:
+        return True
+    
+    # Also try with "and" as separator in generated
+    if gt_expanded_pm:
+        # First remove \text{} around connectors
+        gen_clean = re.sub(r'\\text\{\s*(or|and|OR|AND)\s*\}', r' \1 ', gen_ans)
+        # Split by "and" or "or" or ","
+        gen_parts = re.split(r'\s+and\s+|\s+or\s+|,', gen_clean, flags=re.IGNORECASE)
+        gen_items_and = sorted([normalize_latex(x.strip()) for x in gen_parts if x.strip()])
+        if gt_expanded_pm == gen_items_and:
+            return True
+    
+    # Handle ± inside fractions like \frac{-4 ± √31}{15}
+    def expand_pm_in_frac(s):
+        # Find \frac{a±b}{c} and expand to \frac{a+b}{c}, \frac{a-b}{c}
+        s_norm = normalize_latex(s)
+        # Match \frac{ ... ± ... }{ ... } - the numerator should not contain another \frac
+        # Use negative lookbehind/ahead to avoid crossing fraction boundaries
+        frac_match = re.search(r'\\frac\{([^{}]*?)±([^{}]*?)\}\{([^{}]+)\}', s_norm)
+        if frac_match:
+            a, b, c = frac_match.groups()
+            # Build the list, preserving any prefix before the matched frac
+            prefix = s_norm[:frac_match.start()]
+            suffix = s_norm[frac_match.end():]
+            
+            exp1 = prefix + f"\\frac{{{a}+{b}}}{{{c}}}" + suffix
+            exp2 = prefix + f"\\frac{{{a}-{b}}}{{{c}}}" + suffix
+            
+            return sorted([normalize_latex(exp1), normalize_latex(exp2)])
+        return None
+    
+    gt_frac_pm = expand_pm_in_frac(ground_truth)
+    if gt_frac_pm:
+        # Also clean the generated text
+        gen_clean = re.sub(r'\\text\{\s*(or|and|OR|AND)\s*\}', r' \1 ', gen_ans)
+        gen_parts = re.split(r'\s+and\s+|\s+or\s+|,', gen_clean, flags=re.IGNORECASE)
+        gen_items_frac = sorted([normalize_latex(x.strip()) for x in gen_parts if x.strip()])
+        if gt_frac_pm == gen_items_frac:
+            return True
+    
+    # Handle sets with ± like {1±√5, -2}
+    def expand_set_with_pm(s):
+        # Remove set braces and expand
+        s_clean = re.sub(r'\\?\{|\\?\}|\\left|\\right', '', s)
+        return expand_pm(s_clean)
+    
+    gt_set_pm = expand_set_with_pm(ground_truth)
+    gen_set_clean = re.sub(r'\\?\{|\\?\}|\\left|\\right', '', gen_ans)
+    gen_set_items = sorted([normalize_latex(x.strip()) for x in gen_set_clean.split(',')]) if ',' in gen_set_clean else None
+    if gt_set_pm and gen_set_items and gt_set_pm == gen_set_items:
         return True
     
     # Method 4: Same numbers in answer (for tuple lists, etc.)
@@ -222,6 +280,16 @@ def check_answer(generated: str, ground_truth: str) -> bool:
         if gt_norm in gen_norm or gen_norm in gt_norm:
             ratio = min(len(gen_norm), len(gt_norm)) / max(len(gen_norm), len(gt_norm))
             if ratio > 0.5:
+                return True
+    
+    # Method 5b: Handle "OR" in ground truth - gen matches one of the options
+    # First remove \text{} wrappers around connectors
+    gt_clean = re.sub(r'\\text\{\s*(or|and|OR|AND)\s*\}', r' \1 ', ground_truth)
+    if ' or ' in gt_clean.lower():
+        options = re.split(r'\s+or\s+', gt_clean, flags=re.IGNORECASE)
+        for opt in options:
+            opt_norm = normalize_latex(opt.strip())
+            if opt_norm == gen_norm:
                 return True
     
     # Method 6: Symbolic comparison using SymPy
@@ -486,6 +554,15 @@ def check_answer(generated: str, ground_truth: str) -> bool:
     if gt_simple and gen_norm.strip('()') == gt_simple:
         return True
     
+    # Method 19d: If gen is a simple number and gt starts with that number
+    if gen_norm.isdigit():
+        gt_clean = re.sub(r'\\[a-zA-Z]+\{[^{}]*\}|\\[a-zA-Z]+', '', ground_truth)
+        if gt_clean.strip().startswith(gen_norm):
+            return True
+        # Also check if GT contains "= {number}" or "is {number}"
+        if re.search(rf'(is|=)\s*{gen_norm}\b', gt_clean):
+            return True
+    
     # Method 19b: More aggressive text extraction
     # Extract math expressions from verbose text answers
     def extract_math_from_text(s):
@@ -645,13 +722,17 @@ def check_answer(generated: str, ground_truth: str) -> bool:
                 e = expr
                 # Replace fractions
                 e = re.sub(r'\\frac\{([^{}]+)\}\{([^{}]+)\}', r'((\1)/(\2))', e)
-                # Handle (n+1) properly
-                e = e.replace(var, f'({p})')
+                # Handle exponents with braces: ^{n+1} -> **(n+1)
+                e = re.sub(r'\^\{([^{}]+)\}', r'**(\1)', e)
                 e = e.replace('^', '**')
+                # Handle (n+1) properly - substitute variable
+                e = e.replace(var, f'({p})')
+                # Add implicit multiplication
                 e = re.sub(r'(\d)\(', r'\1*(', e)  # 2(n+1) -> 2*(n+1)
                 e = re.sub(r'(\d)([a-z])', r'\1*\2', e)  # 2n -> 2*n
                 e = re.sub(r'\)(\d)', r')*\1', e)  # )2 -> )*2
                 e = re.sub(r'\)([a-z])', r')*\1', e)  # )n -> )*n
+                e = re.sub(r'\)\(', r')*(', e)  # )( -> )*(
                 val = eval(e)
                 results.append(round(val, 8))
             return tuple(results)
