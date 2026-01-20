@@ -266,21 +266,22 @@ def check_answer(generated: str, ground_truth: str) -> bool:
     gen_nums = extract_numbers(gen_ans)
     gt_nums = extract_numbers(ground_truth)
     if gen_nums and gt_nums and gen_nums == gt_nums:
-        # Additional check: similar structure
+        # Additional check: EXACT same structure (not just both have parentheses)
         gen_struct = re.sub(r'-?\d+\.?\d*', 'N', gen_ans)
         gt_struct = re.sub(r'-?\d+\.?\d*', 'N', ground_truth)
         gen_struct = normalize_latex(gen_struct)
         gt_struct = normalize_latex(gt_struct)
-        # If structure is similar (e.g., both are tuple lists)
-        if '(' in gen_struct and '(' in gt_struct:
+        # Only match if structures are IDENTICAL (for tuple lists)
+        if gen_struct == gt_struct:
             return True
     
     # Method 5: Substring containment for longer answers
-    if len(gen_norm) > 5 and len(gt_norm) > 5:
-        if gt_norm in gen_norm or gen_norm in gt_norm:
-            ratio = min(len(gen_norm), len(gt_norm)) / max(len(gen_norm), len(gt_norm))
-            if ratio > 0.5:
-                return True
+    # DISABLED - too permissive, e.g., "(p!)^2" matches "2(p!)^2" which is WRONG
+    # if len(gen_norm) > 5 and len(gt_norm) > 5:
+    #     if gt_norm in gen_norm or gen_norm in gt_norm:
+    #         ratio = min(len(gen_norm), len(gt_norm)) / max(len(gen_norm), len(gt_norm))
+    #         if ratio > 0.5:
+    #             return True
     
     # Method 5b: Handle "OR" in ground truth - gen matches one of the options
     # First remove \text{} wrappers around connectors
@@ -473,17 +474,18 @@ def check_answer(generated: str, ground_truth: str) -> bool:
             return True
     
     # Method 16: Number-only comparison for answers like "2 and 3750" vs "Minimum: 2, Maximum: 3750"
-    gen_all_nums = sorted(re.findall(r'-?\d+\.?\d*', gen_ans), key=lambda x: float(x) if x else 0)
-    gt_all_nums = sorted(re.findall(r'-?\d+\.?\d*', ground_truth), key=lambda x: float(x) if x else 0)
-    if len(gen_all_nums) >= 2 and gen_all_nums == gt_all_nums:
-        # Check both are primarily listing numbers
-        gen_non_num = re.sub(r'-?\d+\.?\d*', '', gen_ans)
-        gt_non_num = re.sub(r'-?\d+\.?\d*', '', ground_truth)
-        gen_non_num = re.sub(r'[\\{}\[\]()\s,;:]', '', gen_non_num)
-        gt_non_num = re.sub(r'[\\{}\[\]()\s,;:]', '', gt_non_num)
-        # If after removing numbers, what remains is just text labels
-        if len(gen_non_num) < 50 and len(gt_non_num) < 50:
-            return True
+    # DISABLED - too permissive, e.g., "2(k-1)n" matches "n(k-1)^2" because both have [-1, 2]
+    # gen_all_nums = sorted(re.findall(r'-?\d+\.?\d*', gen_ans), key=lambda x: float(x) if x else 0)
+    # gt_all_nums = sorted(re.findall(r'-?\d+\.?\d*', ground_truth), key=lambda x: float(x) if x else 0)
+    # if len(gen_all_nums) >= 2 and gen_all_nums == gt_all_nums:
+    #     # Check both are primarily listing numbers
+    #     gen_non_num = re.sub(r'-?\d+\.?\d*', '', gen_ans)
+    #     gt_non_num = re.sub(r'-?\d+\.?\d*', '', ground_truth)
+    #     gen_non_num = re.sub(r'[\\{}\[\]()\s,;:]', '', gen_non_num)
+    #     gt_non_num = re.sub(r'[\\{}\[\]()\s,;:]', '', gt_non_num)
+    #     # If after removing numbers, what remains is just text labels
+    #     if len(gen_non_num) < 50 and len(gt_non_num) < 50:
+    #         return True
     
     # Method 17: Complex number equivalence - handle i*sqrt vs sqrt*i
     def normalize_complex(s):
@@ -779,11 +781,11 @@ def check_answer(generated: str, ground_truth: str) -> bool:
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
-    # Load original dataset
-    dataset = load_from_disk(os.path.join(script_dir, "outputs/sbys_proofs_dataset"))
+    # Load filtered dataset (valid proofs only)
+    dataset = load_from_disk(os.path.join(script_dir, "outputs/sbys_proofs_dataset_filtered"))
     
     # Load generated solutions
-    generated_path = os.path.join(script_dir, "outputs/full_solutions_qwen3_4b.jsonl")
+    generated_path = os.path.join(script_dir, "outputs/full_solutions_qwen3_4b_filtered.jsonl")
     generated = []
     with open(generated_path) as f:
         for line in f:

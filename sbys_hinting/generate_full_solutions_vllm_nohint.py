@@ -1,4 +1,4 @@
-"""Generate full solutions from Qwen3 4B using vLLM with data parallelism across 8 GPUs."""
+"""Generate full solutions from Qwen3 4B using vLLM with data parallelism - NO HINT version."""
 
 import json
 import os
@@ -11,18 +11,16 @@ def main():
     num_gpus = 8
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_dir = os.path.join(script_dir, "outputs")
-    worker_script = os.path.join(script_dir, "worker.py")
+    worker_script = os.path.join(script_dir, "worker_nohint.py")
     
     # Load filtered dataset (valid proofs only)
     dataset = load_from_disk(os.path.join(script_dir, "outputs/sbys_proofs_dataset_filtered"))
     
-    # Build prompts
+    # Build prompts - NO incomplete proof, just the problem
     all_items = []
     for row in dataset:
         problem = row["problem"]
-        sbys_steps = row["sbys_solution"]
-        incomplete_proof = "\n".join(sbys_steps[:-1]) if len(sbys_steps) > 1 else ""
-        user_msg = f"Problem: {problem}\nIncomplete proof: {incomplete_proof}"
+        user_msg = f"Problem: {problem}"
         all_items.append({
             "user_msg": user_msg,
             "problem": row["problem"],
@@ -40,8 +38,8 @@ def main():
     processes = []
     
     for gpu_id, chunk in enumerate(chunks):
-        chunk_file = os.path.join(output_dir, f"tmp_chunk_{gpu_id}.json")
-        output_file = os.path.join(output_dir, f"tmp_output_{gpu_id}.jsonl")
+        chunk_file = os.path.join(output_dir, f"tmp_chunk_nohint_{gpu_id}.json")
+        output_file = os.path.join(output_dir, f"tmp_output_nohint_{gpu_id}.jsonl")
         
         with open(chunk_file, "w") as f:
             json.dump(chunk, f)
@@ -62,7 +60,7 @@ def main():
         print(f"GPU {gpu_id} finished with exit code {proc.returncode}")
     
     # Merge results
-    final_output = os.path.join(output_dir, "full_solutions_qwen3_4b_filtered.jsonl")
+    final_output = os.path.join(output_dir, "full_solutions_qwen3_4b_nohint.jsonl")
     with open(final_output, "w") as out:
         for output_file in output_files:
             if os.path.exists(output_file):
@@ -80,3 +78,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
