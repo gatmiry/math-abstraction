@@ -384,41 +384,46 @@ class PromptUpdateInteraction(BaseInteraction):
         """Two-turn interaction flow for training, single-turn for validation.
         
         Training (has interaction_kwargs):
-            Turn 1: Ignore initial generation (no hints), inject prompt WITH hints from persistent state
+            Turn 1: Ignore initial generation (it had no hints), inject prompt WITH hints
             Turn 2: Evaluate generation (with hints), update persistent state, terminate
         
         Validation (no interaction_kwargs):
-            Single turn: Evaluate generation directly, return score, terminate
+            Single turn: Terminate immediately, let verl's custom_reward_function score
         """
         import math
         
-        print(f"[PromptUpdateInteraction] generate_response called! instance_id={instance_id}")
-        initial_state = kwargs.get("state", {})
-        
+        # Extract kwargs from interaction_kwargs
         ground_truth = kwargs.get("ground_truth")
         sbys_solution = kwargs.get("sbys_solution") or []
         problem = kwargs.get("problem")
+        initial_state = kwargs.get("state", {})
+        
+        # Debug: Log what we received
+        print(f"[PromptUpdateInteraction] generate_response called! instance_id={instance_id[:8]}...")
+        print(f"[PromptUpdateInteraction] kwargs keys: {list(kwargs.keys())}")
+        print(f"[PromptUpdateInteraction] ground_truth={'SET' if ground_truth else 'None'}, problem={'SET' if problem else 'None'}, sbys_solution_len={len(sbys_solution)}")
         
         # ==================== VALIDATION: Single-turn evaluation ====================
-        # If no ground_truth in kwargs, this is a validation sample - do single-turn eval
+        # If no ground_truth in kwargs, this is a validation sample - terminate immediately
+        # verl's custom_reward_function will handle scoring with reward_model.ground_truth
         if ground_truth is None:
-            print(f"[PromptUpdateInteraction] Validation mode: single-turn evaluation")
-            
-            # Extract the assistant's response
-            last_assistant = ""
-            for msg in reversed(messages):
-                if msg.get("role") == "assistant":
-                    last_assistant = msg.get("content", "")
-                    break
-            
-            # For validation, get ground_truth from the prompt/message context if available
-            # The validation dataset stores it in extra_info.reward_model.ground_truth
-            # which verl passes through differently - we need to extract from messages
-            # For now, return 0 reward and let verl's custom_reward_function handle it
-            print(f"[PromptUpdateInteraction] Validation: returning for custom reward scoring")
+            print(f"[PromptUpdateInteraction] VALIDATION MODE: Terminating on first turn (no interaction_kwargs)")
+            # Return True to terminate, empty content, 0 reward (verl will use custom_reward_function)
             return True, "", 0.0, {"validation": True, "single_turn": True}
         
         # ==================== TRAINING: Two-turn interaction ====================
+        # Verify we have the problem text (required for training)
+        if not problem:
+            print(f"[PromptUpdateInteraction] ERROR: No problem text in kwargs for training! kwargs={kwargs}")
+            # Fallback: try to extract from messages
+            for msg in messages:
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if "Problem:" in content:
+                        problem = content.split("Problem:", 1)[1].strip()
+                        print(f"[PromptUpdateInteraction] Extracted problem from messages: {problem[:50]}...")
+                        break
+        
         # Use problem text as key for persistent binary search state (survives across steps)
         problem_key = problem if problem else instance_id
         
@@ -463,6 +468,8 @@ class PromptUpdateInteraction(BaseInteraction):
         # Ignore the initial generation (it had no hints), return prompt WITH hints
         if current_turn == 1:
             print(f"[PromptUpdateInteraction] Turn 1: Injecting hints (try_index={problem_state['try_index']})")
+            print(f"[PromptUpdateInteraction] Turn 1: problem={problem[:80] if problem else 'None'}...")
+            print(f"[PromptUpdateInteraction] Turn 1: sbys_solution has {len(sbys_solution)} steps")
             
             # Construct prompt with current hint level from persistent state
             partial_answer = "\n".join(sbys_solution[:problem_state["try_index"]])
@@ -475,6 +482,8 @@ class PromptUpdateInteraction(BaseInteraction):
                 updated_prompt = (
                     f"Problem: {problem}\n"
                 )
+            
+            print(f"[PromptUpdateInteraction] Turn 1: updated_prompt={updated_prompt[:100]}...")
             
             system_prompt_name = "full_solution_simple" if problem_state["try_index"] > 0 else "full_solution_with_hint"
             system_prompt = load_system_prompt(system_prompt_name)
