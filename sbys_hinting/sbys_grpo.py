@@ -16,7 +16,10 @@ os.environ.setdefault("VLLM_USE_V1", "0")
 os.environ["WANDB_SAVE_CODE"] = "true"
 
 # Token file path (not tracked by git)
+# Try sbys_hinting first, then fall back to hinting folder
 TOKEN_FILE = os.path.join(os.path.dirname(__file__), "hf_token.txt")
+if not os.path.exists(TOKEN_FILE):
+    TOKEN_FILE = os.path.join(os.path.dirname(__file__), "..", "hinting", "hf_token.txt")
 
 # System prompt file path
 SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full_solution.txt")
@@ -25,7 +28,7 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full
 SYSTEM_PROMPT_NAME = "full_solution_simple"
 
 HINT_LEVEL = -1
-VAL_SIZE = 512
+VAL_SIZE = 128 
 PROMPT_UPDATE_ENABLED = True
 PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
 PROMPT_UPDATE_MAX_USER_TURNS = 2
@@ -234,6 +237,10 @@ check_answer = _math_checker.check_answer
 extract_boxed_answer = _math_checker.extract_boxed_answer
 
 
+# Global counter for compute_score logging (tracks samples that bypass interaction)
+_compute_score_log_counter = 0
+_compute_score_log_limit = 5  # Log detailed info for first N samples
+
 def compute_score(
     data_source: str = None,
     solution_str: str = None,
@@ -256,6 +263,8 @@ def compute_score(
     Returns:
         Reward score (1.0 if answer matches, 0.0 otherwise)
     """
+    global _compute_score_log_counter
+    
     if ground_truth is None:
         return 0.0
     
@@ -266,10 +275,78 @@ def compute_score(
     # It handles: LaTeX parsing, symbolic comparison, tuple matching,
     # numeric equivalence, text normalization, etc.
     is_correct = check_answer(solution_str, ground_truth)
+    boxed_answer = extract_boxed_answer(solution_str)
+    
+    # ==================== DETAILED LOGGING for compute_score ====================
+    # This logs samples that go through verl's reward function
+    # If interaction was NOT called, this is the ONLY place we see the generation
+    if _compute_score_log_counter < _compute_score_log_limit:
+        _compute_score_log_counter += 1
+        print("\n" + "#" * 80)
+        print(f"[COMPUTE_SCORE DETAILED LOG #{_compute_score_log_counter}] - This is what verl's reward function receives")
+        print("#" * 80)
+        print(f"\n>>> DATA_SOURCE: {data_source}")
+        print(f"\n>>> GROUND_TRUTH:\n{ground_truth[:300] if ground_truth else 'None'}...")
+        print(f"\n>>> SOLUTION_STR (model generation - check if single or multi-turn):\n{solution_str[:2000] if solution_str else 'None'}...")
+        print(f"\n>>> EXTRA_INFO: {extra_info}")
+        print(f"\n>>> KWARGS: {list(kwargs.keys())}")
+        print(f"\n>>> BOXED_ANSWER: {boxed_answer}")
+        print(f">>> IS_CORRECT: {is_correct}")
+        print("#" * 80 + "\n")
+        
+        # Log to wandb table with full information (max 3 batches)
+        try:
+            import wandb
+            if wandb.run is not None:
+                # Initialize batch tracking if needed
+                if not hasattr(compute_score, '_wandb_batch_counter'):
+                    compute_score._wandb_batch_counter = 0
+                    compute_score._wandb_samples = []
+                
+                # Stop collecting after 3 batches
+                if compute_score._wandb_batch_counter >= 3:
+                    pass  # Don't collect more samples
+                else:
+                    # Try to extract prompt from extra_info or kwargs if available
+                    prompt_text = "N/A (not passed to reward function)"
+                    if extra_info and isinstance(extra_info, dict):
+                        prompt_text = extra_info.get("prompt", extra_info.get("problem", prompt_text))
+                    if prompt_text == "N/A (not passed to reward function)" and kwargs:
+                        prompt_text = kwargs.get("prompt", kwargs.get("problem", prompt_text))
+                    
+                    compute_score._wandb_samples.append({
+                        "sample_id": f"reward_{_compute_score_log_counter}",
+                        "data_source": str(data_source),
+                        "prompt": str(prompt_text)[:1000] if prompt_text else "None",
+                        "ground_truth": ground_truth[:500] if ground_truth else "None",
+                        "generation": solution_str[:2000] if solution_str else "None",
+                        "boxed_answer": boxed_answer or "None",
+                        "is_correct": str(is_correct),
+                        "extra_info_keys": str(list(extra_info.keys()) if extra_info and isinstance(extra_info, dict) else extra_info)[:200],
+                    })
+                    
+                    # Log when we have enough samples, then reset for next batch
+                    if _compute_score_log_counter >= _compute_score_log_limit:
+                        columns = ["sample_id", "data_source", "prompt", "ground_truth", "generation", "boxed_answer", "is_correct", "extra_info_keys"]
+                        table = wandb.Table(columns=columns)
+                        for s in compute_score._wandb_samples:
+                            table.add_data(
+                                s["sample_id"], s["data_source"], s["prompt"], s["ground_truth"],
+                                s["generation"], s["boxed_answer"], s["is_correct"], s["extra_info_keys"]
+                            )
+                        compute_score._wandb_batch_counter += 1
+                        table_name = f"compute_score_samples_batch_{compute_score._wandb_batch_counter}"
+                        wandb.log({table_name: table}, commit=False)
+                        print(f"[WANDB] Logged {len(compute_score._wandb_samples)} compute_score samples as '{table_name}' ({compute_score._wandb_batch_counter}/3)")
+                        
+                        # Reset for next batch
+                        compute_score._wandb_samples = []
+                        _compute_score_log_counter = 0  # Reset global counter
+        except Exception as e:
+            print(f"[WANDB] Failed to log compute_score samples: {e}")
     
     # Debug logging (sample 1 in 50)
     if random.random() < 0.02:
-        boxed_answer = extract_boxed_answer(solution_str)
         print(f"[compute_score DEBUG] ground_truth={ground_truth[:80] if ground_truth else None}...")
         print(f"[compute_score DEBUG] boxed_answer={boxed_answer[:80] if boxed_answer else None}...")
         print(f"[compute_score DEBUG] is_correct={is_correct}")
@@ -367,12 +444,67 @@ def get_or_create_problem_state_actor():
 
 class PromptUpdateInteraction(BaseInteraction):
     """Update prompts between generations based on previous response/reward."""
+    
+    # Class-level counter for detailed logging (shared across instances)
+    _sample_log_counter = 0
+    _sample_log_limit = 5  # Log detailed info for first N samples per batch
+    
+    # Class-level list to collect samples for wandb logging
+    _wandb_samples = []
+    _wandb_batch_counter = 0  # Track which batch we're on for unique table names
 
     def __init__(self, config):
         super().__init__(config)
         self._instance_state = {}  # Per-instance state (keyed by instance_id)
         # Use Ray Actor for persistent state across all workers
         self._state_actor = get_or_create_problem_state_actor()
+    
+    @classmethod
+    def _log_samples_to_wandb(cls):
+        """Log collected samples to wandb as a table (max 3 batches)."""
+        if not cls._wandb_samples:
+            return
+        
+        # Stop after 3 batches
+        if cls._wandb_batch_counter >= 3:
+            cls._wandb_samples = []
+            cls._sample_log_counter = 0
+            return
+        
+        try:
+            import wandb
+            if wandb.run is None:
+                print("[WANDB] No active wandb run, skipping sample logging")
+                return
+            
+            # Create a wandb table with the samples
+            columns = ["sample_id", "mode", "turn", "problem", "ground_truth", "prompt", "generation", "boxed_answer", "reward"]
+            table = wandb.Table(columns=columns)
+            
+            for sample in cls._wandb_samples:
+                table.add_data(
+                    sample.get("sample_id", ""),
+                    sample.get("mode", ""),
+                    sample.get("turn", ""),
+                    sample.get("problem", "")[:500],
+                    sample.get("ground_truth", "")[:200],
+                    sample.get("prompt", "")[:1000],
+                    sample.get("generation", "")[:2000],
+                    sample.get("boxed_answer", ""),
+                    sample.get("reward", "")
+                )
+            
+            # Use unique table name for each batch so we get multiple tables
+            cls._wandb_batch_counter += 1
+            table_name = f"interaction_samples_batch_{cls._wandb_batch_counter}"
+            wandb.log({table_name: table}, commit=False)
+            print(f"[WANDB] Logged {len(cls._wandb_samples)} interaction samples to wandb as '{table_name}' ({cls._wandb_batch_counter}/3)")
+            
+            # Clear samples and reset counter for next batch
+            cls._wandb_samples = []
+            cls._sample_log_counter = 0
+        except Exception as e:
+            print(f"[WANDB] Failed to log samples: {e}")
     
     ##generate_response returns a 4‑tuple:
     # 1) should_terminate_sequence (bool)
@@ -403,11 +535,69 @@ class PromptUpdateInteraction(BaseInteraction):
         print(f"[PromptUpdateInteraction] kwargs keys: {list(kwargs.keys())}")
         print(f"[PromptUpdateInteraction] ground_truth={'SET' if ground_truth else 'None'}, problem={'SET' if problem else 'None'}, sbys_solution_len={len(sbys_solution)}")
         
+        # ==================== LOG RAW INPUT FROM VERL ====================
+        # Log the raw messages and kwargs that verl passed to us
+        if PromptUpdateInteraction._sample_log_counter < PromptUpdateInteraction._sample_log_limit:
+            print("\n" + "-" * 60)
+            print(f"[RAW VERL INPUT - Sample approaching limit {PromptUpdateInteraction._sample_log_counter + 1}/{PromptUpdateInteraction._sample_log_limit}]")
+            print("-" * 60)
+            print(f">>> MESSAGES FROM VERL ({len(messages)} messages):")
+            for i, msg in enumerate(messages):
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")[:800]
+                print(f"  [{i}] {role.upper()}:")
+                print(f"      {content}...")
+            print(f"\n>>> KWARGS FROM VERL:")
+            for key, val in kwargs.items():
+                if isinstance(val, str):
+                    print(f"  {key}: {val[:200]}...")
+                elif isinstance(val, list):
+                    print(f"  {key}: list with {len(val)} items")
+                else:
+                    print(f"  {key}: {val}")
+            print("-" * 60 + "\n")
+        
         # ==================== VALIDATION: Single-turn evaluation ====================
         # If no ground_truth in kwargs, this is a validation sample - terminate immediately
         # verl's custom_reward_function will handle scoring with reward_model.ground_truth
         if ground_truth is None:
             print(f"[PromptUpdateInteraction] VALIDATION MODE: Terminating on first turn (no interaction_kwargs)")
+            
+            # Extract validation generation for logging
+            val_generation = ""
+            val_prompt = ""
+            for msg in messages:
+                if msg.get("role") == "user":
+                    val_prompt = msg.get("content", "")[:500]
+                elif msg.get("role") == "assistant":
+                    val_generation = msg.get("content", "")
+            
+            # Log detailed info for first few validation samples
+            if PromptUpdateInteraction._sample_log_counter < PromptUpdateInteraction._sample_log_limit:
+                PromptUpdateInteraction._sample_log_counter += 1
+                print("\n" + "=" * 80)
+                print(f"[DETAILED VALIDATION SAMPLE LOG #{PromptUpdateInteraction._sample_log_counter}]")
+                print("=" * 80)
+                print(f"\n>>> VALIDATION PROMPT:\n{val_prompt}...")
+                print(f"\n>>> VALIDATION GENERATION:\n{val_generation[:1500]}...")
+                val_boxed = extract_boxed_answer(val_generation) if val_generation else "N/A"
+                print(f"\n>>> BOXED ANSWER: {val_boxed}")
+                print(f">>> NOTE: ground_truth not available in interaction kwargs (will be scored by custom_reward_function)")
+                print("=" * 80 + "\n")
+                
+                # Collect validation sample for wandb logging
+                PromptUpdateInteraction._wandb_samples.append({
+                    "sample_id": f"val_{PromptUpdateInteraction._sample_log_counter}",
+                    "mode": "validation",
+                    "turn": "Single Turn",
+                    "problem": val_prompt,
+                    "ground_truth": "(from dataset, not in interaction_kwargs)",
+                    "prompt": val_prompt,
+                    "generation": val_generation[:2000],
+                    "boxed_answer": val_boxed,
+                    "reward": "(scored by custom_reward_function)"
+                })
+            
             # Return True to terminate, empty content, 0 reward (verl will use custom_reward_function)
             return True, "", 0.0, {"validation": True, "single_turn": True}
         
@@ -471,6 +661,15 @@ class PromptUpdateInteraction(BaseInteraction):
             print(f"[PromptUpdateInteraction] Turn 1: problem={problem[:80] if problem else 'None'}...")
             print(f"[PromptUpdateInteraction] Turn 1: sbys_solution has {len(sbys_solution)} steps")
             
+            # Extract Turn 0 generation (the one we're discarding)
+            turn0_generation = ""
+            turn0_prompt = ""
+            for msg in messages:
+                if msg.get("role") == "user":
+                    turn0_prompt = msg.get("content", "")[:500]
+                elif msg.get("role") == "assistant":
+                    turn0_generation = msg.get("content", "")
+            
             # Construct prompt with current hint level from persistent state
             partial_answer = "\n".join(sbys_solution[:problem_state["try_index"]])
             if problem_state["try_index"] > 0:
@@ -492,6 +691,17 @@ class PromptUpdateInteraction(BaseInteraction):
                 f"{PROMPT_RESET_SYSTEM_TAG}{system_prompt}\n"
                 f"{PROMPT_RESET_USER_TAG}{updated_prompt}"
             )
+            
+            # Store Turn 1 info for detailed logging in Turn 2
+            instance_state["turn1_info"] = {
+                "turn0_prompt": turn0_prompt,
+                "turn0_generation": turn0_generation[:2000],  # Truncate for logging
+                "turn1_prompt": updated_prompt,
+                "try_index": problem_state["try_index"],
+                "problem": problem[:500] if problem else "None",
+                "ground_truth": ground_truth[:200] if ground_truth else "None",
+            }
+            
             # Return 0 reward for turn 1 (we're not evaluating this generation)
             return False, reset_payload, 0.0, {"turn": 1, "try_index": problem_state["try_index"]}
         
@@ -512,6 +722,59 @@ class PromptUpdateInteraction(BaseInteraction):
         print(f"[PromptUpdateInteraction] ground_truth={ground_truth[:50] if ground_truth else None}...")
         print(f"[PromptUpdateInteraction] boxed_answer={boxed_answer[:50] if boxed_answer else 'N/A'}...")
         print(f"[PromptUpdateInteraction] reward={reward}")
+        
+        # ==================== DETAILED LOGGING for sample problems ====================
+        # Log full details for first N samples to help debug
+        if PromptUpdateInteraction._sample_log_counter < PromptUpdateInteraction._sample_log_limit:
+            PromptUpdateInteraction._sample_log_counter += 1
+            turn1_info = instance_state.get("turn1_info", {})
+            
+            # Collect sample for wandb logging
+            sample_id = PromptUpdateInteraction._sample_log_counter
+            
+            # Log Turn 0 (discarded generation)
+            PromptUpdateInteraction._wandb_samples.append({
+                "sample_id": f"train_{sample_id}",
+                "mode": "training",
+                "turn": "Turn 0 (DISCARDED)",
+                "problem": turn1_info.get("problem", ""),
+                "ground_truth": turn1_info.get("ground_truth", ""),
+                "prompt": turn1_info.get("turn0_prompt", ""),
+                "generation": turn1_info.get("turn0_generation", ""),
+                "boxed_answer": extract_boxed_answer(turn1_info.get("turn0_generation", "")) or "N/A",
+                "reward": "N/A (discarded)"
+            })
+            
+            # Log Turn 2 (scored generation)
+            PromptUpdateInteraction._wandb_samples.append({
+                "sample_id": f"train_{sample_id}",
+                "mode": "training",
+                "turn": "Turn 2 (SCORED)",
+                "problem": turn1_info.get("problem", ""),
+                "ground_truth": turn1_info.get("ground_truth", ""),
+                "prompt": turn1_info.get("turn1_prompt", ""),
+                "generation": last_assistant[:2000],
+                "boxed_answer": boxed_answer,
+                "reward": str(reward)
+            })
+            
+            # Log to wandb after collecting enough samples
+            if PromptUpdateInteraction._sample_log_counter >= PromptUpdateInteraction._sample_log_limit:
+                PromptUpdateInteraction._log_samples_to_wandb()
+            
+            print("\n" + "=" * 80)
+            print(f"[DETAILED SAMPLE LOG #{PromptUpdateInteraction._sample_log_counter}]")
+            print("=" * 80)
+            print(f"\n>>> PROBLEM:\n{turn1_info.get('problem', 'N/A')}")
+            print(f"\n>>> GROUND TRUTH:\n{turn1_info.get('ground_truth', 'N/A')}")
+            print(f"\n>>> TRY_INDEX (hints given): {turn1_info.get('try_index', 'N/A')}")
+            print(f"\n>>> TURN 0 PROMPT (original, no hints):\n{turn1_info.get('turn0_prompt', 'N/A')[:500]}...")
+            print(f"\n>>> TURN 0 GENERATION (DISCARDED):\n{turn1_info.get('turn0_generation', 'N/A')[:1000]}...")
+            print(f"\n>>> TURN 1 PROMPT (with hints injected):\n{turn1_info.get('turn1_prompt', 'N/A')[:500]}...")
+            print(f"\n>>> TURN 2 GENERATION (SCORED):\n{last_assistant[:1000]}...")
+            print(f"\n>>> BOXED ANSWER: {boxed_answer}")
+            print(f">>> REWARD: {reward}")
+            print("=" * 80 + "\n")
         
         # Update persistent problem state statistics
         problem_state["total_attempts"] = problem_state.get("total_attempts", 0) + 1
@@ -1281,7 +1544,11 @@ def main():
         # Initialize Ray early to distribute checkpoint to all nodes
         print("[INFO] Initializing Ray for checkpoint distribution...")
         if not ray.is_initialized():
-            ray.init(address='auto')
+            try:
+                ray.init(address='auto', ignore_reinit_error=True)
+            except ConnectionError:
+                print("[INFO] Could not connect to existing Ray cluster, starting new one...")
+                ray.init(ignore_reinit_error=True)
         
         # Distribute checkpoint from head node to all worker nodes
         # This is necessary because verl expects ALL shards to be available on each node
@@ -1334,7 +1601,11 @@ def main():
         
         # Initialize Ray if not already initialized (needed for ProblemStateActor)
         if not ray.is_initialized():
-            ray.init(address='auto')
+            try:
+                ray.init(address='auto', ignore_reinit_error=True)
+            except ConnectionError:
+                print("[INFO] Could not connect to existing Ray cluster, starting new one...")
+                ray.init(ignore_reinit_error=True)
         
         # Create the shared ProblemStateActor before training starts
         # This ensures all workers can access the same actor instance
