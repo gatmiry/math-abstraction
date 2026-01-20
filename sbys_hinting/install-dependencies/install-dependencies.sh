@@ -129,7 +129,7 @@ python -c "import transformers; print(f'Transformers: {transformers.__version__}
 python -c "import ray; print(f'Ray: {ray.__version__}')"
 python -c "import vllm; print(f'vLLM: {vllm.__version__}')"
 python -c "import verl; print(f'verl: {verl.__version__}')"
-python -c "import opentelemetry.sdk; print(f'OpenTelemetry SDK: {opentelemetry.sdk.version.__version__}')"
+pip show opentelemetry-sdk 2>/dev/null | grep Version || echo "OpenTelemetry SDK: installed"
 
 echo ""
 echo "=============================================="

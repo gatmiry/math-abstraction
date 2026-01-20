@@ -2,9 +2,12 @@
 # Note: opentelemetry, ray, torch, and verl are installed separately by install-dependencies.sh
 # to avoid version conflicts
 
+# Apple internal
+apple-bolt
+
 # ML/Training Core (verl installed separately with --no-deps)
 vllm==0.8.5.post1
-sglang[all]==0.4.6.post1
+sglang==0.4.6.post1
 transformers==4.57.0
 accelerate==1.12.0
 datasets==4.4.2
