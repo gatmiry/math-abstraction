@@ -222,40 +222,16 @@ NUM_NODES = 1  # Testing with single node first
 GPUS_PER_NODE = 8
 
 
-def extract_boxed_answer(text: str) -> Optional[str]:
-    """Extract answer from \\box{...} or \\boxed{...} using proper brace matching."""
-    # Find all occurrences of \box{ or \boxed{
-    matches = list(re.finditer(r'\\box(ed)?\{', text))
-    if not matches:
-        return None
-    
-    # Use the last occurrence (final answer is typically at the end)
-    start_pos = matches[-1].end()
-    depth = 1
-    i = start_pos
-    
-    # Match braces properly to handle nested expressions like \frac{...}{...}
-    while i < len(text) and depth > 0:
-        if text[i] == '{':
-            depth += 1
-        elif text[i] == '}':
-            depth -= 1
-        i += 1
-    
-    if depth == 0:
-        return text[start_pos:i-1].strip()
-    return None
-
-
-def normalize_answer(answer: str) -> str:
-    """Normalize answer for comparison."""
-    if answer is None:
-        return ""
-    ans = answer.strip()
-    ans = re.sub(r'\s+', '', ans)
-    ans = ans.replace('\\left', '').replace('\\right', '')
-    ans = ans.replace('\\,', '').replace('\\;', '').replace('\\:', '')
-    return ans.lower()
+# Import the comprehensive answer checking logic from check_accuracy.py
+# Use dynamic import to handle both direct execution and module import
+import importlib.util
+import os as _os
+_check_accuracy_path = _os.path.join(_os.path.dirname(__file__), "check_accuracy.py")
+_spec = importlib.util.spec_from_file_location("check_accuracy", _check_accuracy_path)
+_check_accuracy = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_check_accuracy)
+check_answer = _check_accuracy.check_answer
+extract_boxed_answer = _check_accuracy.extract_boxed_answer
 
 
 def compute_score(
@@ -268,6 +244,7 @@ def compute_score(
     """Compute reward score for a single solution (verl 0.4.1 format).
     
     This function is called by verl's NaiveRewardManager for each sample.
+    Uses comprehensive answer matching from check_accuracy.py with 27+ methods.
     
     Args:
         data_source: Data source identifier (not used here)
@@ -282,30 +259,22 @@ def compute_score(
     if ground_truth is None:
         return 0.0
     
-    # Extract boxed answer from solution
-    boxed_answer = extract_boxed_answer(solution_str)
-    boxed_normalized = normalize_answer(boxed_answer)
+    if solution_str is None:
+        return 0.0
     
-    # Also extract boxed content from ground_truth if it has \boxed{}
-    gt_boxed = extract_boxed_answer(ground_truth)
-    if gt_boxed is not None:
-        answer_normalized = normalize_answer(gt_boxed)
-    else:
-        answer_normalized = normalize_answer(ground_truth)
+    # Use the comprehensive check_answer function from check_accuracy.py
+    # It handles many special cases: LaTeX normalization, ± expansion, 
+    # symbolic comparison, tuple matching, interval notation, etc.
+    is_correct = check_answer(solution_str, ground_truth)
     
     # Debug logging (sample 1 in 50)
-    import random
     if random.random() < 0.02:
+        boxed_answer = extract_boxed_answer(solution_str)
         print(f"[compute_score DEBUG] ground_truth={ground_truth[:80] if ground_truth else None}...")
         print(f"[compute_score DEBUG] boxed_answer={boxed_answer[:80] if boxed_answer else None}...")
-        print(f"[compute_score DEBUG] boxed_normalized={boxed_normalized[:50] if boxed_normalized else None}")
-        print(f"[compute_score DEBUG] answer_normalized={answer_normalized[:50] if answer_normalized else None}")
+        print(f"[compute_score DEBUG] is_correct={is_correct}")
     
-    # Compare normalized answers
-    if boxed_normalized and answer_normalized and boxed_normalized == answer_normalized:
-        return 1.0
-    else:
-        return 0.0
+    return 1.0 if is_correct else 0.0
 
 
 @ray.remote
@@ -710,13 +679,14 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
         answers = []
         sbys_solutions = []
         problems = []
-        for problem, final_answer, sbys_solution in zip(
-            examples['problem'], examples['final_answer'], examples['sbys_solution']
+
+        for problem, answer, sbys_solution in zip(
+            examples['problem'], examples['answer'], examples['sbys_solution']
         ):
-            if final_answer:
+            if answer:
                 messages = format_prompt(problem)
                 prompts.append(messages)
-                answers.append(final_answer)
+                answers.append(answer)
                 sbys_solutions.append(sbys_solution)
                 problems.append(problem)
         
@@ -1189,9 +1159,9 @@ def main():
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",  # Leave room for FSDP actor
         "actor_rollout_ref.rollout.prompt_length=2560",
-        "actor_rollout_ref.rollout.response_length=4096",
-        "actor_rollout_ref.rollout.max_model_len=6656",
-        "actor_rollout_ref.rollout.max_num_batched_tokens=6656",
+        "actor_rollout_ref.rollout.response_length=8192",
+        "actor_rollout_ref.rollout.max_model_len=10752",  # 2560 + 8192
+        "actor_rollout_ref.rollout.max_num_batched_tokens=10752",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",  # Reduced from 4 to save GPU memory
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
@@ -1219,7 +1189,7 @@ def main():
         f"data.val_files={val_dataset_file}",
         "data.prompt_key=prompt",
         "data.max_prompt_length=2560",
-        "data.max_response_length=1536",
+        "data.max_response_length=8192",
         f"data.train_batch_size={TRAIN_BATCH_SIZE}",
         f"data.val_batch_size={TEST_BATCH_SIZE}",
         "data.return_raw_chat=true",  # Required for sglang rollout
