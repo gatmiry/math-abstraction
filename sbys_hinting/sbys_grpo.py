@@ -27,8 +27,8 @@ SYSTEM_PROMPT_NAME = "full_solution_simple"
 HINT_LEVEL = -1
 VAL_SIZE = 512
 PROMPT_UPDATE_ENABLED = True
-PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 3
-PROMPT_UPDATE_MAX_USER_TURNS = 3
+PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
+PROMPT_UPDATE_MAX_USER_TURNS = 2
 PROMPT_RESET_PREFIX = "__RESET_PROMPT__\n"
 PROMPT_RESET_SYSTEM_TAG = "__SYSTEM__\n"
 PROMPT_RESET_USER_TAG = "__USER__\n"
@@ -181,13 +181,13 @@ except ImportError:
 
 # Configuration
 DEFAULT_MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507"
-DATASET_NAME = os.path.join(os.path.dirname(__file__), "outputs", "sbys_proofs_dataset")
+DATASET_NAME = os.path.join(os.path.dirname(__file__), "outputs", "sbys_proofs_dataset_filtered")
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
 # Training hyperparameters
-TRAIN_BATCH_SIZE = 256
+TRAIN_BATCH_SIZE = 64  # Reduced for faster iteration
 TOTAL_EPOCHS = 50
-TEST_BATCH_SIZE = 512
+TEST_BATCH_SIZE = 128  # Reduced for faster validation
 
 
 def parse_args():
@@ -308,16 +308,103 @@ def compute_score(
         return 0.0
 
 
+@ray.remote
+class ProblemStateActor:
+    """Ray Actor to maintain persistent problem state across all workers.
+    
+    This actor is shared across all workers in distributed training,
+    ensuring that problem state persists across GRPO steps regardless
+    of which worker processes the problem.
+    """
+    
+    def __init__(self):
+        self._problem_state = {}  # Keyed by problem text
+    
+    def get_state(self, problem_key: str) -> Optional[Dict[str, Any]]:
+        """Get state for a problem, returns None if not exists."""
+        return self._problem_state.get(problem_key)
+    
+    def set_state(self, problem_key: str, state: Dict[str, Any]) -> None:
+        """Set state for a problem."""
+        self._problem_state[problem_key] = state
+    
+    def update_state(self, problem_key: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Update specific fields in problem state and return the updated state."""
+        if problem_key not in self._problem_state:
+            self._problem_state[problem_key] = {}
+        self._problem_state[problem_key].update(updates)
+        return self._problem_state[problem_key]
+    
+    def init_state_if_missing(self, problem_key: str, default_state: Dict[str, Any]) -> Dict[str, Any]:
+        """Initialize state for a problem if it doesn't exist, return current state."""
+        if problem_key not in self._problem_state:
+            self._problem_state[problem_key] = default_state
+        return self._problem_state[problem_key]
+    
+    def get_all_stats(self) -> Dict[str, Any]:
+        """Get summary statistics across all problems."""
+        total_problems = len(self._problem_state)
+        total_attempts = sum(s.get("total_attempts", 0) for s in self._problem_state.values())
+        total_correct = sum(s.get("total_correct", 0) for s in self._problem_state.values())
+        return {
+            "total_problems": total_problems,
+            "total_attempts": total_attempts,
+            "total_correct": total_correct,
+        }
+    
+    def initialize_all_problems(self, problems_data: List[Dict[str, Any]]) -> int:
+        """Initialize state for all problems at once (called at start of training).
+        
+        Args:
+            problems_data: List of dicts with 'problem' and 'sbys_solution' keys
+        
+        Returns:
+            Number of problems initialized
+        """
+        count = 0
+        for item in problems_data:
+            problem_key = item.get("problem")
+            sbys_solution = item.get("sbys_solution") or []
+            if problem_key and problem_key not in self._problem_state:
+                self._problem_state[problem_key] = {
+                    "guide_steps_count": len(sbys_solution),
+                    "unable_index": 0,
+                    "able_index": len(sbys_solution),
+                    "try_index": 0,
+                    "total_attempts": 0,
+                    "total_correct": 0,
+                }
+                count += 1
+        return count
+
+
+# Global name for the shared actor
+PROBLEM_STATE_ACTOR_NAME = "problem_state_actor"
+
+
+def get_or_create_problem_state_actor():
+    """Get existing ProblemStateActor or create a new one."""
+    try:
+        # Try to get existing actor
+        return ray.get_actor(PROBLEM_STATE_ACTOR_NAME)
+    except ValueError:
+        # Actor doesn't exist, create it
+        return ProblemStateActor.options(
+            name=PROBLEM_STATE_ACTOR_NAME,
+            lifetime="detached",  # Survives driver failure
+            max_concurrency=100,  # Handle many concurrent requests
+        ).remote()
+
+
 class PromptUpdateInteraction(BaseInteraction):
     """Update prompts between generations based on previous response/reward."""
 
     def __init__(self, config):
         super().__init__(config)
-        self._state = {}
-        self.guide_steps_count = 0
-        self.unable_index = 0
-        self.able_index = 0
-        self.try_index = 0
+        self._instance_state = {}  # Per-instance state (keyed by instance_id)
+        # Use Ray Actor for persistent state across all workers
+        self._state_actor = get_or_create_problem_state_actor()
+    
     ##generate_response returns a 4‑tuple:
     # 1) should_terminate_sequence (bool)
     # 2) content (str) — the user message to add (or reset)
@@ -325,84 +412,154 @@ class PromptUpdateInteraction(BaseInteraction):
     # 4) metrics (dict) — any extra info to log
 
     async def generate_response(self, instance_id, messages, **kwargs):
+        """Two-turn interaction flow:
+        
+        Turn 1: Ignore initial generation (no hints), inject prompt WITH hints from persistent state
+        Turn 2: Evaluate generation (with hints), update persistent state, terminate
+        """
+        import math
+        
         print(f"[PromptUpdateInteraction] generate_response called! instance_id={instance_id}")
         initial_state = kwargs.get("state", {})
-        state = self._state.setdefault(
-            instance_id, dict(initial_state) if isinstance(initial_state, dict) else {}
-        )
+        
         ground_truth = kwargs.get("ground_truth")
         sbys_solution = kwargs.get("sbys_solution") or []
         problem = kwargs.get("problem")
-        print(f"[PromptUpdateInteraction] ground_truth={ground_truth[:50] if ground_truth else None}...")
-        if self.guide_steps_count == 0:
-            ## this means this is the first round
-            ## now initialized guide_steps_count and unable_index and able_index
-            self.guide_steps_count = len(sbys_solution)
-            self.able_index = self.guide_steps_count
         
-        #print(f"[PromptUpdateInteraction] sbys_solution={sbys_solution}")
+        # Use problem text as key for persistent binary search state (survives across steps)
+        problem_key = problem if problem else instance_id
+        
+        # Get persistent state from Ray Actor (initialized at start of training)
+        problem_state = ray.get(self._state_actor.get_state.remote(problem_key))
+        
+        # Fallback initialization if state wasn't pre-initialized (shouldn't happen normally)
+        if problem_state is None:
+            print(f"[PromptUpdateInteraction] WARNING: Problem state not pre-initialized for: {problem_key[:50]}...")
+            problem_state = {
+                "guide_steps_count": len(sbys_solution) if sbys_solution else 0,
+                "unable_index": 0,
+                "able_index": len(sbys_solution) if sbys_solution else 0,
+                "try_index": 0,
+                "total_attempts": 0,
+                "total_correct": 0,
+            }
+            ray.get(self._state_actor.set_state.remote(problem_key, problem_state))
+        
+        # Initialize per-instance state (for tracking this specific request and turn number)
+        if instance_id not in self._instance_state:
+            self._instance_state[instance_id] = {
+                "turn": 0,  # Track which turn we're on
+                **(dict(initial_state) if isinstance(initial_state, dict) else {})
+            }
+        instance_state = self._instance_state[instance_id]
+        
+        # Increment turn counter
+        instance_state["turn"] = instance_state.get("turn", 0) + 1
+        current_turn = instance_state["turn"]
+        
+        print(f"[PromptUpdateInteraction] Turn {current_turn}, problem_key={problem_key[:50] if problem_key else None}...")
+        print(f"[PromptUpdateInteraction] Persistent state: try_index={problem_state['try_index']}, able={problem_state['able_index']}, unable={problem_state['unable_index']}")
+        
+        # Update guide_steps_count if sbys_solution changed (shouldn't happen, but just in case)
+        if problem_state["guide_steps_count"] == 0 and sbys_solution:
+            problem_state["guide_steps_count"] = len(sbys_solution)
+            problem_state["able_index"] = len(sbys_solution)
+            ray.get(self._state_actor.set_state.remote(problem_key, problem_state))
+        
+        # ==================== TURN 1: Inject hints ====================
+        # Ignore the initial generation (it had no hints), return prompt WITH hints
+        if current_turn == 1:
+            print(f"[PromptUpdateInteraction] Turn 1: Injecting hints (try_index={problem_state['try_index']})")
+            
+            # Construct prompt with current hint level from persistent state
+            partial_answer = "\n".join(sbys_solution[:problem_state["try_index"]])
+            if problem_state["try_index"] > 0:
+                updated_prompt = (
+                    f"Problem: {problem}\n"
+                    f"Incomplete proof: {partial_answer}\n"
+                )
+            else:
+                updated_prompt = (
+                    f"Problem: {problem}\n"
+                )
+            
+            system_prompt_name = "full_solution_simple" if problem_state["try_index"] > 0 else "full_solution_with_hint"
+            system_prompt = load_system_prompt(system_prompt_name)
+            reset_payload = (
+                f"{PROMPT_RESET_PREFIX}"
+                f"{PROMPT_RESET_SYSTEM_TAG}{system_prompt}\n"
+                f"{PROMPT_RESET_USER_TAG}{updated_prompt}"
+            )
+            # Return 0 reward for turn 1 (we're not evaluating this generation)
+            return False, reset_payload, 0.0, {"turn": 1, "try_index": problem_state["try_index"]}
+        
+        # ==================== TURN 2: Evaluate and update state ====================
+        print(f"[PromptUpdateInteraction] Turn 2: Evaluating generation")
+        
+        # Extract the assistant's response
         last_assistant = ""
         for msg in reversed(messages):
             if msg.get("role") == "assistant":
                 last_assistant = msg.get("content", "")
                 break
 
+        # Compute reward
         reward = compute_score(solution_str=last_assistant, ground_truth=ground_truth)
         boxed_answer = extract_boxed_answer(last_assistant) or "N/A"
-        state["attempt"] = state.get("attempt", 0) + 1
-        state["last_reward"] = reward
-        state["last_answer"] = boxed_answer
+        
+        print(f"[PromptUpdateInteraction] ground_truth={ground_truth[:50] if ground_truth else None}...")
+        print(f"[PromptUpdateInteraction] boxed_answer={boxed_answer[:50] if boxed_answer else 'N/A'}...")
+        print(f"[PromptUpdateInteraction] reward={reward}")
+        
+        # Update persistent problem state statistics
+        problem_state["total_attempts"] = problem_state.get("total_attempts", 0) + 1
+        if reward > 0.5:
+            problem_state["total_correct"] = problem_state.get("total_correct", 0) + 1
 
-        if reward >= 0.9 and self.try_index == 0:
-            ## this means the method can solve the problem without any partial proofs, so we are done with this problem!
-            print(f"[PromptUpdateInteraction] Removing instance {instance_id} because guide steps completed")
-            return True, "", reward, {"correct": True}
+        # Check if solved without hints (try_index == 0 means no hints were given)
+        if reward > 0.5 and problem_state["try_index"] == 0:
+            print(f"[PromptUpdateInteraction] Correct without hints! attempts={problem_state['total_attempts']}, correct={problem_state['total_correct']}")
+            ray.get(self._state_actor.set_state.remote(problem_key, problem_state))
+            # Clean up instance state
+            if instance_id in self._instance_state:
+                del self._instance_state[instance_id]
+            return True, "", reward, {"correct": True, "try_index": 0, "turn": 2}
 
-        ## here is the logic for specifying the next try_index
-        import math
-        if self.try_index <= self.unable_index and reward > 0.5:
-            self.able_index = self.try_index
-            if self.try_index == self.unable_index:
-                self.try_index = self.try_index - 1
+        # Binary search logic to update try_index for NEXT time this problem is seen
+        old_try_index = problem_state["try_index"]
+        if problem_state["try_index"] <= problem_state["unable_index"] and reward > 0.5:
+            problem_state["able_index"] = problem_state["try_index"]
+            if problem_state["try_index"] == problem_state["unable_index"]:
+                problem_state["try_index"] = problem_state["try_index"] - 1
             else:
-                self.try_index = self.try_index - (self.unable_index - self.try_index)
-            self.try_index = max(self.try_index, 0)
-        elif self.try_index >= self.able_index and reward < 0.5:
-            self.unable_index = self.try_index
-            if self.try_index == self.able_index:
-                self.try_index = self.try_index + 1
+                problem_state["try_index"] = problem_state["try_index"] - (problem_state["unable_index"] - problem_state["try_index"])
+            problem_state["try_index"] = max(problem_state["try_index"], 0)
+        elif problem_state["try_index"] >= problem_state["able_index"] and reward < 0.5:
+            problem_state["unable_index"] = problem_state["try_index"]
+            if problem_state["try_index"] == problem_state["able_index"]:
+                problem_state["try_index"] = problem_state["try_index"] + 1
             else:
-                self.try_index = self.try_index + (self.try_index - self.able_index)
-            self.try_index = min(self.try_index, self.guide_steps_count)
+                problem_state["try_index"] = problem_state["try_index"] + (problem_state["try_index"] - problem_state["able_index"])
+            problem_state["try_index"] = min(problem_state["try_index"], problem_state["guide_steps_count"])
         else:
             if reward < 0.5:
-                self.unable_index = self.try_index
-                self.try_index = math.ceil((self.try_index + self.able_index) / 2)
+                problem_state["unable_index"] = problem_state["try_index"]
+                problem_state["try_index"] = math.ceil((problem_state["try_index"] + problem_state["able_index"]) / 2)
             else:
-                self.able_index = self.try_index
-                self.try_index = math.floor((self.try_index + self.unable_index) / 2)
+                problem_state["able_index"] = problem_state["try_index"]
+                problem_state["try_index"] = math.floor((problem_state["try_index"] + problem_state["unable_index"]) / 2)
 
+        # Persist updated state to Ray Actor
+        ray.get(self._state_actor.set_state.remote(problem_key, problem_state))
+        
+        print(f"[PromptUpdateInteraction] Updated hint level: {old_try_index} -> {problem_state['try_index']} (able={problem_state['able_index']}, unable={problem_state['unable_index']})")
 
-        partial_answer = "\n".join(sbys_solution[:self.try_index])
-        if self.try_index > 0:
-            updated_prompt = (
-                f"Problem: {problem}\n"
-                f"Incomplete proof: {partial_answer}\n"
-                #f"Please produce a full solution and end with the final answer in \\box{...}."
-            )
-        else:
-            updated_prompt = (
-                f"Problem: {problem}\n"
-                #f"Please produce a full solution and end with the final answer in \\box{...}."
-            )
-        system_prompt_name = "full_solution_with_hint" if self.try_index == 0 else "full_solution_simple"
-        system_prompt = load_system_prompt(system_prompt_name)
-        reset_payload = (
-            f"{PROMPT_RESET_PREFIX}"
-            f"{PROMPT_RESET_SYSTEM_TAG}{system_prompt}\n"
-            f"{PROMPT_RESET_USER_TAG}{updated_prompt}"
-        )
-        return False, reset_payload, reward, {"try_index": self.try_index}
+        # Clean up instance state
+        if instance_id in self._instance_state:
+            del self._instance_state[instance_id]
+        
+        # Terminate the sequence - we're done with this problem for this GRPO step
+        return True, "", reward, {"try_index": problem_state["try_index"], "turn": 2, "reward": reward}
 
 def _reset_request_prompt(self, processing_class, new_user_content: str, new_system_content: Optional[str] = None) -> None:
     if new_system_content is None:
@@ -532,6 +689,19 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
     
     # Load dataset
     dataset = load_from_disk(dataset_path)
+    
+    # Deduplicate by problem text to avoid @4 metrics issues
+    original_size = len(dataset)
+    seen_problems = set()
+    unique_indices = []
+    for idx, example in enumerate(dataset):
+        problem = example['problem']
+        if problem not in seen_problems:
+            seen_problems.add(problem)
+            unique_indices.append(idx)
+    if len(unique_indices) < original_size:
+        dataset = dataset.select(unique_indices)
+        print(f"[INFO] Deduplicated dataset: {original_size} -> {len(dataset)} ({original_size - len(dataset)} duplicates removed)")
     
     # Format dataset - store messages as JSON for verl to parse
     def format_dataset(examples):
@@ -1017,21 +1187,26 @@ def main():
         "actor_rollout_ref.rollout.n=4",  # Multiple generations for GRPO
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.7",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",  # Leave room for FSDP actor
         "actor_rollout_ref.rollout.prompt_length=2560",
         "actor_rollout_ref.rollout.response_length=4096",
         "actor_rollout_ref.rollout.max_model_len=6656",
         "actor_rollout_ref.rollout.max_num_batched_tokens=6656",
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",  # Reduced from 4 to save GPU memory
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
+        
+        # Validation rollout config - 2 samples per prompt for @2 metrics
+        "actor_rollout_ref.rollout.val_kwargs.n=2",
+        "actor_rollout_ref.rollout.val_kwargs.do_sample=true",
+        "actor_rollout_ref.rollout.val_kwargs.temperature=1.0",
         
         # Ray cluster config - connect to existing cluster
         "++ray_kwargs.ray_init.address=auto",
         
         # Actor config
         f"actor_rollout_ref.actor.ppo_mini_batch_size={TRAIN_BATCH_SIZE}",  # Must be <= train_batch_size
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",  # Reduced from 4 to save GPU memory
         "actor_rollout_ref.actor.ppo_epochs=1",
         
         # Algorithm - GRPO
@@ -1153,9 +1328,30 @@ def main():
 
     if PROMPT_UPDATE_ENABLED:
         install_prompt_reset_hook()
-    
-    # Note: Ray will be initialized by verl's run_ppo with proper config
-    # including address='auto' and VLLM_USE_V1=0 in runtime_env
+        
+        # Initialize Ray if not already initialized (needed for ProblemStateActor)
+        if not ray.is_initialized():
+            ray.init(address='auto')
+        
+        # Create the shared ProblemStateActor before training starts
+        # This ensures all workers can access the same actor instance
+        print("[INFO] Initializing shared ProblemStateActor for persistent problem state...")
+        state_actor = get_or_create_problem_state_actor()
+        print(f"[INFO] ProblemStateActor ready: {state_actor}")
+        
+        # Initialize all problem states at once (more efficient than initializing per-call)
+        all_problems = []
+        for item in train_data:
+            extra_info = item.get("extra_info", {})
+            interaction_kwargs = extra_info.get("interaction_kwargs", {})
+            if interaction_kwargs.get("problem"):
+                all_problems.append({
+                    "problem": interaction_kwargs["problem"],
+                    "sbys_solution": interaction_kwargs.get("sbys_solution", []),
+                })
+        print(f"[INFO] Initializing state for {len(all_problems)} problems...")
+        num_initialized = ray.get(state_actor.initialize_all_problems.remote(all_problems))
+        print(f"[INFO] Initialized {num_initialized} problem states")
     
     # Import run_ppo here to avoid import issues
     from verl.trainer.main_ppo import run_ppo
