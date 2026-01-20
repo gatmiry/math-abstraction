@@ -181,11 +181,11 @@ except ImportError:
 
 # Configuration
 DEFAULT_MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507"
-DATASET_NAME = os.path.join(os.path.dirname(__file__), "outputs", "sbys_proofs_dataset_filtered")
+DATASET_NAME = os.path.join(os.path.dirname(__file__), "outputs", "hint_helped_dataset", "hint_helped_dataset")
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
 # Training hyperparameters
-TRAIN_BATCH_SIZE = 64  # Reduced for faster iteration
+TRAIN_BATCH_SIZE = 128  # Reduced for faster iteration
 TOTAL_EPOCHS = 50
 TEST_BATCH_SIZE = 128  # Reduced for faster validation
 
@@ -222,16 +222,16 @@ NUM_NODES = 1  # Testing with single node first
 GPUS_PER_NODE = 8
 
 
-# Import the comprehensive answer checking logic from check_accuracy.py
-# Use dynamic import to handle both direct execution and module import
+# Import the math_verify based answer checking logic from math_checker.py
+# Uses Hugging Face's math_verify library for standardized verification
 import importlib.util
 import os as _os
-_check_accuracy_path = _os.path.join(_os.path.dirname(__file__), "check_accuracy.py")
-_spec = importlib.util.spec_from_file_location("check_accuracy", _check_accuracy_path)
-_check_accuracy = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_check_accuracy)
-check_answer = _check_accuracy.check_answer
-extract_boxed_answer = _check_accuracy.extract_boxed_answer
+_math_checker_path = _os.path.join(_os.path.dirname(__file__), "math_checker.py")
+_spec = importlib.util.spec_from_file_location("math_checker", _math_checker_path)
+_math_checker = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_math_checker)
+check_answer = _math_checker.check_answer
+extract_boxed_answer = _math_checker.extract_boxed_answer
 
 
 def compute_score(
@@ -244,12 +244,12 @@ def compute_score(
     """Compute reward score for a single solution (verl 0.4.1 format).
     
     This function is called by verl's NaiveRewardManager for each sample.
-    Uses comprehensive answer matching from check_accuracy.py with 27+ methods.
+    Uses math_verify library (Hugging Face standard) for answer verification.
     
     Args:
         data_source: Data source identifier (not used here)
         solution_str: Generated solution string
-        ground_truth: Ground truth answer (from dataset)
+        ground_truth: Ground truth answer (from dataset 'answer' field)
         extra_info: Extra info dictionary
         **kwargs: Additional keyword arguments
     
@@ -262,9 +262,9 @@ def compute_score(
     if solution_str is None:
         return 0.0
     
-    # Use the comprehensive check_answer function from check_accuracy.py
-    # It handles many special cases: LaTeX normalization, ± expansion, 
-    # symbolic comparison, tuple matching, interval notation, etc.
+    # Use math_checker.check_answer which uses math_verify library
+    # It handles: LaTeX parsing, symbolic comparison, tuple matching,
+    # numeric equivalence, text normalization, etc.
     is_correct = check_answer(solution_str, ground_truth)
     
     # Debug logging (sample 1 in 50)
@@ -381,10 +381,14 @@ class PromptUpdateInteraction(BaseInteraction):
     # 4) metrics (dict) — any extra info to log
 
     async def generate_response(self, instance_id, messages, **kwargs):
-        """Two-turn interaction flow:
+        """Two-turn interaction flow for training, single-turn for validation.
         
-        Turn 1: Ignore initial generation (no hints), inject prompt WITH hints from persistent state
-        Turn 2: Evaluate generation (with hints), update persistent state, terminate
+        Training (has interaction_kwargs):
+            Turn 1: Ignore initial generation (no hints), inject prompt WITH hints from persistent state
+            Turn 2: Evaluate generation (with hints), update persistent state, terminate
+        
+        Validation (no interaction_kwargs):
+            Single turn: Evaluate generation directly, return score, terminate
         """
         import math
         
@@ -395,6 +399,26 @@ class PromptUpdateInteraction(BaseInteraction):
         sbys_solution = kwargs.get("sbys_solution") or []
         problem = kwargs.get("problem")
         
+        # ==================== VALIDATION: Single-turn evaluation ====================
+        # If no ground_truth in kwargs, this is a validation sample - do single-turn eval
+        if ground_truth is None:
+            print(f"[PromptUpdateInteraction] Validation mode: single-turn evaluation")
+            
+            # Extract the assistant's response
+            last_assistant = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "assistant":
+                    last_assistant = msg.get("content", "")
+                    break
+            
+            # For validation, get ground_truth from the prompt/message context if available
+            # The validation dataset stores it in extra_info.reward_model.ground_truth
+            # which verl passes through differently - we need to extract from messages
+            # For now, return 0 reward and let verl's custom_reward_function handle it
+            print(f"[PromptUpdateInteraction] Validation: returning for custom reward scoring")
+            return True, "", 0.0, {"validation": True, "single_turn": True}
+        
+        # ==================== TRAINING: Two-turn interaction ====================
         # Use problem text as key for persistent binary search state (survives across steps)
         problem_key = problem if problem else instance_id
         

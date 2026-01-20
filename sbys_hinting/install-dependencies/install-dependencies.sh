@@ -2,6 +2,10 @@
 # Install dependencies for GRPO training
 # Usage: ./install-dependencies.sh [venv_path]
 # Default venv path: /mnt/task_runtime/myenv
+#
+# This script installs packages in a specific order to avoid dependency conflicts
+# between vllm (needs opentelemetry-sdk<1.27) and ray[default] (needs opentelemetry-sdk>=1.30)
+# Solution: Install verl with --no-deps, then install ray without default extras
 
 set -e  # Exit on error
 
@@ -23,47 +27,109 @@ fi
 
 # Create virtual environment if it doesn't exist
 if [ ! -d "$VENV_PATH" ]; then
-    echo "[1/6] Creating virtual environment..."
+    echo "[1/9] Creating virtual environment..."
     python3.12 -m venv "$VENV_PATH"
 else
-    echo "[1/6] Virtual environment already exists at $VENV_PATH"
+    echo "[1/9] Virtual environment already exists at $VENV_PATH"
 fi
 
 # Activate virtual environment
-echo "[2/6] Activating virtual environment..."
+echo "[2/9] Activating virtual environment..."
 source "$VENV_PATH/bin/activate"
 
 # Upgrade pip, setuptools, wheel
-echo "[3/6] Upgrading pip, setuptools, wheel..."
+echo "[3/9] Upgrading pip, setuptools, wheel..."
 pip install --upgrade pip setuptools wheel
 
 # Install PyTorch with CUDA 12.4 first (special index)
-echo "[4/6] Installing PyTorch with CUDA 12.4..."
+echo "[4/9] Installing PyTorch with CUDA 12.4..."
 pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 \
     --index-url https://download.pytorch.org/whl/cu124
 
+# Install opentelemetry packages FIRST with exact versions (vllm compatible)
+echo "[5/9] Installing opentelemetry packages (pinned to 1.26.0 for vllm compatibility)..."
+pip install \
+    opentelemetry-api==1.26.0 \
+    opentelemetry-sdk==1.26.0 \
+    opentelemetry-proto==1.26.0 \
+    opentelemetry-exporter-otlp==1.26.0 \
+    opentelemetry-exporter-otlp-proto-grpc==1.26.0 \
+    opentelemetry-exporter-otlp-proto-http==1.26.0 \
+    opentelemetry-exporter-otlp-proto-common==1.26.0 \
+    opentelemetry-semantic-conventions==0.47b0
+
+# Install ray WITHOUT extras to avoid pulling in ray[default] which needs opentelemetry-sdk>=1.30.0
+# ray[default] adds observability features which we don't need
+echo "[6/9] Installing ray (without default extras)..."
+pip install ray==2.53.0
+
+# Install verl with --no-deps because it requires ray[default] which conflicts with vllm
+# Then we install verl's actual dependencies separately
+echo "[7/9] Installing verl (without dependencies) and its deps..."
+pip install verl==0.4.1 --no-deps
+# Install verl dependencies (except ray[default], we already have ray)
+pip install \
+    accelerate \
+    codetiming \
+    datasets \
+    dill \
+    hydra-core \
+    numpy \
+    pandas \
+    peft \
+    "pyarrow>=19.0.0" \
+    pybind11 \
+    pylatexenc \
+    torchdata \
+    "tensordict<=0.6.2" \
+    transformers \
+    wandb \
+    "packaging>=20.0"
+
 # Install flash-attn (needs special handling - requires CUDA toolkit)
-echo "[5/6] Installing flash-attn..."
-# Set CUDA paths if needed
+echo "[8/9] Installing flash-attn..."
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
-pip install flash-attn==2.7.4.post1 --no-build-isolation || {
-    echo "[WARNING] flash-attn installation failed. Trying without version pin..."
-    pip install flash-attn --no-build-isolation || {
+pip install flash-attn==2.7.4.post1 --no-build-isolation 2>/dev/null || {
+    echo "[WARNING] flash-attn 2.7.4.post1 installation failed. Trying without version pin..."
+    pip install flash-attn --no-build-isolation 2>/dev/null || {
         echo "[WARNING] flash-attn could not be installed. Training may still work without it."
     }
 }
 
-# Install core requirements (let pip resolve transitive dependencies)
-echo "[6/6] Installing core dependencies..."
-pip install -r "$SCRIPT_DIR/requirements-core.txt"
+# Create constraints file to prevent torch/opentelemetry from being changed
+CONSTRAINTS_FILE=$(mktemp)
+cat > "$CONSTRAINTS_FILE" << EOF
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+torchaudio==2.6.0+cu124
+opentelemetry-api==1.26.0
+opentelemetry-sdk==1.26.0
+opentelemetry-proto==1.26.0
+opentelemetry-exporter-otlp==1.26.0
+opentelemetry-exporter-otlp-proto-grpc==1.26.0
+opentelemetry-exporter-otlp-proto-http==1.26.0
+opentelemetry-exporter-otlp-proto-common==1.26.0
+opentelemetry-semantic-conventions==0.47b0
+ray==2.53.0
+EOF
+
+# Install remaining packages with constraints
+echo "[9/9] Installing remaining dependencies (vllm, sglang, etc.)..."
+pip install -c "$CONSTRAINTS_FILE" -r "$SCRIPT_DIR/requirements-core.txt"
+
+# Cleanup constraints file
+rm -f "$CONSTRAINTS_FILE"
 
 # Verify key packages
 echo ""
 echo "Verifying installation..."
 python -c "import torch; print(f'PyTorch: {torch.__version__}')"
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 python -c "import transformers; print(f'Transformers: {transformers.__version__}')"
 python -c "import ray; print(f'Ray: {ray.__version__}')"
+python -c "import vllm; print(f'vLLM: {vllm.__version__}')"
 python -c "import verl; print(f'verl: {verl.__version__}')"
+python -c "import opentelemetry.sdk; print(f'OpenTelemetry SDK: {opentelemetry.sdk.version.__version__}')"
 
 echo ""
 echo "=============================================="
