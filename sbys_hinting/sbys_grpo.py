@@ -277,10 +277,26 @@ def compute_score(
     """
     global _compute_score_log_counter
     
+    # DEBUG: Log ALL parameters received by compute_score
+    if _compute_score_log_counter < 3:
+        print("\n" + "!" * 80)
+        print("[compute_score DEBUG] ALL PARAMETERS RECEIVED:")
+        print(f"  data_source = {repr(data_source)}")
+        print(f"  solution_str = {repr(solution_str[:200] if solution_str else solution_str)}...")
+        print(f"  ground_truth = {repr(ground_truth)}")
+        print(f"  extra_info = {repr(extra_info)}")
+        print(f"  kwargs keys = {list(kwargs.keys())}")
+        for k, v in kwargs.items():
+            v_str = repr(v)[:200] if v else repr(v)
+            print(f"    kwargs[{k}] = {v_str}")
+        print("!" * 80 + "\n")
+    
     if ground_truth is None:
+        print(f"[compute_score] WARNING: ground_truth is None! Returning 0.0")
         return 0.0
     
     if solution_str is None:
+        print(f"[compute_score] WARNING: solution_str is None! Returning 0.0")
         return 0.0
     
     # Use math_checker.check_answer which uses math_verify library
@@ -713,6 +729,8 @@ class PromptUpdateInteraction(BaseInteraction):
             
             # Store Turn 1 info for detailed logging in Turn 2
             # Store by problem_key (not instance_id) since verl uses new instance_id for continuation
+
+            
             turn1_info = {
                 "turn0_prompt": turn0_prompt,
                 "turn0_generation": turn0_generation[:2000],  # Truncate for logging
@@ -721,6 +739,27 @@ class PromptUpdateInteraction(BaseInteraction):
                 "problem": problem[:500] if problem else "None",
                 "ground_truth": ground_truth[:200] if ground_truth else "None",
             }
+            # Collect sample for wandb logging (only first N samples)
+            if PromptUpdateInteraction._sample_log_counter < PromptUpdateInteraction._sample_log_limit:
+                PromptUpdateInteraction._sample_log_counter += 1
+                sample_id = PromptUpdateInteraction._sample_log_counter
+                
+                # Log Turn 0 (discarded generation)
+                PromptUpdateInteraction._wandb_samples.append({
+                    "sample_id": f"train_{sample_id}",
+                    "mode": "training",
+                    "turn": "Turn 0 (DISCARDED)",
+                    "problem": turn1_info.get("problem", ""),
+                    "ground_truth": turn1_info.get("ground_truth", ""),
+                    "prompt": turn1_info.get("turn0_prompt", ""),
+                    "generation": turn1_info.get("turn0_generation", ""),
+                    "boxed_answer": extract_boxed_answer(turn1_info.get("turn0_generation", "")) or "N/A",
+                    "reward": "N/A (discarded)"
+                })
+
+                # Log to wandb after collecting enough samples
+                if PromptUpdateInteraction._sample_log_counter >= PromptUpdateInteraction._sample_log_limit:
+                    PromptUpdateInteraction._log_samples_to_wandb()
             
             # Return 0 reward for turn 1 (we're not evaluating this generation)
             return False, reset_payload, 0.0, {"turn": 1, "try_index": problem_state["try_index"]}
@@ -749,27 +788,13 @@ class PromptUpdateInteraction(BaseInteraction):
             PromptUpdateInteraction._sample_log_counter += 1
             # turn1_info already retrieved from class-level dict by problem_key above
             
-            # Collect sample for wandb logging
-            sample_id = PromptUpdateInteraction._sample_log_counter
-            
-            # Log Turn 0 (discarded generation)
-            PromptUpdateInteraction._wandb_samples.append({
-                "sample_id": f"train_{sample_id}",
-                "mode": "training",
-                "turn": "Turn 0 (DISCARDED)",
-                "problem": turn1_info.get("problem", ""),
-                "ground_truth": turn1_info.get("ground_truth", ""),
-                "prompt": turn1_info.get("turn0_prompt", ""),
-                "generation": turn1_info.get("turn0_generation", ""),
-                "boxed_answer": extract_boxed_answer(turn1_info.get("turn0_generation", "")) or "N/A",
-                "reward": "N/A (discarded)"
-            })
             
             
             
-            # Log to wandb after collecting enough samples
-            if PromptUpdateInteraction._sample_log_counter >= PromptUpdateInteraction._sample_log_limit:
-                PromptUpdateInteraction._log_samples_to_wandb()
+            
+            
+            
+            
             
             print("\n" + "=" * 80)
             print(f"[DETAILED SAMPLE LOG #{PromptUpdateInteraction._sample_log_counter}]")
@@ -1082,8 +1107,9 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
                 }
             row = {
                 "prompt": item["prompt"],  # List of message dicts with 'role' and 'content'
+                "ground_truth": item["answer"],  # Top-level for custom_reward_function
                 "reward_model": {
-                    "ground_truth": item["answer"],
+                    "ground_truth": item["answer"],  # Keep for compatibility
                 },
                 "data_source": "omni_math",  # Identifier for reward function
             }
