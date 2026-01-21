@@ -7,6 +7,7 @@ Uses Hydra to properly load verl's default configs and override specific values.
 
 import os
 import sys
+import json
 import argparse
 import apple_bolt as bolt
 
@@ -40,13 +41,15 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full
 SYSTEM_PROMPT_NAME = "full_solution_simple"
 
 HINT_LEVEL = -1
-VAL_SIZE = 128 
+VAL_SIZE = 8
 PROMPT_UPDATE_ENABLED = True
 PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
 PROMPT_UPDATE_MAX_USER_TURNS = 2
 PROMPT_RESET_PREFIX = "__RESET_PROMPT__\n"
 PROMPT_RESET_SYSTEM_TAG = "__SYSTEM__\n"
 PROMPT_RESET_USER_TAG = "__USER__\n"
+PROMPT_LOG_VALIDATION_MARKER = "__LOG_VALIDATION__\n"  # Marker to enable logging in _reset_request_prompt
+ENABLE_VALIDATION_INTERACTION = True
 
 def load_system_prompt(name: str = None):
     """Load a named system prompt from file.
@@ -200,9 +203,9 @@ DATASET_NAME = os.path.join(os.path.dirname(__file__), "outputs", "hint_helped_d
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
 # Training hyperparameters
-TRAIN_BATCH_SIZE = 64  # Reduced for faster iteration
+TRAIN_BATCH_SIZE = 8#64  # Reduced for faster iteration
 TOTAL_EPOCHS = 50
-TEST_BATCH_SIZE = 128  # Reduced for faster validation
+TEST_BATCH_SIZE = 8#128  # Reduced for faster validation
 
 
 def parse_args():
@@ -342,6 +345,16 @@ class ProblemStateActor:
     
     def __init__(self):
         self._problem_state = {}  # Keyed by problem text
+        self._validation_log_count = 0  # Shared counter for validation logging
+    
+    def get_next_validation_log_index(self) -> int:
+        """Atomically increment and return the next validation log index.
+        
+        This is thread-safe across all distributed workers since it runs
+        in a single Ray actor.
+        """
+        self._validation_log_count += 1
+        return self._validation_log_count
     
     def get_state(self, problem_key: str) -> Optional[Dict[str, Any]]:
         """Get state for a problem, returns None if not exists."""
@@ -428,12 +441,14 @@ class PromptUpdateInteraction(BaseInteraction):
     
     # Class-level dict to store Turn 1 info by problem_key (since instance_id changes between calls)
     _turn1_info_by_problem = {}
-
+    
     def __init__(self, config):
         super().__init__(config)
         self._instance_state = {}  # Per-instance state (keyed by instance_id)
         # Use Ray Actor for persistent state across all workers
         self._state_actor = get_or_create_problem_state_actor()
+        # Install the prompt reset hook on this worker (needed for multi-turn with prompt reset)
+        install_prompt_reset_hook()
     
     ##generate_response returns a 4‑tuple:
     # 1) should_terminate_sequence (bool)
@@ -458,6 +473,7 @@ class PromptUpdateInteraction(BaseInteraction):
         sbys_solution = kwargs.get("sbys_solution") or []
         problem = kwargs.get("problem")
         initial_state = kwargs.get("state", {})
+        is_validation = kwargs.get("is_validation", False)
         
         # Debug: Log what we received
         print(f"[PromptUpdateInteraction] generate_response called! instance_id={instance_id[:8]}...")
@@ -537,6 +553,8 @@ class PromptUpdateInteraction(BaseInteraction):
         print(f"[PromptUpdateInteraction] Turn {current_turn}, problem_key={problem_key[:50] if problem_key else None}...")
         print(f"[PromptUpdateInteraction] Persistent state: try_index={problem_state['try_index']}, able={problem_state['able_index']}, unable={problem_state['unable_index']}")
         
+        # Note: Validation state logging moved to Turn 2 where we have the reward
+        
         # Update guide_steps_count if sbys_solution changed (shouldn't happen, but just in case)
         if problem_state["guide_steps_count"] == 0 and sbys_solution:
             print('guide_steps_count changed from 0 to ', len(sbys_solution), ' this was an error and should not happen')
@@ -576,7 +594,12 @@ class PromptUpdateInteraction(BaseInteraction):
             
             system_prompt_name = "full_solution_simple" if problem_state["try_index"] > 0 else "full_solution_with_hint"
             system_prompt = load_system_prompt(system_prompt_name)
+            # Add validation marker if this is a validation sample (enables logging in _reset_request_prompt)
+            validation_marker = PROMPT_LOG_VALIDATION_MARKER if is_validation else ""
+            if is_validation:
+                print(f"[generate_response] VALIDATION SAMPLE - adding marker to reset_payload")
             reset_payload = (
+                f"{validation_marker}"
                 f"{PROMPT_RESET_PREFIX}"
                 f"{PROMPT_RESET_SYSTEM_TAG}{system_prompt}\n"
                 f"{PROMPT_RESET_USER_TAG}{updated_prompt}"
@@ -596,6 +619,7 @@ class PromptUpdateInteraction(BaseInteraction):
             }
             
             # Return 0 reward for turn 1 (we're not evaluating this generation)
+            # NOTE: The finalized prompt is logged in _reset_request_prompt when verl processes our reset_payload
             return False, reset_payload, 0.0, {"turn": 1, "try_index": problem_state["try_index"]}
         
         # ==================== TURN 2: Evaluate and update state ====================
@@ -615,6 +639,31 @@ class PromptUpdateInteraction(BaseInteraction):
         print(f"[PromptUpdateInteraction] ground_truth={ground_truth[:50] if ground_truth else None}...")
         print(f"[PromptUpdateInteraction] boxed_answer={boxed_answer[:50] if boxed_answer else 'N/A'}...")
         print(f"[PromptUpdateInteraction] reward={reward}")
+        
+        # Log validation state with reward (only for validation, at Turn 2)
+        if is_validation:
+            global _VALIDATION_STATE_LOG_FILE
+            if _VALIDATION_STATE_LOG_FILE is None:
+                log_dir = os.path.join(os.path.dirname(__file__), "validation_prompts")
+                os.makedirs(log_dir, exist_ok=True)
+                _VALIDATION_STATE_LOG_FILE = os.path.join(log_dir, "validation_state.jsonl")
+                print(f"[generate_response] Will log validation state to: {_VALIDATION_STATE_LOG_FILE}")
+            
+            # Use shared Ray actor counter for consistent log indexing across workers
+            log_index = ray.get(self._state_actor.get_next_validation_log_index.remote())
+            state_record = {
+                "log_index": log_index,
+                "problem": problem,
+                "try_index": problem_state["try_index"],  # The try_index used for this generation
+                "able_index": problem_state["able_index"],
+                "unable_index": problem_state["unable_index"],
+                "guide_steps_count": problem_state.get("guide_steps_count", 0),
+                "ground_truth": ground_truth,
+                "reward": reward,  # The reward for this generation
+                "boxed_answer": boxed_answer[:200] if boxed_answer else "N/A",
+            }
+            with open(_VALIDATION_STATE_LOG_FILE, 'a') as f:
+                f.write(json.dumps(state_record, indent=2) + '\n\n')
         
         # Retrieve Turn 1 info stored by problem_key
         turn1_info = {}
@@ -699,7 +748,15 @@ class PromptUpdateInteraction(BaseInteraction):
         # Terminate the sequence - we're done with this problem for this GRPO step
         return True, "", reward, {"try_index": problem_state["try_index"], "turn": 2, "reward": reward}
 
-def _reset_request_prompt(self, processing_class, new_user_content: str, new_system_content: Optional[str] = None) -> None:
+_RESET_PROMPT_LOG_FILE = None
+_RESET_PROMPT_LOG_COUNT = 0
+
+_VALIDATION_STATE_LOG_FILE = None
+# Note: Validation log counter is now stored in ProblemStateActor for distributed consistency
+
+def _reset_request_prompt(self, processing_class, new_user_content: str, new_system_content: Optional[str] = None, should_log: bool = False) -> None:
+    global _RESET_PROMPT_LOG_FILE, _RESET_PROMPT_LOG_COUNT
+    
     if new_system_content is None:
         system_msg = None
         for msg in self.messages:
@@ -733,14 +790,57 @@ def _reset_request_prompt(self, processing_class, new_user_content: str, new_sys
         tokenize=True,
         return_dict=True,
     )
+    
+    # === LOG THE FINALIZED PROMPT THAT VERL SENDS TO THE MODEL (validation only) ===
+    if should_log:
+        # Get the full prompt string (what the model actually sees)
+        full_prompt_str = processing_class.apply_chat_template(
+            messages,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=False
+        )
+        
+        # Initialize log file path (all workers append to same file)
+        if _RESET_PROMPT_LOG_FILE is None:
+            log_dir = os.path.join(os.path.dirname(__file__), "validation_prompts")
+            os.makedirs(log_dir, exist_ok=True)
+            _RESET_PROMPT_LOG_FILE = os.path.join(log_dir, "verl_finalized_prompts.jsonl")
+            print(f"[_reset_request_prompt] Will log VALIDATION finalized prompts to: {_RESET_PROMPT_LOG_FILE}")
+        
+        _RESET_PROMPT_LOG_COUNT += 1
+        record = {
+            "log_index": _RESET_PROMPT_LOG_COUNT,
+            "messages": messages,
+            "full_prompt_sent_to_model": full_prompt_str,
+            "token_count": len(tokenization_dict_with_prompt["input_ids"]),
+        }
+        with open(_RESET_PROMPT_LOG_FILE, 'a') as f:
+            f.write(json.dumps(record, indent=2) + '\n\n')  # Pretty print with separator
+        
+        # Print preview for first few
+        if _RESET_PROMPT_LOG_COUNT <= 5:
+            print(f"\n[VERL VALIDATION PROMPT #{_RESET_PROMPT_LOG_COUNT}] tokens={len(tokenization_dict_with_prompt['input_ids'])}")
+            print(f"  Messages: {len(messages)} messages")
+            for i, msg in enumerate(messages):
+                print(f"    [{i}] {msg['role']}: {msg['content'][:150]}...")
+            print(f"  Full prompt preview: {full_prompt_str[:400]}...")
+    # === END LOGGING ===
+    
     self.input_ids = tokenization_dict_with_prompt["input_ids"]
     self.attention_mask = tokenization_dict_with_prompt["attention_mask"]
-    self.prompt_ids = self.input_ids
-    self.prompt_attention_mask = self.attention_mask
-    self.position_ids = self.prompt_position_ids = compute_position_id_with_mask(
+    # IMPORTANT: Use list() to create COPIES, not references!
+    # Otherwise _update_input_ids (called by add_assistant_message) would extend both
+    self.prompt_ids = list(self.input_ids)
+    self.prompt_attention_mask = list(self.attention_mask)
+    position_ids_list = compute_position_id_with_mask(
         torch.tensor(self.attention_mask)
     ).tolist()
-    self.loss_mask = self.prompt_loss_mask = [0] * len(self.input_ids)
+    self.position_ids = list(position_ids_list)
+    self.prompt_position_ids = list(position_ids_list)
+    loss_mask_list = [0] * len(self.input_ids)
+    self.loss_mask = list(loss_mask_list)
+    self.prompt_loss_mask = list(loss_mask_list)
     self.generation_prompt_ids = self.input_ids[len(tokens_without_prompt) :]
     self.base_conv_wo_gen_prompt_end_pos = len(
         AsyncRolloutRequest._handle_apply_chat_template(
@@ -776,7 +876,15 @@ def install_prompt_reset_hook():
     original_add_user_message = AsyncRolloutRequest.add_user_message
 
     def patched_add_user_message(self, processing_class, content: str):
+        # Check for validation logging marker first
+        should_log = False
+        if content.startswith(PROMPT_LOG_VALIDATION_MARKER):
+            should_log = True
+            content = content[len(PROMPT_LOG_VALIDATION_MARKER):]
+            print(f"[patched_add_user_message] DETECTED VALIDATION MARKER! should_log={should_log}")
+        
         if content.startswith(PROMPT_RESET_PREFIX):
+            print(f"[patched_add_user_message] DETECTED RESET PREFIX! should_log={should_log}")
             payload = content[len(PROMPT_RESET_PREFIX) :]
             new_system_content = None
             new_user_content = payload
@@ -786,7 +894,7 @@ def install_prompt_reset_hook():
                     system_part, user_part = payload.split(PROMPT_RESET_USER_TAG, 1)
                     new_system_content = system_part.rstrip("\n")
                     new_user_content = user_part
-            _reset_request_prompt(self, processing_class, new_user_content, new_system_content)
+            _reset_request_prompt(self, processing_class, new_user_content, new_system_content, should_log)
             return
         return original_add_user_message(self, processing_class, content)
 
@@ -924,7 +1032,7 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
 
     # Convert to verl format
     # verl expects ground_truth nested under reward_model
-    def to_verl_format(dataset_split, enable_interaction: bool):
+    def to_verl_format(dataset_split, enable_interaction: bool, is_validation: bool = False):
         rl_data = []
         for item in dataset_split:
             extra_info = {}
@@ -934,6 +1042,7 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
                     "state": {"attempt": 0},
                     "sbys_solution": item.get("sbys_solution"),
                     "problem": item.get("problem"),
+                    "is_validation": is_validation,  # Flag to enable logging only for validation
                 }
             row = {
                 "prompt": item["prompt"],  # List of message dicts with 'role' and 'content'
@@ -948,8 +1057,8 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
             rl_data.append(row)
         return rl_data
     
-    train_data = to_verl_format(train_dataset, enable_interaction=True)
-    val_data = to_verl_format(val_dataset, enable_interaction=False)
+    train_data = to_verl_format(train_dataset, enable_interaction=True, is_validation=False)
+    val_data = to_verl_format(val_dataset, enable_interaction=ENABLE_VALIDATION_INTERACTION, is_validation=True)
     
     return train_data, val_data
 
@@ -1257,6 +1366,17 @@ def main():
     print(f"Nodes: {NUM_NODES}, GPUs per node: {GPUS_PER_NODE}")
     print("=" * 80)
     
+    # Clear validation log files (workers will append to them)
+    validation_log_dir = os.path.join(os.path.dirname(__file__), "validation_prompts")
+    os.makedirs(validation_log_dir, exist_ok=True)
+    validation_log_file = os.path.join(validation_log_dir, "verl_finalized_prompts.jsonl")
+    validation_state_file = os.path.join(validation_log_dir, "validation_state.jsonl")
+    with open(validation_log_file, 'w') as f:
+        f.write("")  # Clear file at start of run
+    with open(validation_state_file, 'w') as f:
+        f.write("")  # Clear file at start of run
+    print(f"Cleared validation logs: {validation_log_file}, {validation_state_file}")
+    
     # Load tokens and login to services
     tokens = load_tokens()
     login_huggingface(tokens)
@@ -1373,7 +1493,7 @@ def main():
         f"trainer.total_epochs={TOTAL_EPOCHS}",
         "trainer.save_freq=50",  # Save checkpoint every N steps
         "trainer.val_before_train=true",  # Skip validation before training (too slow)
-        "trainer.test_freq=5",  # Validate every 50 training steps
+        "trainer.test_freq=1",  # Validate every 50 training steps
         "trainer.log_val_generations=3",  # Log N validation samples to wandb
         
         # Custom reward function (use ++ to add or override)
