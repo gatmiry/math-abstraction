@@ -6,8 +6,20 @@ Uses Hydra to properly load verl's default configs and override specific values.
 """
 
 import os
+import sys
 import argparse
 import apple_bolt as bolt
+
+# Add parent directory to PYTHONPATH so 'sbys_hinting' module can be imported by verl workers
+_parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
+# Also set as environment variable so Ray workers inherit it
+if "PYTHONPATH" in os.environ:
+    if _parent_dir not in os.environ["PYTHONPATH"]:
+        os.environ["PYTHONPATH"] = f"{_parent_dir}:{os.environ['PYTHONPATH']}"
+else:
+    os.environ["PYTHONPATH"] = _parent_dir
 
 # vLLM 0.8.5 V1 engine works fine, but keep this for compatibility with older versions
 os.environ.setdefault("VLLM_USE_V1", "0")
@@ -188,7 +200,7 @@ DATASET_NAME = os.path.join(os.path.dirname(__file__), "outputs", "hint_helped_d
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
 # Training hyperparameters
-TRAIN_BATCH_SIZE = 128  # Reduced for faster iteration
+TRAIN_BATCH_SIZE = 256  # Reduced for faster iteration
 TOTAL_EPOCHS = 50
 TEST_BATCH_SIZE = 128  # Reduced for faster validation
 
@@ -452,6 +464,9 @@ class PromptUpdateInteraction(BaseInteraction):
     # Class-level list to collect samples for wandb logging
     _wandb_samples = []
     _wandb_batch_counter = 0  # Track which batch we're on for unique table names
+    
+    # Class-level dict to store Turn 1 info by problem_key (since instance_id changes between calls)
+    _turn1_info_by_problem = {}
 
     def __init__(self, config):
         super().__init__(config)
@@ -604,15 +619,8 @@ class PromptUpdateInteraction(BaseInteraction):
         # ==================== TRAINING: Two-turn interaction ====================
         # Verify we have the problem text (required for training)
         if not problem:
-            print(f"[PromptUpdateInteraction] ERROR: No problem text in kwargs for training! kwargs={kwargs}")
-            # Fallback: try to extract from messages
-            for msg in messages:
-                if msg.get("role") == "user":
-                    content = msg.get("content", "")
-                    if "Problem:" in content:
-                        problem = content.split("Problem:", 1)[1].strip()
-                        print(f"[PromptUpdateInteraction] Extracted problem from messages: {problem[:50]}...")
-                        break
+            assert False, "No problem text in kwargs for training! kwargs={kwargs}"
+            
         
         # Use problem text as key for persistent binary search state (survives across steps)
         problem_key = problem if problem else instance_id
@@ -630,26 +638,37 @@ class PromptUpdateInteraction(BaseInteraction):
                 "try_index": 0,
                 "total_attempts": 0,
                 "total_correct": 0,
+                "current_turn": 0,  # Track turn number per-problem (persists across instance_ids)
             }
             ray.get(self._state_actor.set_state.remote(problem_key, problem_state))
         
-        # Initialize per-instance state (for tracking this specific request and turn number)
+        # Ensure current_turn field exists (for backward compatibility with old state)
+        if "current_turn" not in problem_state:
+            problem_state["current_turn"] = 0
+        
+        # Increment turn counter (tracked by problem_key, not instance_id!)
+        # This is critical because verl uses different instance_ids for continuation calls
+        problem_state["current_turn"] = problem_state.get("current_turn", 0) + 1
+        current_turn = problem_state["current_turn"]
+        
+        # Persist the incremented turn immediately
+        ray.get(self._state_actor.set_state.remote(problem_key, problem_state))
+        
+        # Keep instance_state for storing Turn 1 info needed by Turn 2
         if instance_id not in self._instance_state:
             self._instance_state[instance_id] = {
-                "turn": 0,  # Track which turn we're on
                 **(dict(initial_state) if isinstance(initial_state, dict) else {})
             }
         instance_state = self._instance_state[instance_id]
-        
-        # Increment turn counter
-        instance_state["turn"] = instance_state.get("turn", 0) + 1
-        current_turn = instance_state["turn"]
+        # Link instance_id to problem_key so Turn 2 can find Turn 1's stored info
+        instance_state["problem_key"] = problem_key
         
         print(f"[PromptUpdateInteraction] Turn {current_turn}, problem_key={problem_key[:50] if problem_key else None}...")
         print(f"[PromptUpdateInteraction] Persistent state: try_index={problem_state['try_index']}, able={problem_state['able_index']}, unable={problem_state['unable_index']}")
         
         # Update guide_steps_count if sbys_solution changed (shouldn't happen, but just in case)
         if problem_state["guide_steps_count"] == 0 and sbys_solution:
+            print('guide_steps_count changed from 0 to ', len(sbys_solution), ' this was an error and should not happen')
             problem_state["guide_steps_count"] = len(sbys_solution)
             problem_state["able_index"] = len(sbys_solution)
             ray.get(self._state_actor.set_state.remote(problem_key, problem_state))
@@ -693,7 +712,8 @@ class PromptUpdateInteraction(BaseInteraction):
             )
             
             # Store Turn 1 info for detailed logging in Turn 2
-            instance_state["turn1_info"] = {
+            # Store by problem_key (not instance_id) since verl uses new instance_id for continuation
+            turn1_info = {
                 "turn0_prompt": turn0_prompt,
                 "turn0_generation": turn0_generation[:2000],  # Truncate for logging
                 "turn1_prompt": updated_prompt,
@@ -706,7 +726,7 @@ class PromptUpdateInteraction(BaseInteraction):
             return False, reset_payload, 0.0, {"turn": 1, "try_index": problem_state["try_index"]}
         
         # ==================== TURN 2: Evaluate and update state ====================
-        print(f"[PromptUpdateInteraction] Turn 2: Evaluating generation")
+        print(f"[PromptUpdateInteraction] Turn 2: Evaluating generation for problem_key={problem_key[:50] if problem_key else None}...")
         
         # Extract the assistant's response
         last_assistant = ""
@@ -727,7 +747,7 @@ class PromptUpdateInteraction(BaseInteraction):
         # Log full details for first N samples to help debug
         if PromptUpdateInteraction._sample_log_counter < PromptUpdateInteraction._sample_log_limit:
             PromptUpdateInteraction._sample_log_counter += 1
-            turn1_info = instance_state.get("turn1_info", {})
+            # turn1_info already retrieved from class-level dict by problem_key above
             
             # Collect sample for wandb logging
             sample_id = PromptUpdateInteraction._sample_log_counter
@@ -745,18 +765,7 @@ class PromptUpdateInteraction(BaseInteraction):
                 "reward": "N/A (discarded)"
             })
             
-            # Log Turn 2 (scored generation)
-            PromptUpdateInteraction._wandb_samples.append({
-                "sample_id": f"train_{sample_id}",
-                "mode": "training",
-                "turn": "Turn 2 (SCORED)",
-                "problem": turn1_info.get("problem", ""),
-                "ground_truth": turn1_info.get("ground_truth", ""),
-                "prompt": turn1_info.get("turn1_prompt", ""),
-                "generation": last_assistant[:2000],
-                "boxed_answer": boxed_answer,
-                "reward": str(reward)
-            })
+            
             
             # Log to wandb after collecting enough samples
             if PromptUpdateInteraction._sample_log_counter >= PromptUpdateInteraction._sample_log_limit:
@@ -784,10 +793,14 @@ class PromptUpdateInteraction(BaseInteraction):
         # Check if solved without hints (try_index == 0 means no hints were given)
         if reward > 0.5 and problem_state["try_index"] == 0:
             print(f"[PromptUpdateInteraction] Correct without hints! attempts={problem_state['total_attempts']}, correct={problem_state['total_correct']}")
+            # Reset current_turn for next time this problem is seen
+            problem_state["current_turn"] = 0
             ray.get(self._state_actor.set_state.remote(problem_key, problem_state))
-            # Clean up instance state
+            # Clean up instance state and turn1_info
             if instance_id in self._instance_state:
                 del self._instance_state[instance_id]
+            if hasattr(PromptUpdateInteraction, '_turn1_info_by_problem') and problem_key in PromptUpdateInteraction._turn1_info_by_problem:
+                del PromptUpdateInteraction._turn1_info_by_problem[problem_key]
             return True, "", reward, {"correct": True, "try_index": 0, "turn": 2}
 
         # Binary search logic to update try_index for NEXT time this problem is seen
@@ -814,14 +827,19 @@ class PromptUpdateInteraction(BaseInteraction):
                 problem_state["able_index"] = problem_state["try_index"]
                 problem_state["try_index"] = math.floor((problem_state["try_index"] + problem_state["unable_index"]) / 2)
 
+        # Reset current_turn for next time this problem is seen
+        problem_state["current_turn"] = 0
+        
         # Persist updated state to Ray Actor
         ray.get(self._state_actor.set_state.remote(problem_key, problem_state))
         
         print(f"[PromptUpdateInteraction] Updated hint level: {old_try_index} -> {problem_state['try_index']} (able={problem_state['able_index']}, unable={problem_state['unable_index']})")
 
-        # Clean up instance state
+        # Clean up instance state and turn1_info
         if instance_id in self._instance_state:
             del self._instance_state[instance_id]
+        if hasattr(PromptUpdateInteraction, '_turn1_info_by_problem') and problem_key in PromptUpdateInteraction._turn1_info_by_problem:
+            del PromptUpdateInteraction._turn1_info_by_problem[problem_key]
         
         # Terminate the sequence - we're done with this problem for this GRPO step
         return True, "", reward, {"try_index": problem_state["try_index"], "turn": 2, "reward": reward}
@@ -1543,12 +1561,14 @@ def main():
         
         # Initialize Ray early to distribute checkpoint to all nodes
         print("[INFO] Initializing Ray for checkpoint distribution...")
+        # Runtime env ensures workers can import sbys_hinting module
+        ray_runtime_env = {"env_vars": {"PYTHONPATH": _parent_dir}}
         if not ray.is_initialized():
             try:
-                ray.init(address='auto', ignore_reinit_error=True)
+                ray.init(address='auto', ignore_reinit_error=True, runtime_env=ray_runtime_env)
             except ConnectionError:
                 print("[INFO] Could not connect to existing Ray cluster, starting new one...")
-                ray.init(ignore_reinit_error=True)
+                ray.init(ignore_reinit_error=True, runtime_env=ray_runtime_env)
         
         # Distribute checkpoint from head node to all worker nodes
         # This is necessary because verl expects ALL shards to be available on each node
