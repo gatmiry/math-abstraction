@@ -37,6 +37,9 @@ def normalize_latex_for_parsing(s: str) -> str:
     s = re.sub(r'^[A-Za-z]\s*=\s*', '', s)
     # Remove currency symbols
     s = s.replace('\\$', '').replace('$', '')
+    # Normalize exponent braces: ^{1234} -> ^1234 (for numeric exponents only)
+    # This helps math_verify parse exponents correctly
+    s = re.sub(r'\^\{(\d+)\}', r'^\1', s)
     # Normalize fraction variants
     s = s.replace('\\dfrac', '\\frac')
     s = s.replace('\\tfrac', '\\frac')
@@ -149,6 +152,18 @@ def check_answer(generated: str, ground_truth: str) -> bool:
             result = verify(gt_parsed[0], gen_parsed[0], strict=False)
             if result:
                 return True
+            
+            # Try sympy simplification for exponential equivalence (e.g., 4^{2006} = 2^{4012})
+            try:
+                from sympy import simplify, Eq
+                diff = simplify(gt_parsed[0] - gen_parsed[0])
+                if diff == 0:
+                    return True
+                # Also try checking equality directly
+                if simplify(Eq(gt_parsed[0], gen_parsed[0])) == True:
+                    return True
+            except:
+                pass
         
         # If only one parsed, try numeric comparison
         if gt_parsed and not gen_parsed:

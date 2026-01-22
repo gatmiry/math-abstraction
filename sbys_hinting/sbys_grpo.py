@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import argparse
+import fcntl
 import apple_bolt as bolt
 
 # Add parent directory to PYTHONPATH so 'sbys_hinting' module can be imported by verl workers
@@ -651,8 +652,10 @@ class PromptUpdateInteraction(BaseInteraction):
             
             # Use shared Ray actor counter for consistent log indexing across workers
             log_index = ray.get(self._state_actor.get_next_validation_log_index.remote())
+            worker_pid = os.getpid()
             state_record = {
                 "log_index": log_index,
+                "worker_pid": worker_pid,  # Track which worker wrote this
                 "problem": problem,
                 "try_index": problem_state["try_index"],  # The try_index used for this generation
                 "able_index": problem_state["able_index"],
@@ -662,8 +665,20 @@ class PromptUpdateInteraction(BaseInteraction):
                 "reward": reward,  # The reward for this generation
                 "boxed_answer": boxed_answer[:200] if boxed_answer else "N/A",
             }
+            
+            # Write to shared file with locking
             with open(_VALIDATION_STATE_LOG_FILE, 'a') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)  # Exclusive lock for atomic writes
                 f.write(json.dumps(state_record, indent=2) + '\n\n')
+                f.flush()  # Ensure data is written before releasing lock
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)  # Release lock
+            
+            # Also write to per-worker file (no locking needed - each worker has its own file)
+            worker_log_file = os.path.join(os.path.dirname(_VALIDATION_STATE_LOG_FILE), f"worker_{worker_pid}.jsonl")
+            with open(worker_log_file, 'a') as f:
+                f.write(json.dumps(state_record, indent=2) + '\n\n')
+            
+            print(f"[generate_response] Logged validation record #{log_index} from worker {worker_pid}")
         
         # Retrieve Turn 1 info stored by problem_key
         turn1_info = {}
@@ -1449,9 +1464,9 @@ def main():
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",  # Leave room for FSDP actor
         "actor_rollout_ref.rollout.prompt_length=2560",
-        "actor_rollout_ref.rollout.response_length=8192",
-        "actor_rollout_ref.rollout.max_model_len=10752",  # 2560 + 8192
-        "actor_rollout_ref.rollout.max_num_batched_tokens=10752",
+        "actor_rollout_ref.rollout.response_length=16384",  # Increased from 12288 to further reduce LENGTH truncation
+        "actor_rollout_ref.rollout.max_model_len=18944",  # 2560 + 16384
+        "actor_rollout_ref.rollout.max_num_batched_tokens=18944",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",  # Reduced from 4 to save GPU memory
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
@@ -1479,7 +1494,7 @@ def main():
         f"data.val_files={val_dataset_file}",
         "data.prompt_key=prompt",
         "data.max_prompt_length=2560",
-        "data.max_response_length=8192",
+        "data.max_response_length=16384",  # Match rollout.response_length
         f"data.train_batch_size={TRAIN_BATCH_SIZE}",
         f"data.val_batch_size={TEST_BATCH_SIZE}",
         "data.return_raw_chat=true",  # Required for sglang rollout
