@@ -15,12 +15,12 @@ parameters:
   
 cluster_options:
   aws:
-    instance_type: p5.48xlarge
+    instance_type: p6-b200.48xlarge
     
 resources:
   # LATER: this docker image is only needed temporarily until Bolt updates the default to be this one
   docker_image: docker.apple.com/iris/iris:latest
-  cluster: aws_4
+  cluster: aws_10
   #instance_type: p5.48xlarge
   task_type: 8gpu
   timeout: 14d

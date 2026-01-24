@@ -50,7 +50,7 @@ PROMPT_RESET_PREFIX = "__RESET_PROMPT__\n"
 PROMPT_RESET_SYSTEM_TAG = "__SYSTEM__\n"
 PROMPT_RESET_USER_TAG = "__USER__\n"
 PROMPT_LOG_VALIDATION_MARKER = "__LOG_VALIDATION__\n"  # Marker to enable logging in _reset_request_prompt
-ENABLE_VALIDATION_INTERACTION = True
+ENABLE_VALIDATION_INTERACTION = False
 
 def load_system_prompt(name: str = None):
     """Load a named system prompt from file.
@@ -182,16 +182,25 @@ try:
     # NCCL P2P workaround for hardware issues
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_IGNORE_DISABLED_P2P"] = "1"
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_P2P_DISABLE"] = "1"
+    # Add PYTHONPATH so verl workers can import sbys_hinting module
+    PPO_RAY_RUNTIME_ENV["env_vars"]["PYTHONPATH"] = _parent_dir
     # Add CUDA library paths for sglang subprocesses
     cuda_lib_paths = [
+        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib",
         "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib",
         "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cublas/lib",
         "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cudnn/lib",
         "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cufft/lib",
+        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/curand/lib",
+        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cusolver/lib",
+        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cusparse/lib",
         "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/nccl/lib",
+        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/nvjitlink/lib",
     ]
     existing_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
     PPO_RAY_RUNTIME_ENV["env_vars"]["LD_LIBRARY_PATH"] = ":".join(cuda_lib_paths) + ":" + existing_ld_path
+    # Use triton attention backend instead of flashinfer JIT (system CUDA doesn't support sm_100a)
+    PPO_RAY_RUNTIME_ENV["env_vars"]["SGLANG_ATTENTION_BACKEND"] = "triton"
     # Add sglang to pip packages for workers
     PPO_RAY_RUNTIME_ENV.setdefault("pip", [])
     PPO_RAY_RUNTIME_ENV["pip"].append("sglang[all]==0.4.6.post1")
@@ -642,6 +651,8 @@ class PromptUpdateInteraction(BaseInteraction):
         print(f"[PromptUpdateInteraction] reward={reward}")
         
         # Log validation state with reward (only for validation, at Turn 2)
+        # NOTE: Avoid blocking operations (ray.get, file locking) here to prevent deadlocks
+        # during distributed training when workers finish at different times
         if is_validation:
             global _VALIDATION_STATE_LOG_FILE
             if _VALIDATION_STATE_LOG_FILE is None:
@@ -650,8 +661,13 @@ class PromptUpdateInteraction(BaseInteraction):
                 _VALIDATION_STATE_LOG_FILE = os.path.join(log_dir, "validation_state.jsonl")
                 print(f"[generate_response] Will log validation state to: {_VALIDATION_STATE_LOG_FILE}")
             
-            # Use shared Ray actor counter for consistent log indexing across workers
-            log_index = ray.get(self._state_actor.get_next_validation_log_index.remote())
+            # Use local counter per worker to avoid blocking ray.get() calls
+            # This prevents deadlocks when some workers finish before others
+            if not hasattr(self, '_local_validation_log_counter'):
+                self._local_validation_log_counter = 0
+            self._local_validation_log_counter += 1
+            log_index = self._local_validation_log_counter
+            
             worker_pid = os.getpid()
             state_record = {
                 "log_index": log_index,
@@ -666,14 +682,8 @@ class PromptUpdateInteraction(BaseInteraction):
                 "boxed_answer": boxed_answer[:200] if boxed_answer else "N/A",
             }
             
-            # Write to shared file with locking
-            with open(_VALIDATION_STATE_LOG_FILE, 'a') as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)  # Exclusive lock for atomic writes
-                f.write(json.dumps(state_record, indent=2) + '\n\n')
-                f.flush()  # Ensure data is written before releasing lock
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)  # Release lock
-            
-            # Also write to per-worker file (no locking needed - each worker has its own file)
+            # Write ONLY to per-worker file (no locking needed - each worker has its own file)
+            # Avoid shared file with locking as it can cause deadlocks in distributed training
             worker_log_file = os.path.join(os.path.dirname(_VALIDATION_STATE_LOG_FILE), f"worker_{worker_pid}.jsonl")
             with open(worker_log_file, 'a') as f:
                 f.write(json.dumps(state_record, indent=2) + '\n\n')
