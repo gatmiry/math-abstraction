@@ -963,7 +963,7 @@ def format_prompt(problem: str, system_prompt: str = None) -> List[Dict[str, str
         ]
         return messages
 
-def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None, val_size: int = 128, max_prompt_tokens: int = 2560, hint_level: int = 0):
+def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] = None, val_size: int = 128, max_prompt_tokens: int = 4096, hint_level: int = 0):
     """Create RL dataset in verl format with train/val split.
     
     Args:
@@ -1500,10 +1500,10 @@ def main():
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.4",  # Leave room for FSDP actor
-        "actor_rollout_ref.rollout.prompt_length=2560",
+        "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
         "actor_rollout_ref.rollout.response_length=16384",  # Increased from 12288 to further reduce LENGTH truncation
-        "actor_rollout_ref.rollout.max_model_len=18944",  # 2560 + 16384
-        "actor_rollout_ref.rollout.max_num_batched_tokens=75776",  # 18944 * 4, more batching for faster generation
+        "actor_rollout_ref.rollout.max_model_len=20480",  # 4096 + 16384
+        "actor_rollout_ref.rollout.max_num_batched_tokens=81920",  # 20480 * 4, more batching for faster generation
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
@@ -1521,7 +1521,7 @@ def main():
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
-        "actor_rollout_ref.actor.offload_param=true",  # Offload actor params to CPU to reduce GPU memory pressure
+        "+actor_rollout_ref.actor.offload_param=true",  # Offload actor params to CPU to reduce GPU memory pressure
         "actor_rollout_ref.ref.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         
         # Enable gradient checkpointing to reduce memory usage during policy update
@@ -1536,7 +1536,7 @@ def main():
         f"data.train_files={train_dataset_file}",
         f"data.val_files={val_dataset_file}",
         "data.prompt_key=prompt",
-        "data.max_prompt_length=2560",
+        "data.max_prompt_length=4096",  # Match increased prompt_length for multi-turn
         "data.max_response_length=16384",  # Match rollout.response_length
         f"data.train_batch_size={TRAIN_BATCH_SIZE}",
         f"data.val_batch_size={TEST_BATCH_SIZE}",
