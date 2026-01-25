@@ -249,7 +249,7 @@ def parse_args():
 
 # Distributed training configuration
 # 2 nodes, 8 GPUs per node = 16 GPUs total
-NUM_NODES = 2  # Testing with single node first
+NUM_NODES = 4  # Debugging NCCL timeout
 GPUS_PER_NODE = 8
 
 
@@ -1499,7 +1499,7 @@ def main():
         "actor_rollout_ref.rollout.n=4",  # Multiple generations for GRPO
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",  # Leave room for FSDP actor
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.4",  # Leave room for FSDP actor
         "actor_rollout_ref.rollout.prompt_length=2560",
         "actor_rollout_ref.rollout.response_length=16384",  # Increased from 12288 to further reduce LENGTH truncation
         "actor_rollout_ref.rollout.max_model_len=18944",  # 2560 + 16384
@@ -1521,6 +1521,7 @@ def main():
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
+        "actor_rollout_ref.actor.offload_param=true",  # Offload actor params to CPU to reduce GPU memory pressure
         "actor_rollout_ref.ref.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         
         # Enable gradient checkpointing to reduce memory usage during policy update

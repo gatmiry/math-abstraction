@@ -346,6 +346,86 @@ else:
 PATCH_VERL
 fi
 
+# Patch 6: verl dp_actor.py - fix entropy calculation to use chunking config
+VERL_DP_ACTOR="$VENV_PATH/lib/python3.12/site-packages/verl/workers/actor/dp_actor.py"
+if [ -f "$VERL_DP_ACTOR" ]; then
+    python << 'PATCH_DP_ACTOR'
+filepath = '/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/workers/actor/dp_actor.py'
+with open(filepath, 'r') as f:
+    content = f.read()
+
+# Fix _forward_micro_batch to use self.compute_entropy_from_logits (respects chunking config)
+# instead of hardcoded verl_F.entropy_from_logits
+old_code = '''                    if calculate_entropy:
+                        entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)'''
+
+new_code = '''                    if calculate_entropy:
+                        entropy = self.compute_entropy_from_logits(logits)  # (bsz, response_length)'''
+
+if old_code in content:
+    content = content.replace(old_code, new_code)
+    with open(filepath, 'w') as f:
+        f.write(content)
+    print('[PATCHED] verl dp_actor.py to use chunking config for entropy calculation')
+else:
+    print('[SKIP] dp_actor.py already patched or pattern not found')
+PATCH_DP_ACTOR
+fi
+
+# Patch 7: verl torch_functional.py - fix entropy_from_logits_with_chunking for 3D tensors
+VERL_TORCH_FUNC="$VENV_PATH/lib/python3.12/site-packages/verl/utils/torch_functional.py"
+if [ -f "$VERL_TORCH_FUNC" ]; then
+    python << 'PATCH_TORCH_FUNC'
+filepath = '/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/utils/torch_functional.py'
+with open(filepath, 'r') as f:
+    content = f.read()
+
+# Fix entropy_from_logits_with_chunking to handle 3D tensors (batch, seq_len, vocab)
+old_code = '''def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 2048):
+    """Memory-efficient entropy calculation with chunking."""
+    entropy = torch.zeros(logits.shape[0], device=logits.device)
+    for i in range(0, logits.shape[0], chunk_size):
+        logits_chunk = logits[i : i + chunk_size].float()
+        pd_chunk = torch.nn.functional.softmax(logits_chunk, dim=-1)
+        entropy_chunk = torch.logsumexp(logits_chunk, dim=-1) - torch.sum(pd_chunk * logits_chunk, dim=-1)
+        entropy[i : i + chunk_size] = entropy_chunk
+    return entropy'''
+
+new_code = '''def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 2048):
+    """Memory-efficient entropy calculation with chunking.
+    
+    Supports both 2D (batch, vocab) and 3D (batch, seq_len, vocab) inputs.
+    For 3D input, chunks along the flattened (batch * seq_len) dimension.
+    """
+    original_shape = logits.shape[:-1]  # All dims except vocab
+    vocab_size = logits.shape[-1]
+    
+    # Flatten to 2D: (total_tokens, vocab_size)
+    # Use reshape instead of view to handle non-contiguous tensors
+    logits_flat = logits.reshape(-1, vocab_size)
+    total_tokens = logits_flat.shape[0]
+    
+    entropy_flat = torch.zeros(total_tokens, device=logits.device, dtype=logits.dtype)
+    for i in range(0, total_tokens, chunk_size):
+        end_idx = min(i + chunk_size, total_tokens)
+        logits_chunk = logits_flat[i:end_idx].float()
+        pd_chunk = torch.nn.functional.softmax(logits_chunk, dim=-1)
+        entropy_chunk = torch.logsumexp(logits_chunk, dim=-1) - torch.sum(pd_chunk * logits_chunk, dim=-1)
+        entropy_flat[i:end_idx] = entropy_chunk.to(entropy_flat.dtype)
+    
+    # Reshape back to original shape (without vocab dim)
+    return entropy_flat.reshape(original_shape)'''
+
+if old_code in content:
+    content = content.replace(old_code, new_code)
+    with open(filepath, 'w') as f:
+        f.write(content)
+    print('[PATCHED] verl torch_functional.py for 3D tensor support in entropy_from_logits_with_chunking')
+else:
+    print('[SKIP] torch_functional.py already patched or pattern not found')
+PATCH_TORCH_FUNC
+fi
+
 # Install sbys_hinting as a package so Ray workers can import it
 echo "[12/12] Installing sbys_hinting as editable package..."
 
