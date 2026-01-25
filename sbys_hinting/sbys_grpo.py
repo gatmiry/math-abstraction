@@ -42,7 +42,7 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full
 SYSTEM_PROMPT_NAME = "full_solution_simple"
 
 HINT_LEVEL = -1
-VAL_SIZE = 8
+VAL_SIZE = 512
 PROMPT_UPDATE_ENABLED = True
 PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
 PROMPT_UPDATE_MAX_USER_TURNS = 2
@@ -51,6 +51,12 @@ PROMPT_RESET_SYSTEM_TAG = "__SYSTEM__\n"
 PROMPT_RESET_USER_TAG = "__USER__\n"
 PROMPT_LOG_VALIDATION_MARKER = "__LOG_VALIDATION__\n"  # Marker to enable logging in _reset_request_prompt
 ENABLE_VALIDATION_INTERACTION = False
+#
+TRAIN_BATCH_SIZE = 256 #256  # Reduced to prevent OOM on distributed workers
+TOTAL_EPOCHS = 50
+TEST_BATCH_SIZE = 256  # Reduced for faster validation
+
+
 
 def load_system_prompt(name: str = None):
     """Load a named system prompt from file.
@@ -213,9 +219,6 @@ DATASET_NAME = os.path.join(os.path.dirname(__file__), "outputs", "hint_helped_d
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
 # Training hyperparameters
-TRAIN_BATCH_SIZE = 8#64  # Reduced for faster iteration
-TOTAL_EPOCHS = 50
-TEST_BATCH_SIZE = 8#128  # Reduced for faster validation
 
 
 def parse_args():
@@ -246,7 +249,7 @@ def parse_args():
 
 # Distributed training configuration
 # 2 nodes, 8 GPUs per node = 16 GPUs total
-NUM_NODES = 1  # Testing with single node first
+NUM_NODES = 2  # Testing with single node first
 GPUS_PER_NODE = 8
 
 
@@ -473,7 +476,7 @@ class PromptUpdateInteraction(BaseInteraction):
             Turn 1: Ignore initial generation (it had no hints), inject prompt WITH hints
             Turn 2: Evaluate generation (with hints), update persistent state, terminate
         
-        Validation (no interaction_kwargs):
+        Validation (is_validation=True):
             Single turn: Terminate immediately, let verl's custom_reward_function score
         """
         import math
@@ -485,7 +488,16 @@ class PromptUpdateInteraction(BaseInteraction):
         initial_state = kwargs.get("state", {})
         is_validation = kwargs.get("is_validation", False)
         
-        # Debug: Log what we received
+        # ==================== VALIDATION: Terminate immediately ====================
+        # For validation, we don't want multi-turn interaction - just single generation
+        # with scoring handled by custom_reward_function. Terminate immediately.
+        if is_validation:
+            print(f"[PromptUpdateInteraction] VALIDATION mode - terminating immediately")
+            # Return: (should_terminate=True, content="", reward=0.0, metrics={})
+            # The actual reward will be computed by compute_score in custom_reward_function
+            return True, "", 0.0, {"mode": "validation", "skipped": True}
+        
+        # Debug: Log what we received (training only)
         print(f"[PromptUpdateInteraction] generate_response called! instance_id={instance_id[:8]}...")
         print(f"[PromptUpdateInteraction] kwargs keys: {list(kwargs.keys())}")
         print(f"[PromptUpdateInteraction] ground_truth={'SET' if ground_truth else 'None'}, problem={'SET' if problem else 'None'}, sbys_solution_len={len(sbys_solution)}")
@@ -516,7 +528,15 @@ class PromptUpdateInteraction(BaseInteraction):
         # ==================== TRAINING: Two-turn interaction ====================
         # Verify we have the problem text (required for training)
         if not problem:
-            assert False, "No problem text in kwargs for training! kwargs={kwargs}"
+            # Debug: Show what we received
+            print(f"[ERROR] No problem text! is_validation={is_validation}, kwargs_keys={list(kwargs.keys())}")
+            print(f"[ERROR] Full kwargs: {kwargs}")
+            # If this is actually a validation sample that somehow has is_validation=False,
+            # treat it as validation (terminate immediately)
+            if not sbys_solution or len(sbys_solution) == 0:
+                print(f"[WARNING] Empty problem AND empty sbys_solution - treating as validation")
+                return True, "", 0.0, {"mode": "validation_fallback", "skipped": True}
+            raise ValueError(f"No problem text in kwargs for training! is_validation={is_validation}, kwargs={kwargs}")
             
         
         # Use problem text as key for persistent binary search state (survives across steps)
@@ -1061,13 +1081,20 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
         rl_data = []
         for item in dataset_split:
             extra_info = {}
-            if enable_interaction and PROMPT_UPDATE_ENABLED:
+            # IMPORTANT: When multi_turn.enable=true is set globally, verl's sglang_rollout
+            # expects interaction_kwargs to exist in non_tensor_batch, even for validation.
+            # If missing, it raises KeyError causing worker crash. We MUST provide it.
+            # Also, AsyncRolloutRequest is a Pydantic model that requires interaction_kwargs
+            # to be a dict (not None), so we must provide the same schema for both.
+            if PROMPT_UPDATE_ENABLED:
+                # Always provide full interaction_kwargs with same schema
+                # For validation, is_validation=True tells the interaction to terminate immediately
                 extra_info["interaction_kwargs"] = {
                     "ground_truth": item["answer"],
                     "state": {"attempt": 0},
-                    "sbys_solution": item.get("sbys_solution"),
-                    "problem": item.get("problem"),
-                    "is_validation": is_validation,  # Flag to enable logging only for validation
+                    "sbys_solution": item.get("sbys_solution") if enable_interaction else [],
+                    "problem": item.get("problem") if enable_interaction else "",
+                    "is_validation": is_validation,  # Flag to skip interaction for validation
                 }
             row = {
                 "prompt": item["prompt"],  # List of message dicts with 'role' and 'content'
@@ -1476,8 +1503,8 @@ def main():
         "actor_rollout_ref.rollout.prompt_length=2560",
         "actor_rollout_ref.rollout.response_length=16384",  # Increased from 12288 to further reduce LENGTH truncation
         "actor_rollout_ref.rollout.max_model_len=18944",  # 2560 + 16384
-        "actor_rollout_ref.rollout.max_num_batched_tokens=18944",
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",  # Reduced from 4 to save GPU memory
+        "actor_rollout_ref.rollout.max_num_batched_tokens=75776",  # 18944 * 4, more batching for faster generation
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
         
@@ -1491,8 +1518,13 @@ def main():
         
         # Actor config
         f"actor_rollout_ref.actor.ppo_mini_batch_size={TRAIN_BATCH_SIZE}",  # Must be <= train_batch_size
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",  # Reduced from 4 to save GPU memory
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.actor.ppo_epochs=1",
+        "actor_rollout_ref.actor.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
+        "actor_rollout_ref.ref.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
+        
+        # Enable gradient checkpointing to reduce memory usage during policy update
+        "actor_rollout_ref.model.enable_gradient_checkpointing=true",
         
         # Algorithm - GRPO
         "algorithm.adv_estimator=grpo",
@@ -1518,7 +1550,7 @@ def main():
         f"trainer.total_epochs={TOTAL_EPOCHS}",
         "trainer.save_freq=50",  # Save checkpoint every N steps
         "trainer.val_before_train=true",  # Skip validation before training (too slow)
-        "trainer.test_freq=1",  # Validate every 50 training steps
+        "trainer.test_freq=5",  # Validate every 50 training steps
         "trainer.log_val_generations=3",  # Log N validation samples to wandb
         
         # Custom reward function (use ++ to add or override)
