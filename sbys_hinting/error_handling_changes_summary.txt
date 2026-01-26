@@ -34,20 +34,53 @@ CHANGES MADE:
    - Code: time.sleep(5)
 
 3. ADDED _safe_actor_call() HELPER METHOD (Line ~495)
-   - Wraps Ray actor calls with:
-     * 30-second timeout using asyncio.wait_for()
-     * Exception handling that returns default value instead of crashing
-   - Prevents hanging actor calls from blocking workers
+   - Wraps Ray actor calls with timeout and try/except
+   - Code added:
+   
+     async def _safe_actor_call(self, coro, timeout_seconds=30, default=None):
+         """Safely await a Ray actor call with timeout and error handling."""
+         import asyncio
+         try:
+             return await asyncio.wait_for(coro, timeout=timeout_seconds)
+         except asyncio.TimeoutError:
+             print(f"[PromptUpdateInteraction] WARNING: Actor call timed out after {timeout_seconds}s")
+             return default
+         except Exception as e:
+             print(f"[PromptUpdateInteraction] WARNING: Actor call failed: {e}")
+             return default
 
 4. WRAPPED generate_response() WITH TRY/EXCEPT (Line ~472)
    - Original method renamed to _generate_response_impl()
    - New generate_response() wraps the call in try/except
-   - On error: returns (True, "", 0.0, {"error": str(e), "fallback": True})
-   - Prevents unhandled exceptions from crashing workers
+   - Code added:
+   
+     async def generate_response(self, instance_id, messages, **kwargs):
+         import traceback
+         
+         # Wrap entire method in try/except to prevent worker crashes
+         try:
+             return await self._generate_response_impl(instance_id, messages, **kwargs)
+         except Exception as e:
+             # Log the error but don't crash the worker
+             print(f"[PromptUpdateInteraction] ERROR in generate_response: {e}")
+             traceback.print_exc()
+             # Return safe default: terminate with 0 reward
+             return True, "", 0.0, {"error": str(e), "fallback": True}
 
 5. UPDATED ALL RAY ACTOR CALLS (6 locations)
    - Changed from: await self._state_actor.method.remote(...)
    - Changed to:   await self._safe_actor_call(self._state_actor.method.remote(...), timeout_seconds=30)
+   
+   Example change:
+     BEFORE:
+       problem_state = await self._state_actor.get_state.remote(problem_key)
+     
+     AFTER:
+       problem_state = await self._safe_actor_call(
+           self._state_actor.get_state.remote(problem_key),
+           timeout_seconds=30,
+           default=None
+       )
    
    Locations updated:
    - get_state.remote() - returns None on failure (triggers fallback init)
