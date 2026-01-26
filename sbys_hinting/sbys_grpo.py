@@ -52,7 +52,7 @@ PROMPT_RESET_USER_TAG = "__USER__\n"
 PROMPT_LOG_VALIDATION_MARKER = "__LOG_VALIDATION__\n"  # Marker to enable logging in _reset_request_prompt
 ENABLE_VALIDATION_INTERACTION = False
 #
-TRAIN_BATCH_SIZE = 128 #256  # Reduced to prevent OOM on distributed workers
+TRAIN_BATCH_SIZE = 128  # Batch size for training
 TOTAL_EPOCHS = 50
 TEST_BATCH_SIZE = 128  # Reduced for faster validation
 
@@ -543,7 +543,8 @@ class PromptUpdateInteraction(BaseInteraction):
         problem_key = problem if problem else instance_id
         
         # Get persistent state from Ray Actor (initialized at start of training)
-        problem_state = ray.get(self._state_actor.get_state.remote(problem_key))
+        # Use await instead of ray.get() to avoid blocking the asyncio event loop
+        problem_state = await self._state_actor.get_state.remote(problem_key)
         
         # Fallback initialization if state wasn't pre-initialized (shouldn't happen normally)
         if problem_state is None:
@@ -557,7 +558,7 @@ class PromptUpdateInteraction(BaseInteraction):
                 "total_correct": 0,
                 "current_turn": 0,  # Track turn number per-problem (persists across instance_ids)
             }
-            ray.get(self._state_actor.set_state.remote(problem_key, problem_state))
+            await self._state_actor.set_state.remote(problem_key, problem_state)
         
         # Ensure current_turn field exists (for backward compatibility with old state)
         if "current_turn" not in problem_state:
@@ -569,7 +570,7 @@ class PromptUpdateInteraction(BaseInteraction):
         current_turn = problem_state["current_turn"]
         
         # Persist the incremented turn immediately
-        ray.get(self._state_actor.set_state.remote(problem_key, problem_state))
+        await self._state_actor.set_state.remote(problem_key, problem_state)
         
         # Keep instance_state for storing Turn 1 info needed by Turn 2
         if instance_id not in self._instance_state:
@@ -590,7 +591,7 @@ class PromptUpdateInteraction(BaseInteraction):
             print('guide_steps_count changed from 0 to ', len(sbys_solution), ' this was an error and should not happen')
             problem_state["guide_steps_count"] = len(sbys_solution)
             problem_state["able_index"] = len(sbys_solution)
-            ray.get(self._state_actor.set_state.remote(problem_key, problem_state))
+            await self._state_actor.set_state.remote(problem_key, problem_state)
         
         # ==================== TURN 1: Inject hints ====================
         # Ignore the initial generation (it had no hints), return prompt WITH hints
@@ -744,7 +745,7 @@ class PromptUpdateInteraction(BaseInteraction):
             print(f"[PromptUpdateInteraction] Correct without hints! attempts={problem_state['total_attempts']}, correct={problem_state['total_correct']}")
             # Reset current_turn for next time this problem is seen
             problem_state["current_turn"] = 0
-            ray.get(self._state_actor.set_state.remote(problem_key, problem_state))
+            await self._state_actor.set_state.remote(problem_key, problem_state)
             # Clean up instance state and turn1_info
             if instance_id in self._instance_state:
                 del self._instance_state[instance_id]
@@ -780,7 +781,7 @@ class PromptUpdateInteraction(BaseInteraction):
         problem_state["current_turn"] = 0
         
         # Persist updated state to Ray Actor
-        ray.get(self._state_actor.set_state.remote(problem_key, problem_state))
+        await self._state_actor.set_state.remote(problem_key, problem_state)
         
         print(f"[PromptUpdateInteraction] Updated hint level: {old_try_index} -> {problem_state['try_index']} (able={problem_state['able_index']}, unable={problem_state['unable_index']})")
 
