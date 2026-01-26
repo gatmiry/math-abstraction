@@ -42,7 +42,7 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full
 SYSTEM_PROMPT_NAME = "full_solution_simple"
 
 HINT_LEVEL = -1
-VAL_SIZE = 256
+VAL_SIZE = 128
 PROMPT_UPDATE_ENABLED = True
 PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
 PROMPT_UPDATE_MAX_USER_TURNS = 2
@@ -52,9 +52,9 @@ PROMPT_RESET_USER_TAG = "__USER__\n"
 PROMPT_LOG_VALIDATION_MARKER = "__LOG_VALIDATION__\n"  # Marker to enable logging in _reset_request_prompt
 ENABLE_VALIDATION_INTERACTION = False
 #
-TRAIN_BATCH_SIZE = 128  # Batch size for training
+TRAIN_BATCH_SIZE = 64  # Batch size for training
 TOTAL_EPOCHS = 50
-TEST_BATCH_SIZE = 128  # Reduced for faster validation
+TEST_BATCH_SIZE = 64  # Reduced for faster validation
 
 
 
@@ -169,6 +169,8 @@ import random
 import socket
 import traceback
 import threading
+import signal
+import atexit
 from verl.interactions.base import BaseInteraction
 import ray
 import tempfile
@@ -181,6 +183,7 @@ import torch
 # =============================================================================
 _CRASH_LOG_DIR = os.path.join(os.path.dirname(__file__), "crash_logs")
 _CRASH_LOG_LOCK = threading.Lock()
+_PROCESS_START_TIME = datetime.datetime.now()
 
 def get_node_identifier():
     """Get a unique identifier for this node."""
@@ -204,6 +207,22 @@ def log_crash(error_type: str, error_msg: str, stack_trace: str = None, extra_in
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         node_id = get_node_identifier()
         
+        # Get GPU memory info if available
+        gpu_info = None
+        try:
+            if torch.cuda.is_available():
+                gpu_info = []
+                for i in range(torch.cuda.device_count()):
+                    mem_allocated = torch.cuda.memory_allocated(i) / 1024**3
+                    mem_reserved = torch.cuda.memory_reserved(i) / 1024**3
+                    gpu_info.append({
+                        "device": i,
+                        "allocated_gb": round(mem_allocated, 2),
+                        "reserved_gb": round(mem_reserved, 2)
+                    })
+        except:
+            pass
+        
         log_entry = {
             "timestamp": timestamp,
             "node_id": node_id,
@@ -211,6 +230,8 @@ def log_crash(error_type: str, error_msg: str, stack_trace: str = None, extra_in
             "error_msg": str(error_msg),
             "stack_trace": stack_trace or traceback.format_exc(),
             "extra_info": extra_info or {},
+            "gpu_info": gpu_info,
+            "uptime_seconds": (datetime.datetime.now() - _PROCESS_START_TIME).total_seconds(),
         }
         
         # Write to a single combined log file (thread-safe)
@@ -229,10 +250,12 @@ def log_crash(error_type: str, error_msg: str, stack_trace: str = None, extra_in
                 f.write(f"Stack trace:\n{stack_trace}\n")
             if extra_info:
                 f.write(f"Extra info: {json.dumps(extra_info, indent=2)}\n")
+            if gpu_info:
+                f.write(f"GPU info: {json.dumps(gpu_info, indent=2)}\n")
         
-        print(f"[CRASH_LOG] Logged {error_type} to {combined_log}")
+        print(f"[CRASH_LOG] Logged {error_type} to {combined_log}", flush=True)
     except Exception as e:
-        print(f"[CRASH_LOG] Failed to write crash log: {e}")
+        print(f"[CRASH_LOG] Failed to write crash log: {e}", flush=True)
 
 def install_global_exception_handler():
     """Install a global exception handler that logs uncaught exceptions."""
@@ -251,10 +274,51 @@ def install_global_exception_handler():
         original_excepthook(exc_type, exc_value, exc_tb)
     
     sys.excepthook = custom_excepthook
-    print(f"[INFO] Installed global exception handler, crash logs will be saved to: {_CRASH_LOG_DIR}")
+    print(f"[INFO] Installed global exception handler, crash logs will be saved to: {_CRASH_LOG_DIR}", flush=True)
 
-# Install the handler immediately when module is imported
+def install_signal_handlers():
+    """Install signal handlers to log when process receives termination signals."""
+    def signal_handler(signum, frame):
+        sig_name = signal.Signals(signum).name
+        stack_trace = "".join(traceback.format_stack(frame)) if frame else "No stack available"
+        log_crash(
+            error_type=f"SIGNAL_RECEIVED:{sig_name}",
+            error_msg=f"Process received signal {signum} ({sig_name})",
+            stack_trace=stack_trace,
+            extra_info={"signal_number": signum, "signal_name": sig_name}
+        )
+        print(f"[SIGNAL] Received {sig_name}, logged to crash_logs", flush=True)
+        # Re-raise the signal to allow normal termination
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+    
+    # Install handlers for common termination signals
+    for sig in [signal.SIGTERM, signal.SIGINT, signal.SIGABRT]:
+        try:
+            signal.signal(sig, signal_handler)
+        except Exception as e:
+            print(f"[WARN] Could not install handler for {sig}: {e}", flush=True)
+    
+    print(f"[INFO] Installed signal handlers for SIGTERM, SIGINT, SIGABRT", flush=True)
+
+def install_atexit_handler():
+    """Install atexit handler to log when process exits."""
+    def atexit_handler():
+        log_crash(
+            error_type="PROCESS_EXIT",
+            error_msg="Process is exiting",
+            stack_trace="".join(traceback.format_stack()),
+            extra_info={"exit_type": "atexit"}
+        )
+        print(f"[ATEXIT] Process exiting, logged to crash_logs", flush=True)
+    
+    atexit.register(atexit_handler)
+    print(f"[INFO] Installed atexit handler", flush=True)
+
+# Install all handlers immediately when module is imported
 install_global_exception_handler()
+install_signal_handlers()
+install_atexit_handler()
 # =============================================================================
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
@@ -274,7 +338,7 @@ try:
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_P2P_DISABLE"] = "1"
     # NCCL network stability settings - fix for socket errors (code 3)
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_TIMEOUT"] = "3600"  # 1 hour timeout (default is 30 min)
-    PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_DEBUG"] = "WARN"  # Enable warning-level logging (use INFO for full debug)
+    PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_DEBUG"] = "INFO"  # Full debug logging to catch network issues
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_SOCKET_NTHREADS"] = "4"  # More socket threads for stability
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_NSOCKS_PERTHREAD"] = "4"  # More sockets per thread
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_IB_DISABLE"] = "1"  # Disable InfiniBand, use TCP sockets
@@ -1525,7 +1589,7 @@ def main():
     # These help prevent NCCL socket errors (code 3) during multi-node training
     nccl_env_vars = {
         "NCCL_TIMEOUT": "3600",  # 1 hour timeout (default 30 min)
-        "NCCL_DEBUG": "WARN",  # Enable warnings (use INFO for full debug)
+        "NCCL_DEBUG": "INFO",  # Full debug logging to catch network issues
         "NCCL_SOCKET_NTHREADS": "4",  # More socket threads
         "NCCL_NSOCKS_PERTHREAD": "4",  # More sockets per thread
         "NCCL_IB_DISABLE": "1",  # Disable InfiniBand, use TCP
@@ -1678,11 +1742,11 @@ def main():
         "actor_rollout_ref.rollout.n=4",  # Multiple generations for GRPO
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.6",  # Leave room for FSDP actor
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",  # Reduced to 50% - more headroom for FSDP
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
         "actor_rollout_ref.rollout.response_length=16384",  # Increased from 12288 to further reduce LENGTH truncation
         "actor_rollout_ref.rollout.max_model_len=20480",  # 4096 + 16384
-        "actor_rollout_ref.rollout.max_num_batched_tokens=40960",  # Reduced from 81920 to ease init memory pressure
+        "actor_rollout_ref.rollout.max_num_batched_tokens=20480",  # Further reduced - less concurrent tokens in SGLang
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
