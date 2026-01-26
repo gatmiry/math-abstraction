@@ -42,7 +42,7 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full
 SYSTEM_PROMPT_NAME = "full_solution_simple"
 
 HINT_LEVEL = -1
-VAL_SIZE = 512
+VAL_SIZE = 256
 PROMPT_UPDATE_ENABLED = True
 PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
 PROMPT_UPDATE_MAX_USER_TURNS = 2
@@ -52,9 +52,9 @@ PROMPT_RESET_USER_TAG = "__USER__\n"
 PROMPT_LOG_VALIDATION_MARKER = "__LOG_VALIDATION__\n"  # Marker to enable logging in _reset_request_prompt
 ENABLE_VALIDATION_INTERACTION = False
 #
-TRAIN_BATCH_SIZE = 256 #256  # Reduced to prevent OOM on distributed workers
+TRAIN_BATCH_SIZE = 128 #256  # Reduced to prevent OOM on distributed workers
 TOTAL_EPOCHS = 50
-TEST_BATCH_SIZE = 256  # Reduced for faster validation
+TEST_BATCH_SIZE = 128  # Reduced for faster validation
 
 
 
@@ -441,7 +441,7 @@ def get_or_create_problem_state_actor():
         return ProblemStateActor.options(
             name=PROBLEM_STATE_ACTOR_NAME,
             lifetime="detached",  # Survives driver failure
-            max_concurrency=100,  # Handle many concurrent requests
+            max_concurrency=2000,  # Must handle TRAIN_BATCH_SIZE * n concurrent requests (256 * 4 = 1024+)
         ).remote()
 
 
