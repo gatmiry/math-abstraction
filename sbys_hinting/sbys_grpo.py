@@ -188,6 +188,15 @@ try:
     # NCCL P2P workaround for hardware issues
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_IGNORE_DISABLED_P2P"] = "1"
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_P2P_DISABLE"] = "1"
+    # NCCL network stability settings - fix for socket errors (code 3)
+    PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_TIMEOUT"] = "3600"  # 1 hour timeout (default is 30 min)
+    PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_DEBUG"] = "WARN"  # Enable warning-level logging (use INFO for full debug)
+    PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_SOCKET_NTHREADS"] = "4"  # More socket threads for stability
+    PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_NSOCKS_PERTHREAD"] = "4"  # More sockets per thread
+    PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_IB_DISABLE"] = "1"  # Disable InfiniBand, use TCP sockets
+    # Torch distributed settings for better error reporting
+    PPO_RAY_RUNTIME_ENV["env_vars"]["TORCH_DISTRIBUTED_DEBUG"] = "OFF"  # Set to DETAIL for debugging
+    PPO_RAY_RUNTIME_ENV["env_vars"]["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"  # Better error handling
     # Add PYTHONPATH so verl workers can import sbys_hinting module
     PPO_RAY_RUNTIME_ENV["env_vars"]["PYTHONPATH"] = _parent_dir
     # Add CUDA library paths for sglang subprocesses
@@ -968,27 +977,34 @@ def install_prompt_reset_hook():
     original_add_user_message = AsyncRolloutRequest.add_user_message
 
     def patched_add_user_message(self, processing_class, content: str):
-        # Check for validation logging marker first
-        should_log = False
-        if content.startswith(PROMPT_LOG_VALIDATION_MARKER):
-            should_log = True
-            content = content[len(PROMPT_LOG_VALIDATION_MARKER):]
-            print(f"[patched_add_user_message] DETECTED VALIDATION MARKER! should_log={should_log}")
-        
-        if content.startswith(PROMPT_RESET_PREFIX):
-            print(f"[patched_add_user_message] DETECTED RESET PREFIX! should_log={should_log}")
-            payload = content[len(PROMPT_RESET_PREFIX) :]
-            new_system_content = None
-            new_user_content = payload
-            if payload.startswith(PROMPT_RESET_SYSTEM_TAG):
-                payload = payload[len(PROMPT_RESET_SYSTEM_TAG) :]
-                if PROMPT_RESET_USER_TAG in payload:
-                    system_part, user_part = payload.split(PROMPT_RESET_USER_TAG, 1)
-                    new_system_content = system_part.rstrip("\n")
-                    new_user_content = user_part
-            _reset_request_prompt(self, processing_class, new_user_content, new_system_content, should_log)
-            return
-        return original_add_user_message(self, processing_class, content)
+        import traceback
+        try:
+            # Check for validation logging marker first
+            should_log = False
+            if content.startswith(PROMPT_LOG_VALIDATION_MARKER):
+                should_log = True
+                content = content[len(PROMPT_LOG_VALIDATION_MARKER):]
+                print(f"[patched_add_user_message] DETECTED VALIDATION MARKER! should_log={should_log}")
+            
+            if content.startswith(PROMPT_RESET_PREFIX):
+                print(f"[patched_add_user_message] DETECTED RESET PREFIX! should_log={should_log}")
+                payload = content[len(PROMPT_RESET_PREFIX) :]
+                new_system_content = None
+                new_user_content = payload
+                if payload.startswith(PROMPT_RESET_SYSTEM_TAG):
+                    payload = payload[len(PROMPT_RESET_SYSTEM_TAG) :]
+                    if PROMPT_RESET_USER_TAG in payload:
+                        system_part, user_part = payload.split(PROMPT_RESET_USER_TAG, 1)
+                        new_system_content = system_part.rstrip("\n")
+                        new_user_content = user_part
+                _reset_request_prompt(self, processing_class, new_user_content, new_system_content, should_log)
+                return
+            return original_add_user_message(self, processing_class, content)
+        except Exception as e:
+            print(f"[patched_add_user_message] ERROR: {e}")
+            traceback.print_exc()
+            # Re-raise to let verl handle it - but at least we logged it
+            raise
 
     patched_add_user_message._prompt_reset_patched = True
     AsyncRolloutRequest.add_user_message = patched_add_user_message
@@ -1405,6 +1421,22 @@ def gather_checkpoint_to_head_node(checkpoint_dir: str, output_dir: str, num_nod
 
 def main():
     """Main function to run GRPO training with verl and Ray."""
+    # Set NCCL environment variables EARLY - before any distributed init
+    # These help prevent NCCL socket errors (code 3) during multi-node training
+    nccl_env_vars = {
+        "NCCL_TIMEOUT": "3600",  # 1 hour timeout (default 30 min)
+        "NCCL_DEBUG": "WARN",  # Enable warnings (use INFO for full debug)
+        "NCCL_SOCKET_NTHREADS": "4",  # More socket threads
+        "NCCL_NSOCKS_PERTHREAD": "4",  # More sockets per thread
+        "NCCL_IB_DISABLE": "1",  # Disable InfiniBand, use TCP
+        "NCCL_P2P_DISABLE": "1",  # Disable P2P (can cause issues)
+        "NCCL_IGNORE_DISABLED_P2P": "1",
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",  # Better error handling
+    }
+    for key, value in nccl_env_vars.items():
+        os.environ[key] = value
+    print(f"[INFO] Set NCCL environment variables for network stability")
+    
     # Parse command line arguments
     args = parse_args()
     
