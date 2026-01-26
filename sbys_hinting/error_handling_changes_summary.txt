@@ -1,0 +1,98 @@
+================================================================================
+SUMMARY OF ERROR HANDLING CHANGES TO sbys_grpo.py
+================================================================================
+Date: January 25, 2026
+Author: AI Assistant (Claude)
+
+PROBLEM:
+--------
+Training was crashing with error:
+  RuntimeError: Connection closed by peer [240.12.230.246]:31114
+  
+This occurred at dist.barrier() in verl's SGLang rollout code, indicating a
+worker node crashed during sequence generation.
+
+ROOT CAUSE ANALYSIS:
+--------------------
+1. Worker at IP 240.12.230.246 crashed during async interaction code
+2. Other workers detected the disconnection at the synchronization barrier
+3. Likely causes:
+   - Unhandled exception in async generate_response() method
+   - Ray actor call failure (network blip, actor unavailable)
+   - Potential OOM during generation
+
+CHANGES MADE:
+-------------
+
+1. REDUCED max_num_batched_tokens (Line ~1507)
+   - Before: 81920
+   - After:  40960
+   - Reason: Reduce memory pressure during SGLang initialization
+
+2. ADDED CLUSTER STABILIZATION DELAY (Line ~1690)
+   - Added 5-second delay before run_ppo() to let Ray cluster stabilize
+   - Code: time.sleep(5)
+
+3. ADDED _safe_actor_call() HELPER METHOD (Line ~495)
+   - Wraps Ray actor calls with:
+     * 30-second timeout using asyncio.wait_for()
+     * Exception handling that returns default value instead of crashing
+   - Prevents hanging actor calls from blocking workers
+
+4. WRAPPED generate_response() WITH TRY/EXCEPT (Line ~472)
+   - Original method renamed to _generate_response_impl()
+   - New generate_response() wraps the call in try/except
+   - On error: returns (True, "", 0.0, {"error": str(e), "fallback": True})
+   - Prevents unhandled exceptions from crashing workers
+
+5. UPDATED ALL RAY ACTOR CALLS (6 locations)
+   - Changed from: await self._state_actor.method.remote(...)
+   - Changed to:   await self._safe_actor_call(self._state_actor.method.remote(...), timeout_seconds=30)
+   
+   Locations updated:
+   - get_state.remote() - returns None on failure (triggers fallback init)
+   - set_state.remote() - 5 occurrences, silently fails but continues
+
+BEHAVIOR CHANGES:
+-----------------
+When an error occurs:
+
+WITHOUT error handling (sbys_grpo_withouttry.py):
+  - Worker crashes
+  - All workers fail at dist.barrier()
+  - Entire training job fails
+  - Must restart from checkpoint
+
+WITH error handling (sbys_grpo.py):
+  - Error is caught and logged
+  - Affected sample gets 0 reward
+  - Training continues with other samples
+  - No restart needed
+
+Trade-offs:
+  - Pro: Training is resilient to transient failures
+  - Pro: Most samples still work correctly
+  - Con: Some samples may get incorrect rewards (0 instead of actual)
+  - Con: State might be stale if set_state fails
+
+FILES:
+------
+- sbys_grpo.py           - WITH error handling (current version)
+- sbys_grpo_withouttry.py - WITHOUT error handling (backup)
+
+GIT COMMITS:
+------------
+- d313655: Add robust error handling to interaction code - prevent worker crashes
+- 42d1157: (previous) move setup_worker.sh to sbys_hinting/install-dependencies
+- ce46cd7: fix: async await for ray calls + add worker setup script
+
+TO RUN:
+-------
+1. On each worker node: cd /mnt/task_runtime && git pull
+2. On head node: 
+   cd /mnt/task_runtime/sbys_hinting
+   source ../myenv/bin/activate
+   python sbys_grpo.py
+
+================================================================================
+
