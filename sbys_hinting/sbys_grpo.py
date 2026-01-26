@@ -480,6 +480,33 @@ class PromptUpdateInteraction(BaseInteraction):
             Single turn: Terminate immediately, let verl's custom_reward_function score
         """
         import math
+        import traceback
+        
+        # Wrap entire method in try/except to prevent worker crashes
+        try:
+            return await self._generate_response_impl(instance_id, messages, **kwargs)
+        except Exception as e:
+            # Log the error but don't crash the worker
+            print(f"[PromptUpdateInteraction] ERROR in generate_response: {e}")
+            traceback.print_exc()
+            # Return safe default: terminate with 0 reward
+            return True, "", 0.0, {"error": str(e), "fallback": True}
+    
+    async def _safe_actor_call(self, coro, timeout_seconds=30, default=None):
+        """Safely await a Ray actor call with timeout and error handling."""
+        import asyncio
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            print(f"[PromptUpdateInteraction] WARNING: Actor call timed out after {timeout_seconds}s")
+            return default
+        except Exception as e:
+            print(f"[PromptUpdateInteraction] WARNING: Actor call failed: {e}")
+            return default
+    
+    async def _generate_response_impl(self, instance_id, messages, **kwargs):
+        """Internal implementation of generate_response with actual logic."""
+        import math
         
         # Extract kwargs from interaction_kwargs
         ground_truth = kwargs.get("ground_truth")
@@ -543,8 +570,12 @@ class PromptUpdateInteraction(BaseInteraction):
         problem_key = problem if problem else instance_id
         
         # Get persistent state from Ray Actor (initialized at start of training)
-        # Use await instead of ray.get() to avoid blocking the asyncio event loop
-        problem_state = await self._state_actor.get_state.remote(problem_key)
+        # Use safe wrapper with timeout to avoid blocking and handle actor issues gracefully
+        problem_state = await self._safe_actor_call(
+            self._state_actor.get_state.remote(problem_key),
+            timeout_seconds=30,
+            default=None
+        )
         
         # Fallback initialization if state wasn't pre-initialized (shouldn't happen normally)
         if problem_state is None:
@@ -558,7 +589,10 @@ class PromptUpdateInteraction(BaseInteraction):
                 "total_correct": 0,
                 "current_turn": 0,  # Track turn number per-problem (persists across instance_ids)
             }
-            await self._state_actor.set_state.remote(problem_key, problem_state)
+            await self._safe_actor_call(
+                self._state_actor.set_state.remote(problem_key, problem_state),
+                timeout_seconds=30
+            )
         
         # Ensure current_turn field exists (for backward compatibility with old state)
         if "current_turn" not in problem_state:
@@ -570,7 +604,10 @@ class PromptUpdateInteraction(BaseInteraction):
         current_turn = problem_state["current_turn"]
         
         # Persist the incremented turn immediately
-        await self._state_actor.set_state.remote(problem_key, problem_state)
+        await self._safe_actor_call(
+            self._state_actor.set_state.remote(problem_key, problem_state),
+            timeout_seconds=30
+        )
         
         # Keep instance_state for storing Turn 1 info needed by Turn 2
         if instance_id not in self._instance_state:
@@ -591,7 +628,10 @@ class PromptUpdateInteraction(BaseInteraction):
             print('guide_steps_count changed from 0 to ', len(sbys_solution), ' this was an error and should not happen')
             problem_state["guide_steps_count"] = len(sbys_solution)
             problem_state["able_index"] = len(sbys_solution)
-            await self._state_actor.set_state.remote(problem_key, problem_state)
+            await self._safe_actor_call(
+                self._state_actor.set_state.remote(problem_key, problem_state),
+                timeout_seconds=30
+            )
         
         # ==================== TURN 1: Inject hints ====================
         # Ignore the initial generation (it had no hints), return prompt WITH hints
@@ -745,7 +785,10 @@ class PromptUpdateInteraction(BaseInteraction):
             print(f"[PromptUpdateInteraction] Correct without hints! attempts={problem_state['total_attempts']}, correct={problem_state['total_correct']}")
             # Reset current_turn for next time this problem is seen
             problem_state["current_turn"] = 0
-            await self._state_actor.set_state.remote(problem_key, problem_state)
+            await self._safe_actor_call(
+                self._state_actor.set_state.remote(problem_key, problem_state),
+                timeout_seconds=30
+            )
             # Clean up instance state and turn1_info
             if instance_id in self._instance_state:
                 del self._instance_state[instance_id]
@@ -781,7 +824,10 @@ class PromptUpdateInteraction(BaseInteraction):
         problem_state["current_turn"] = 0
         
         # Persist updated state to Ray Actor
-        await self._state_actor.set_state.remote(problem_key, problem_state)
+        await self._safe_actor_call(
+            self._state_actor.set_state.remote(problem_key, problem_state),
+            timeout_seconds=30
+        )
         
         print(f"[PromptUpdateInteraction] Updated hint level: {old_try_index} -> {problem_state['try_index']} (able={problem_state['able_index']}, unable={problem_state['unable_index']})")
 
@@ -1504,7 +1550,7 @@ def main():
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
         "actor_rollout_ref.rollout.response_length=16384",  # Increased from 12288 to further reduce LENGTH truncation
         "actor_rollout_ref.rollout.max_model_len=20480",  # 4096 + 16384
-        "actor_rollout_ref.rollout.max_num_batched_tokens=81920",  # 20480 * 4, more batching for faster generation
+        "actor_rollout_ref.rollout.max_num_batched_tokens=40960",  # Reduced from 81920 to ease init memory pressure
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
@@ -1684,6 +1730,11 @@ def main():
     
     # Import run_ppo here to avoid import issues
     from verl.trainer.main_ppo import run_ppo
+    
+    # Small delay to ensure Ray cluster is fully synced before starting distributed training
+    import time
+    print("[INFO] Waiting 5 seconds for Ray cluster to stabilize...")
+    time.sleep(5)
     
     # Run PPO training
     print("Starting GRPO training with verl...")
