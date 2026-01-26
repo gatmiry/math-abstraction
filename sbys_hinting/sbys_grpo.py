@@ -1853,7 +1853,7 @@ def main():
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
         "actor_rollout_ref.rollout.response_length=16384",  # Increased from 12288 to further reduce LENGTH truncation
         "actor_rollout_ref.rollout.max_model_len=20480",  # 4096 + 16384
-        "actor_rollout_ref.rollout.max_num_batched_tokens=20480",  # Further reduced - less concurrent tokens in SGLang
+        "actor_rollout_ref.rollout.max_num_batched_tokens=327680",  # 20480*16 = ~102GB KV cache total, ~12.8GB per GPU with TP=8
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
