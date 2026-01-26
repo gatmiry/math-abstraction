@@ -166,12 +166,96 @@ os.environ["NCCL_P2P_DISABLE"] = "1"
 import re
 import sys
 import random
+import socket
+import traceback
+import threading
 from verl.interactions.base import BaseInteraction
 import ray
 import tempfile
 import datetime
 import pandas as pd
 import torch
+
+# =============================================================================
+# CENTRALIZED CRASH LOGGING - Writes to shared filesystem for all nodes
+# =============================================================================
+_CRASH_LOG_DIR = os.path.join(os.path.dirname(__file__), "crash_logs")
+_CRASH_LOG_LOCK = threading.Lock()
+
+def get_node_identifier():
+    """Get a unique identifier for this node."""
+    hostname = socket.gethostname()
+    try:
+        ip = socket.gethostbyname(hostname)
+    except:
+        ip = "unknown"
+    pid = os.getpid()
+    return f"{hostname}_{ip}_{pid}"
+
+def log_crash(error_type: str, error_msg: str, stack_trace: str = None, extra_info: dict = None):
+    """Log a crash/error to the shared crash log directory.
+    
+    This writes to /mnt/task_runtime/sbys_hinting/crash_logs/ which should be
+    accessible from all nodes via NFS.
+    """
+    try:
+        os.makedirs(_CRASH_LOG_DIR, exist_ok=True)
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        node_id = get_node_identifier()
+        
+        log_entry = {
+            "timestamp": timestamp,
+            "node_id": node_id,
+            "error_type": error_type,
+            "error_msg": str(error_msg),
+            "stack_trace": stack_trace or traceback.format_exc(),
+            "extra_info": extra_info or {},
+        }
+        
+        # Write to a single combined log file (thread-safe)
+        combined_log = os.path.join(_CRASH_LOG_DIR, "all_crashes.jsonl")
+        with _CRASH_LOG_LOCK:
+            with open(combined_log, "a") as f:
+                f.write(json.dumps(log_entry) + "\n")
+        
+        # Also write to node-specific file for easier debugging
+        node_log = os.path.join(_CRASH_LOG_DIR, f"crashes_{node_id}.log")
+        with open(node_log, "a") as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"[{timestamp}] {error_type}\n")
+            f.write(f"Error: {error_msg}\n")
+            if stack_trace:
+                f.write(f"Stack trace:\n{stack_trace}\n")
+            if extra_info:
+                f.write(f"Extra info: {json.dumps(extra_info, indent=2)}\n")
+        
+        print(f"[CRASH_LOG] Logged {error_type} to {combined_log}")
+    except Exception as e:
+        print(f"[CRASH_LOG] Failed to write crash log: {e}")
+
+def install_global_exception_handler():
+    """Install a global exception handler that logs uncaught exceptions."""
+    original_excepthook = sys.excepthook
+    
+    def custom_excepthook(exc_type, exc_value, exc_tb):
+        # Log the crash
+        stack_trace = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        log_crash(
+            error_type=f"UNCAUGHT_EXCEPTION:{exc_type.__name__}",
+            error_msg=str(exc_value),
+            stack_trace=stack_trace,
+            extra_info={"exc_type": str(exc_type)}
+        )
+        # Call original handler
+        original_excepthook(exc_type, exc_value, exc_tb)
+    
+    sys.excepthook = custom_excepthook
+    print(f"[INFO] Installed global exception handler, crash logs will be saved to: {_CRASH_LOG_DIR}")
+
+# Install the handler immediately when module is imported
+install_global_exception_handler()
+# =============================================================================
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 from datasets import load_from_disk
@@ -495,9 +579,16 @@ class PromptUpdateInteraction(BaseInteraction):
         try:
             return await self._generate_response_impl(instance_id, messages, **kwargs)
         except Exception as e:
-            # Log the error but don't crash the worker
+            # Log the error to centralized crash log AND console
+            stack_trace = traceback.format_exc()
             print(f"[PromptUpdateInteraction] ERROR in generate_response: {e}")
-            traceback.print_exc()
+            print(stack_trace)
+            log_crash(
+                error_type="INTERACTION_ERROR",
+                error_msg=str(e),
+                stack_trace=stack_trace,
+                extra_info={"instance_id": instance_id, "kwargs_keys": list(kwargs.keys())}
+            )
             # Return safe default: terminate with 0 reward
             return True, "", 0.0, {"error": str(e), "fallback": True}
     
@@ -508,9 +599,11 @@ class PromptUpdateInteraction(BaseInteraction):
             return await asyncio.wait_for(coro, timeout=timeout_seconds)
         except asyncio.TimeoutError:
             print(f"[PromptUpdateInteraction] WARNING: Actor call timed out after {timeout_seconds}s")
+            log_crash("ACTOR_TIMEOUT", f"Actor call timed out after {timeout_seconds}s")
             return default
         except Exception as e:
             print(f"[PromptUpdateInteraction] WARNING: Actor call failed: {e}")
+            log_crash("ACTOR_CALL_FAILED", str(e), traceback.format_exc())
             return default
     
     async def _generate_response_impl(self, instance_id, messages, **kwargs):
@@ -1001,8 +1094,15 @@ def install_prompt_reset_hook():
                 return
             return original_add_user_message(self, processing_class, content)
         except Exception as e:
+            stack_trace = traceback.format_exc()
             print(f"[patched_add_user_message] ERROR: {e}")
-            traceback.print_exc()
+            print(stack_trace)
+            log_crash(
+                error_type="PATCHED_ADD_USER_MESSAGE_ERROR",
+                error_msg=str(e),
+                stack_trace=stack_trace,
+                extra_info={"content_preview": content[:200] if content else None}
+            )
             # Re-raise to let verl handle it - but at least we logged it
             raise
 
