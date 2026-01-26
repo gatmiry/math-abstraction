@@ -180,10 +180,14 @@ import torch
 
 # =============================================================================
 # CENTRALIZED CRASH LOGGING - Writes to shared filesystem for all nodes
+# All nodes write to /mnt/task_runtime/sbys_hinting/crash_logs/ via NFS
 # =============================================================================
 _CRASH_LOG_DIR = os.path.join(os.path.dirname(__file__), "crash_logs")
 _CRASH_LOG_LOCK = threading.Lock()
 _PROCESS_START_TIME = datetime.datetime.now()
+_HEARTBEAT_THREAD = None
+_HEARTBEAT_STOP = threading.Event()
+_WORKER_STATE = {"phase": "init", "iteration": 0, "last_activity": None}
 
 def get_node_identifier():
     """Get a unique identifier for this node."""
@@ -194,6 +198,68 @@ def get_node_identifier():
         ip = "unknown"
     pid = os.getpid()
     return f"{hostname}_{ip}_{pid}"
+
+def get_detailed_system_info():
+    """Get detailed system info for crash diagnosis."""
+    info = {
+        "hostname": socket.gethostname(),
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "cwd": os.getcwd(),
+    }
+    
+    # Get IP address
+    try:
+        info["ip"] = socket.gethostbyname(socket.gethostname())
+    except:
+        info["ip"] = "unknown"
+    
+    # Get GPU info
+    try:
+        if torch.cuda.is_available():
+            info["cuda_device_count"] = torch.cuda.device_count()
+            info["cuda_current_device"] = torch.cuda.current_device()
+            info["gpu_memory"] = []
+            for i in range(torch.cuda.device_count()):
+                mem_allocated = torch.cuda.memory_allocated(i) / 1024**3
+                mem_reserved = torch.cuda.memory_reserved(i) / 1024**3
+                mem_total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                info["gpu_memory"].append({
+                    "device": i,
+                    "allocated_gb": round(mem_allocated, 2),
+                    "reserved_gb": round(mem_reserved, 2),
+                    "total_gb": round(mem_total, 2),
+                    "free_gb": round(mem_total - mem_reserved, 2),
+                })
+    except Exception as e:
+        info["gpu_error"] = str(e)
+    
+    # Get memory info
+    try:
+        import resource
+        rusage = resource.getrusage(resource.RUSAGE_SELF)
+        info["memory_mb"] = rusage.ru_maxrss / 1024  # Convert KB to MB
+    except:
+        pass
+    
+    # Get thread info
+    info["thread_count"] = threading.active_count()
+    info["thread_names"] = [t.name for t in threading.enumerate()]
+    
+    # Get worker state
+    info["worker_state"] = dict(_WORKER_STATE)
+    
+    return info
+
+def update_worker_state(phase: str = None, iteration: int = None, **kwargs):
+    """Update the current worker state for crash diagnosis."""
+    global _WORKER_STATE
+    if phase is not None:
+        _WORKER_STATE["phase"] = phase
+    if iteration is not None:
+        _WORKER_STATE["iteration"] = iteration
+    _WORKER_STATE["last_activity"] = datetime.datetime.now().isoformat()
+    _WORKER_STATE.update(kwargs)
 
 def log_crash(error_type: str, error_msg: str, stack_trace: str = None, extra_info: dict = None):
     """Log a crash/error to the shared crash log directory.
@@ -206,31 +272,16 @@ def log_crash(error_type: str, error_msg: str, stack_trace: str = None, extra_in
         
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         node_id = get_node_identifier()
-        
-        # Get GPU memory info if available
-        gpu_info = None
-        try:
-            if torch.cuda.is_available():
-                gpu_info = []
-                for i in range(torch.cuda.device_count()):
-                    mem_allocated = torch.cuda.memory_allocated(i) / 1024**3
-                    mem_reserved = torch.cuda.memory_reserved(i) / 1024**3
-                    gpu_info.append({
-                        "device": i,
-                        "allocated_gb": round(mem_allocated, 2),
-                        "reserved_gb": round(mem_reserved, 2)
-                    })
-        except:
-            pass
+        system_info = get_detailed_system_info()
         
         log_entry = {
             "timestamp": timestamp,
             "node_id": node_id,
             "error_type": error_type,
-            "error_msg": str(error_msg),
-            "stack_trace": stack_trace or traceback.format_exc(),
+            "error_msg": str(error_msg)[:2000],  # Limit size
+            "stack_trace": (stack_trace or traceback.format_exc())[:10000],  # Limit size
             "extra_info": extra_info or {},
-            "gpu_info": gpu_info,
+            "system_info": system_info,
             "uptime_seconds": (datetime.datetime.now() - _PROCESS_START_TIME).total_seconds(),
         }
         
@@ -245,17 +296,67 @@ def log_crash(error_type: str, error_msg: str, stack_trace: str = None, extra_in
         with open(node_log, "a") as f:
             f.write(f"\n{'='*80}\n")
             f.write(f"[{timestamp}] {error_type}\n")
+            f.write(f"Node: {node_id}\n")
             f.write(f"Error: {error_msg}\n")
+            f.write(f"Worker State: {_WORKER_STATE}\n")
             if stack_trace:
                 f.write(f"Stack trace:\n{stack_trace}\n")
+            if system_info.get("gpu_memory"):
+                f.write(f"GPU Memory:\n")
+                for gpu in system_info["gpu_memory"]:
+                    f.write(f"  GPU {gpu['device']}: {gpu['allocated_gb']:.2f}GB allocated, {gpu['free_gb']:.2f}GB free / {gpu['total_gb']:.2f}GB total\n")
             if extra_info:
                 f.write(f"Extra info: {json.dumps(extra_info, indent=2)}\n")
-            if gpu_info:
-                f.write(f"GPU info: {json.dumps(gpu_info, indent=2)}\n")
         
         print(f"[CRASH_LOG] Logged {error_type} to {combined_log}", flush=True)
     except Exception as e:
         print(f"[CRASH_LOG] Failed to write crash log: {e}", flush=True)
+
+def log_heartbeat():
+    """Log a heartbeat to show this worker is alive."""
+    try:
+        os.makedirs(_CRASH_LOG_DIR, exist_ok=True)
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        node_id = get_node_identifier()
+        system_info = get_detailed_system_info()
+        
+        heartbeat_entry = {
+            "timestamp": timestamp,
+            "node_id": node_id,
+            "type": "HEARTBEAT",
+            "uptime_seconds": (datetime.datetime.now() - _PROCESS_START_TIME).total_seconds(),
+            "worker_state": dict(_WORKER_STATE),
+            "gpu_memory": system_info.get("gpu_memory"),
+            "thread_count": system_info.get("thread_count"),
+        }
+        
+        # Write to heartbeat log (separate from crashes)
+        heartbeat_log = os.path.join(_CRASH_LOG_DIR, "heartbeats.jsonl")
+        with _CRASH_LOG_LOCK:
+            with open(heartbeat_log, "a") as f:
+                f.write(json.dumps(heartbeat_entry) + "\n")
+    except:
+        pass  # Don't crash on heartbeat failure
+
+def start_heartbeat_thread(interval_seconds=30):
+    """Start a background thread that logs heartbeats."""
+    global _HEARTBEAT_THREAD, _HEARTBEAT_STOP
+    
+    def heartbeat_loop():
+        while not _HEARTBEAT_STOP.is_set():
+            log_heartbeat()
+            _HEARTBEAT_STOP.wait(interval_seconds)
+    
+    _HEARTBEAT_STOP.clear()
+    _HEARTBEAT_THREAD = threading.Thread(target=heartbeat_loop, daemon=True, name="HeartbeatThread")
+    _HEARTBEAT_THREAD.start()
+    print(f"[INFO] Started heartbeat thread (interval={interval_seconds}s)", flush=True)
+
+def stop_heartbeat_thread():
+    """Stop the heartbeat thread."""
+    global _HEARTBEAT_STOP
+    _HEARTBEAT_STOP.set()
 
 def install_global_exception_handler():
     """Install a global exception handler that logs uncaught exceptions."""
@@ -641,6 +742,7 @@ class PromptUpdateInteraction(BaseInteraction):
         
         # Wrap entire method in try/except to prevent worker crashes
         try:
+            update_worker_state(phase="generate_response", instance_id=instance_id[:16])
             return await self._generate_response_impl(instance_id, messages, **kwargs)
         except Exception as e:
             # Log the error to centralized crash log AND console
@@ -1585,6 +1687,10 @@ def gather_checkpoint_to_head_node(checkpoint_dir: str, output_dir: str, num_nod
 
 def main():
     """Main function to run GRPO training with verl and Ray."""
+    # Start heartbeat thread for crash diagnosis
+    start_heartbeat_thread(interval_seconds=30)
+    update_worker_state(phase="main_init", iteration=0)
+    
     # Set NCCL environment variables EARLY - before any distributed init
     # These help prevent NCCL socket errors (code 3) during multi-node training
     nccl_env_vars = {
@@ -1600,6 +1706,7 @@ def main():
     for key, value in nccl_env_vars.items():
         os.environ[key] = value
     print(f"[INFO] Set NCCL environment variables for network stability")
+    update_worker_state(phase="nccl_env_set")
     
     # Parse command line arguments
     args = parse_args()
@@ -1934,8 +2041,10 @@ def main():
     
     # Run PPO training
     print("Starting GRPO training with verl...")
+    update_worker_state(phase="training_start")
     try:
         run_ppo(config)
+        update_worker_state(phase="training_complete")
         print("Training completed successfully!")
         
         # After training, gather checkpoint shards from all nodes to head node
