@@ -1879,7 +1879,8 @@ def main():
         
         # Algorithm - GRPO
         "algorithm.adv_estimator=grpo",
-        "algorithm.use_kl_in_reward=false",
+        "algorithm.use_kl_in_reward=true",  # Enable KL penalty to prevent drift from reference policy
+        "algorithm.kl_coef=0.01",  # KL coefficient - penalize divergence from reference
         "algorithm.norm_adv_by_std_in_grpo=true",
         
         # Data config
