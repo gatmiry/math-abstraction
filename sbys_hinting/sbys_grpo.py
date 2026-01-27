@@ -931,7 +931,7 @@ class PromptUpdateInteraction(BaseInteraction):
             
             print(f"[PromptUpdateInteraction] Turn 1: updated_prompt={updated_prompt[:100]}...")
             
-            system_prompt_name = "full_solution_simple" if problem_state["try_index"] > 0 else "full_solution_with_hint"
+            system_prompt_name = "full_solution_with_hint" if problem_state["try_index"] > 0 else "full_solution_simple"
             system_prompt = load_system_prompt(system_prompt_name)
             # Add validation marker if this is a validation sample (enables logging in _reset_request_prompt)
             validation_marker = PROMPT_LOG_VALIDATION_MARKER if is_validation else ""
@@ -1853,7 +1853,7 @@ def main():
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
         "actor_rollout_ref.rollout.response_length=16384",  # Increased from 12288 to further reduce LENGTH truncation
         "actor_rollout_ref.rollout.max_model_len=20480",  # 4096 + 16384
-        "actor_rollout_ref.rollout.max_num_batched_tokens=327680",  # 20480*16 = ~102GB KV cache total, ~12.8GB per GPU with TP=8
+        "actor_rollout_ref.rollout.max_num_batched_tokens=3276800",  # 20480*16 = ~102GB KV cache total, ~12.8GB per GPU with TP=8
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
@@ -1872,6 +1872,7 @@ def main():
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         "+actor_rollout_ref.actor.offload_param=true",  # Offload actor params to CPU to reduce GPU memory pressure
+        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1",  # Required for ref model log prob calculation
         "actor_rollout_ref.ref.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         
         # Enable gradient checkpointing to reduce memory usage during policy update
@@ -1880,7 +1881,7 @@ def main():
         # Algorithm - GRPO
         "algorithm.adv_estimator=grpo",
         "algorithm.use_kl_in_reward=true",  # Enable KL penalty to prevent drift from reference policy
-        "algorithm.kl_coef=0.01",  # KL coefficient - penalize divergence from reference
+        "algorithm.kl_ctrl.kl_coef=0.01",  # KL coefficient - penalize divergence from reference
         "algorithm.norm_adv_by_std_in_grpo=true",
         
         # Data config
