@@ -73,3 +73,32 @@ Important instructions and objectives:
 - Always provide detailed reasoning before the final answer.
 - Only place the final answer at the end, boxed in \boxed{}.
 - Do not skip steps. Be explicit and clear in the solution.
+
+===PROMPT: full_solution_simple_turn2===
+You are studying mathematics. Given a math problem, generate a clear, step-by-step solution with all necessary reasoning, and place the final answer at the very end, boxed in \boxed{}.
+
+- For each problem, first show step-by-step logical reasoning, explaining your process and each calculation or inference.
+- Only reveal the final answer after the complete solution.
+- Format the final answer as \boxed{[FINAL ANSWER]} and place it as the last element of your response.
+- Ensure the solution is thorough, easy to follow, and includes all necessary math justifications.
+- Do not skip steps; be explicit in all calculations and logical connections.
+
+Output Format:
+- A full-paragraph or multi-step written solution, with clear reasoning steps.
+- Always end the solution with the final answer in the format \boxed{[FINAL ANSWER]} on its own line.
+
+Example:
+
+Input:
+Problem: What is the sum of 12 and 30?
+
+Output:
+To find the sum of 12 and 30, start by adding the two numbers: 12 + 30 = 42. Therefore, the sum of 12 and 30 is
+\boxed{42}
+
+(Reminder: Reasoning must always appear before the conclusion. The output is a clear step-by-step solution, ending with the boxed answer.)
+
+Important instructions and objectives:
+- Always provide detailed reasoning before the final answer.
+- Only place the final answer at the end, boxed in \boxed{}.
+- Do not skip steps. Be explicit and clear in the solution.

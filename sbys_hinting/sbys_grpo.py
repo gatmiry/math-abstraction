@@ -659,6 +659,27 @@ class ProblemStateActor:
             "total_correct": total_correct,
         }
     
+    def verify_counters_reset(self, problem_keys: List[str]) -> Dict[str, Any]:
+        """Verify that turn_counter is 0 for all specified problems.
+        
+        Called after each GRPO step to ensure all counters were properly reset.
+        
+        Returns:
+            Dict with 'all_zero': bool, 'non_zero_problems': list of (key, counter) tuples
+        """
+        non_zero = []
+        for key in problem_keys:
+            if key in self._problem_state:
+                counter = self._problem_state[key].get("turn_counter", 0)
+                if counter != 0:
+                    non_zero.append((key[:50], counter))
+        
+        return {
+            "all_zero": len(non_zero) == 0,
+            "non_zero_problems": non_zero,
+            "checked_count": len(problem_keys),
+        }
+    
     def initialize_all_problems(self, problems_data: List[Dict[str, Any]]) -> int:
         """Initialize state for all problems at once (called at start of training).
         
@@ -680,9 +701,143 @@ class ProblemStateActor:
                     "try_index": 0,
                     "total_attempts": 0,
                     "total_correct": 0,
+                    "turn_counter": 0,  # For race-free state updates
+                    "last_verified_attempts": -1,  # Sentinel for step completion verification
                 }
                 count += 1
         return count
+    
+    def increment_turn_counter(self, problem_key: str, target_count: int = 8) -> int:
+        """Increment the turn counter. Called in both Turn 1 and Turn 2.
+        
+        Returns the counter value AFTER increment.
+        
+        VERIFICATION: When counter transitions from 0 to 1 (first increment of a new step),
+        we check if total_attempts increased since the last time counter was 0.
+        If not, the previous step didn't complete (counter never hit target_count).
+        """
+        if problem_key not in self._problem_state:
+            return 0
+        state = self._problem_state[problem_key]
+        counter = state.get("turn_counter", 0)
+        total_attempts = state.get("total_attempts", 0)
+        last_verified_attempts = state.get("last_verified_attempts", -1)
+        
+        # VERIFICATION: First increment of a new step (counter == 0)
+        if counter == 0:
+            # Check if total_attempts increased since last time we started a step
+            # If not (and this isn't the first step), the previous step didn't complete!
+            if last_verified_attempts != -1 and total_attempts == last_verified_attempts:
+                error_msg = (
+                    f"FATAL ERROR: Previous step did not complete!\n"
+                    f"Counter is 0 but total_attempts ({total_attempts}) did not increase since last step.\n"
+                    f"This means counter never reached {target_count} in the previous step.\n"
+                    f"Problem key: {problem_key[:100]}..."
+                )
+                print(f"[ProblemStateActor] {error_msg}")
+                raise RuntimeError(error_msg)
+            
+            # Mark current total_attempts as verified (we'll check it increased at next step start)
+            state["last_verified_attempts"] = total_attempts
+        
+        elif counter >= target_count:
+            # Counter should have been reset when it hit target_count
+            error_msg = (
+                f"FATAL ERROR: turn_counter ({counter}) >= target ({target_count}) at start of increment!\n"
+                f"Previous step did not reset counter properly.\n"
+                f"Problem key: {problem_key[:100]}..."
+            )
+            print(f"[ProblemStateActor] {error_msg}")
+            raise RuntimeError(error_msg)
+        
+        counter += 1
+        state["turn_counter"] = counter
+        return counter
+    
+    def try_claim_and_update(self, problem_key: str, is_correct: bool, target_count: int) -> tuple:
+        """Try to claim this step's update. Only the generation that hits target_count wins.
+        
+        Counter-based approach (RACE-FREE for any interleaving):
+        - Turn 1: Each of 4 generations increments counter (+4 total)
+        - Turn 2: Each of 4 generations increments counter (+4 total)
+        - Total per step = 8 (n_samples_per_prompt * 2)
+        - Only the generation whose increment hits exactly target_count claims
+        - After claiming, reset counter to 0 for next step
+        
+        Returns:
+            (success, old_try_index, new_try_index, state)
+        """
+        import math
+        
+        state = self._problem_state.get(problem_key, {})
+        old_try_index = state.get("try_index", 0)
+        
+        # Increment counter and check if we hit the target
+        counter = state.get("turn_counter", 0) + 1
+        state["turn_counter"] = counter
+        
+        # SANITY CHECK: Counter should NEVER exceed target_count
+        # If it does, something is seriously wrong (duplicate calls, missing reset, etc.)
+        if counter > target_count:
+            error_msg = (
+                f"FATAL ERROR: turn_counter ({counter}) exceeded target ({target_count})!\n"
+                f"This indicates a bug: duplicate calls, missing reset, or race condition.\n"
+                f"Problem key: {problem_key[:100]}...\n"
+                f"State: total_attempts={state.get('total_attempts')}, "
+                f"try_index={state.get('try_index')}, "
+                f"able_index={state.get('able_index')}, "
+                f"unable_index={state.get('unable_index')}"
+            )
+            print(f"[ProblemStateActor] {error_msg}")
+            # Save state for debugging before crashing
+            self._problem_state[problem_key] = state
+            raise RuntimeError(error_msg)
+        
+        if counter != target_count:
+            # Not the last one, don't claim
+            self._problem_state[problem_key] = state
+            return False, old_try_index, old_try_index, state
+        
+        # We hit the target! Claim and reset counter for next step
+        state["turn_counter"] = 0
+        
+        # Apply updates
+        state["total_attempts"] = state.get("total_attempts", 0) + 1
+        if is_correct:
+            state["total_correct"] = state.get("total_correct", 0) + 1
+        
+        # Binary search logic to update try_index
+        try_index = state.get("try_index", 0)
+        able_index = state.get("able_index", 0)
+        unable_index = state.get("unable_index", 0)
+        guide_steps_count = state.get("guide_steps_count", 0)
+        
+        if try_index <= unable_index and is_correct:
+            state["able_index"] = try_index
+            if try_index == unable_index:
+                state["try_index"] = try_index - 1
+            else:
+                state["try_index"] = try_index - (unable_index - try_index)
+            state["try_index"] = max(state["try_index"], 0)
+        elif try_index >= able_index and not is_correct:
+            state["unable_index"] = try_index
+            if try_index == able_index:
+                state["try_index"] = try_index + 1
+            else:
+                state["try_index"] = try_index + (try_index - able_index)
+            state["try_index"] = min(state["try_index"], guide_steps_count)
+        else:
+            if not is_correct:
+                state["unable_index"] = try_index
+                state["try_index"] = math.ceil((try_index + able_index) / 2)
+            else:
+                state["able_index"] = try_index
+                state["try_index"] = math.floor((try_index + unable_index) / 2)
+        
+        new_try_index = state["try_index"]
+        self._problem_state[problem_key] = state
+        
+        return True, old_try_index, new_try_index, state
 
 
 # Global name for the shared actor
@@ -712,6 +867,10 @@ class PromptUpdateInteraction(BaseInteraction):
     
     # Class-level dict to store Turn 1 info by problem_key (since instance_id changes between calls)
     _turn1_info_by_problem = {}
+    # Class-level dict to track Turn 1 start times for timing measurement
+    _turn1_start_times = {}
+    # Aggregated timing stats
+    _turn_timing_stats = {"turn1_to_turn2_deltas": [], "count": 0}
     
     def __init__(self, config):
         super().__init__(config)
@@ -720,6 +879,29 @@ class PromptUpdateInteraction(BaseInteraction):
         self._state_actor = get_or_create_problem_state_actor()
         # Install the prompt reset hook on this worker (needed for multi-turn with prompt reset)
         install_prompt_reset_hook()
+        
+        # Cache our system prompts for turn detection
+        self._our_system_prompts = {
+            load_system_prompt("full_solution_simple_turn2"),  # No hints, Turn 2 variant
+            load_system_prompt("full_solution_with_hint"),      # With hints
+        }
+    
+    def _detect_turn_from_messages(self, messages) -> int:
+        """Detect if this is Turn 1 or Turn 2 by checking the system prompt.
+        
+        Turn 1: System prompt is the ORIGINAL from dataset (full_solution_simple or similar)
+        Turn 2: System prompt is one of OURS (full_solution_simple_turn2 or full_solution_with_hint)
+        
+        Returns: 1 for Turn 1, 2 for Turn 2
+        """
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_content = msg.get("content", "")
+                if system_content in self._our_system_prompts:
+                    return 2  # This is our prompt from Turn 1's reset
+                else:
+                    return 1  # This is the original prompt from dataset
+        return 1  # Default to Turn 1 if no system message found
     
     ##generate_response returns a 4‑tuple:
     # 1) should_terminate_sequence (bool)
@@ -855,27 +1037,17 @@ class PromptUpdateInteraction(BaseInteraction):
                 "try_index": 0,
                 "total_attempts": 0,
                 "total_correct": 0,
-                "current_turn": 0,  # Track turn number per-problem (persists across instance_ids)
             }
             await self._safe_actor_call(
                 self._state_actor.set_state.remote(problem_key, problem_state),
                 timeout_seconds=30
             )
         
-        # Ensure current_turn field exists (for backward compatibility with old state)
-        if "current_turn" not in problem_state:
-            problem_state["current_turn"] = 0
-        
-        # Increment turn counter (tracked by problem_key, not instance_id!)
-        # This is critical because verl uses different instance_ids for continuation calls
-        problem_state["current_turn"] = problem_state.get("current_turn", 0) + 1
-        current_turn = problem_state["current_turn"]
-        
-        # Persist the incremented turn immediately
-        await self._safe_actor_call(
-            self._state_actor.set_state.remote(problem_key, problem_state),
-            timeout_seconds=30
-        )
+        # Detect turn by checking system prompt content (not by counter!)
+        # Turn 1: System prompt is ORIGINAL from dataset
+        # Turn 2: System prompt is OURS (from Turn 1's reset)
+        current_turn = self._detect_turn_from_messages(messages)
+        print(f"[PromptUpdateInteraction] Detected turn {current_turn} via system prompt content")
         
         # Keep instance_state for storing Turn 1 info needed by Turn 2
         if instance_id not in self._instance_state:
@@ -886,7 +1058,9 @@ class PromptUpdateInteraction(BaseInteraction):
         # Link instance_id to problem_key so Turn 2 can find Turn 1's stored info
         instance_state["problem_key"] = problem_key
         
-        print(f"[PromptUpdateInteraction] Turn {current_turn}, problem_key={problem_key[:50] if problem_key else None}...")
+        import time as _time
+        _turn_start_time = _time.time()
+        print(f"[PromptUpdateInteraction] Turn {current_turn}, problem_key={problem_key[:50] if problem_key else None}... [timestamp={_turn_start_time:.3f}]")
         print(f"[PromptUpdateInteraction] Persistent state: try_index={problem_state['try_index']}, able={problem_state['able_index']}, unable={problem_state['unable_index']}")
         
         # Note: Validation state logging moved to Turn 2 where we have the reward
@@ -931,7 +1105,11 @@ class PromptUpdateInteraction(BaseInteraction):
             
             print(f"[PromptUpdateInteraction] Turn 1: updated_prompt={updated_prompt[:100]}...")
             
-            system_prompt_name = "full_solution_with_hint" if problem_state["try_index"] > 0 else "full_solution_simple"
+            # Use turn2 variant of simple prompt so we can detect Turn 2 by checking system prompt
+            # "full_solution_simple" = original from dataset (Turn 1)
+            # "full_solution_simple_turn2" = our variant with "studying" instead of "learning" (Turn 2)
+            # "full_solution_with_hint" = our hint prompt (Turn 2)
+            system_prompt_name = "full_solution_with_hint" if problem_state["try_index"] > 0 else "full_solution_simple_turn2"
             system_prompt = load_system_prompt(system_prompt_name)
             # Add validation marker if this is a validation sample (enables logging in _reset_request_prompt)
             validation_marker = PROMPT_LOG_VALIDATION_MARKER if is_validation else ""
@@ -956,6 +1134,17 @@ class PromptUpdateInteraction(BaseInteraction):
                 "problem": problem[:500] if problem else "None",
                 "ground_truth": ground_truth[:200] if ground_truth else "None",
             }
+            # Actually save turn1_info to class dict for retrieval in Turn 2
+            PromptUpdateInteraction._turn1_info_by_problem[problem_key] = turn1_info
+            
+            # Increment turn counter (blocking call)
+            # Each Turn 1 and Turn 2 increments by 1. Last one to reach target claims.
+            N_SAMPLES_PER_PROMPT = 4  # Must match actor_rollout_ref.rollout.n
+            TARGET_COUNT = N_SAMPLES_PER_PROMPT * 2  # 4 Turn 1s + 4 Turn 2s = 8
+            ray.get(self._state_actor.increment_turn_counter.remote(problem_key, TARGET_COUNT))
+            
+            # Record Turn 1 end time for timing measurement
+            PromptUpdateInteraction._turn1_start_times[problem_key] = _time.time()
             
             # Return 0 reward for turn 1 (we're not evaluating this generation)
             # NOTE: The finalized prompt is logged in _reset_request_prompt when verl processes our reset_payload
@@ -1043,61 +1232,31 @@ class PromptUpdateInteraction(BaseInteraction):
             print(f">>> REWARD: {reward}")
             print("=" * 80 + "\n")
         
-        # Update persistent problem state statistics
-        problem_state["total_attempts"] = problem_state.get("total_attempts", 0) + 1
-        if reward > 0.5:
-            problem_state["total_correct"] = problem_state.get("total_correct", 0) + 1
-
-        # Check if solved without hints (try_index == 0 means no hints were given)
-        if reward > 0.5 and problem_state["try_index"] == 0:
-            print(f"[PromptUpdateInteraction] Correct without hints! attempts={problem_state['total_attempts']}, correct={problem_state['total_correct']}")
-            # Reset current_turn for next time this problem is seen
-            problem_state["current_turn"] = 0
-            await self._safe_actor_call(
-                self._state_actor.set_state.remote(problem_key, problem_state),
-                timeout_seconds=30
-            )
-            # Clean up instance state and turn1_info
-            if instance_id in self._instance_state:
-                del self._instance_state[instance_id]
-            if hasattr(PromptUpdateInteraction, '_turn1_info_by_problem') and problem_key in PromptUpdateInteraction._turn1_info_by_problem:
-                del PromptUpdateInteraction._turn1_info_by_problem[problem_key]
-            return True, "", reward, {"correct": True, "try_index": 0, "turn": 2}
-
-        # Binary search logic to update try_index for NEXT time this problem is seen
-        old_try_index = problem_state["try_index"]
-        if problem_state["try_index"] <= problem_state["unable_index"] and reward > 0.5:
-            problem_state["able_index"] = problem_state["try_index"]
-            if problem_state["try_index"] == problem_state["unable_index"]:
-                problem_state["try_index"] = problem_state["try_index"] - 1
-            else:
-                problem_state["try_index"] = problem_state["try_index"] - (problem_state["unable_index"] - problem_state["try_index"])
-            problem_state["try_index"] = max(problem_state["try_index"], 0)
-        elif problem_state["try_index"] >= problem_state["able_index"] and reward < 0.5:
-            problem_state["unable_index"] = problem_state["try_index"]
-            if problem_state["try_index"] == problem_state["able_index"]:
-                problem_state["try_index"] = problem_state["try_index"] + 1
-            else:
-                problem_state["try_index"] = problem_state["try_index"] + (problem_state["try_index"] - problem_state["able_index"])
-            problem_state["try_index"] = min(problem_state["try_index"], problem_state["guide_steps_count"])
-        else:
-            if reward < 0.5:
-                problem_state["unable_index"] = problem_state["try_index"]
-                problem_state["try_index"] = math.ceil((problem_state["try_index"] + problem_state["able_index"]) / 2)
-            else:
-                problem_state["able_index"] = problem_state["try_index"]
-                problem_state["try_index"] = math.floor((problem_state["try_index"] + problem_state["unable_index"]) / 2)
-
-        # Reset current_turn for next time this problem is seen
-        problem_state["current_turn"] = 0
+        # ==================== RACE-FREE STATE UPDATE ====================
+        # Counter-based approach (works regardless of interleaving):
+        # - Turn 1: Each of 4 generations increments counter (+4)
+        # - Turn 2: Each of 4 generations increments counter (+4)
+        # - Total per step = 8 (N_SAMPLES_PER_PROMPT * 2)
+        # - The generation whose increment reaches exactly 8 claims and updates
+        # - After claiming, counter resets to 0 for next step
+        is_correct = reward > 0.5
+        N_SAMPLES_PER_PROMPT = 4  # Must match actor_rollout_ref.rollout.n
+        TARGET_COUNT = N_SAMPLES_PER_PROMPT * 2  # 4 Turn 1s + 4 Turn 2s = 8
         
-        # Persist updated state to Ray Actor
-        await self._safe_actor_call(
-            self._state_actor.set_state.remote(problem_key, problem_state),
-            timeout_seconds=30
+        result = await self._safe_actor_call(
+            self._state_actor.try_claim_and_update.remote(problem_key, is_correct, TARGET_COUNT),
+            timeout_seconds=30,
+            default=(False, problem_state.get("try_index", 0), problem_state.get("try_index", 0), problem_state)
         )
         
-        print(f"[PromptUpdateInteraction] Updated hint level: {old_try_index} -> {problem_state['try_index']} (able={problem_state['able_index']}, unable={problem_state['unable_index']})")
+        update_success, old_try_index, new_try_index, updated_state = result
+        
+        if update_success:
+            print(f"[PromptUpdateInteraction] WON update claim (hit counter target)! Updated hint level: {old_try_index} -> {new_try_index} (able={updated_state.get('able_index')}, unable={updated_state.get('unable_index')})")
+            if is_correct and old_try_index == 0:
+                print(f"[PromptUpdateInteraction] Correct without hints! attempts={updated_state.get('total_attempts')}, correct={updated_state.get('total_correct')}")
+        else:
+            print(f"[PromptUpdateInteraction] Counter not at target yet, skipping update. Current try_index={new_try_index}")
 
         # Clean up instance state and turn1_info
         if instance_id in self._instance_state:
@@ -1106,7 +1265,7 @@ class PromptUpdateInteraction(BaseInteraction):
             del PromptUpdateInteraction._turn1_info_by_problem[problem_key]
         
         # Terminate the sequence - we're done with this problem for this GRPO step
-        return True, "", reward, {"try_index": problem_state["try_index"], "turn": 2, "reward": reward}
+        return True, "", reward, {"try_index": new_try_index, "turn": 2, "reward": reward, "update_won": update_success}
 
 _RESET_PROMPT_LOG_FILE = None
 _RESET_PROMPT_LOG_COUNT = 0
@@ -1238,27 +1397,27 @@ def install_prompt_reset_hook():
     def patched_add_user_message(self, processing_class, content: str):
         import traceback
         try:
-            # Check for validation logging marker first
-            should_log = False
-            if content.startswith(PROMPT_LOG_VALIDATION_MARKER):
-                should_log = True
-                content = content[len(PROMPT_LOG_VALIDATION_MARKER):]
-                print(f"[patched_add_user_message] DETECTED VALIDATION MARKER! should_log={should_log}")
-            
-            if content.startswith(PROMPT_RESET_PREFIX):
-                print(f"[patched_add_user_message] DETECTED RESET PREFIX! should_log={should_log}")
-                payload = content[len(PROMPT_RESET_PREFIX) :]
-                new_system_content = None
-                new_user_content = payload
-                if payload.startswith(PROMPT_RESET_SYSTEM_TAG):
-                    payload = payload[len(PROMPT_RESET_SYSTEM_TAG) :]
-                    if PROMPT_RESET_USER_TAG in payload:
-                        system_part, user_part = payload.split(PROMPT_RESET_USER_TAG, 1)
-                        new_system_content = system_part.rstrip("\n")
-                        new_user_content = user_part
-                _reset_request_prompt(self, processing_class, new_user_content, new_system_content, should_log)
-                return
-            return original_add_user_message(self, processing_class, content)
+        # Check for validation logging marker first
+        should_log = False
+        if content.startswith(PROMPT_LOG_VALIDATION_MARKER):
+            should_log = True
+            content = content[len(PROMPT_LOG_VALIDATION_MARKER):]
+            print(f"[patched_add_user_message] DETECTED VALIDATION MARKER! should_log={should_log}")
+        
+        if content.startswith(PROMPT_RESET_PREFIX):
+            print(f"[patched_add_user_message] DETECTED RESET PREFIX! should_log={should_log}")
+            payload = content[len(PROMPT_RESET_PREFIX) :]
+            new_system_content = None
+            new_user_content = payload
+            if payload.startswith(PROMPT_RESET_SYSTEM_TAG):
+                payload = payload[len(PROMPT_RESET_SYSTEM_TAG) :]
+                if PROMPT_RESET_USER_TAG in payload:
+                    system_part, user_part = payload.split(PROMPT_RESET_USER_TAG, 1)
+                    new_system_content = system_part.rstrip("\n")
+                    new_user_content = user_part
+            _reset_request_prompt(self, processing_class, new_user_content, new_system_content, should_log)
+            return
+        return original_add_user_message(self, processing_class, content)
         except Exception as e:
             stack_trace = traceback.format_exc()
             print(f"[patched_add_user_message] ERROR: {e}")
@@ -1853,7 +2012,7 @@ def main():
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
         "actor_rollout_ref.rollout.response_length=16384",  # Increased from 12288 to further reduce LENGTH truncation
         "actor_rollout_ref.rollout.max_model_len=20480",  # 4096 + 16384
-        "actor_rollout_ref.rollout.max_num_batched_tokens=3276800",  # 20480*16 = ~102GB KV cache total, ~12.8GB per GPU with TP=8
+        "actor_rollout_ref.rollout.max_num_batched_tokens=1310720",  # 20480*16 = ~102GB KV cache total, ~12.8GB per GPU with TP=8
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
@@ -1872,7 +2031,7 @@ def main():
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         "+actor_rollout_ref.actor.offload_param=true",  # Offload actor params to CPU to reduce GPU memory pressure
-        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1",  # Required for ref model log prob calculation
+        # "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1",  # Only needed when use_kl_in_reward=true
         "actor_rollout_ref.ref.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         
         # Enable gradient checkpointing to reduce memory usage during policy update
@@ -1880,8 +2039,8 @@ def main():
         
         # Algorithm - GRPO
         "algorithm.adv_estimator=grpo",
-        "algorithm.use_kl_in_reward=true",  # Enable KL penalty to prevent drift from reference policy
-        "algorithm.kl_ctrl.kl_coef=0.01",  # KL coefficient - penalize divergence from reference
+        "algorithm.use_kl_in_reward=false",  # Disabled to test if ref model init is causing crashes
+        # "algorithm.kl_ctrl.kl_coef=0.01",  # KL coefficient - disabled for now
         "algorithm.norm_adv_by_std_in_grpo=true",
         
         # Data config
