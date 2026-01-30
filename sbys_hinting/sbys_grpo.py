@@ -26,6 +26,9 @@ else:
 # vLLM 0.8.5 V1 engine works fine, but keep this for compatibility with older versions
 os.environ.setdefault("VLLM_USE_V1", "0")
 
+# Use shared HF cache so all worker nodes can access cached models
+os.environ.setdefault("HF_HOME", "/mnt/task_runtime/.hf_cache")
+
 # Tell wandb to save code with each run
 os.environ["WANDB_SAVE_CODE"] = "true"
 
@@ -42,7 +45,7 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full
 SYSTEM_PROMPT_NAME = "full_solution_simple"
 
 HINT_LEVEL = -1
-VAL_SIZE = 128
+VAL_SIZE = 256
 PROMPT_UPDATE_ENABLED = True
 PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
 PROMPT_UPDATE_MAX_USER_TURNS = 2
@@ -52,9 +55,9 @@ PROMPT_RESET_USER_TAG = "__USER__\n"
 PROMPT_LOG_VALIDATION_MARKER = "__LOG_VALIDATION__\n"  # Marker to enable logging in _reset_request_prompt
 ENABLE_VALIDATION_INTERACTION = False
 #
-TRAIN_BATCH_SIZE = 64  # Batch size for training
+TRAIN_BATCH_SIZE = 256  # Batch size for training
 TOTAL_EPOCHS = 50
-TEST_BATCH_SIZE = 64  # Reduced for faster validation
+TEST_BATCH_SIZE = 256  # Reduced for faster validation
 
 
 
@@ -506,8 +509,8 @@ def parse_args():
     return parser.parse_args()
 
 # Distributed training configuration
-# 2 nodes, 8 GPUs per node = 16 GPUs total
-NUM_NODES = 4  # Debugging NCCL timeout
+# 1 node, 8 GPUs = 8 GPUs total
+NUM_NODES = 8
 GPUS_PER_NODE = 8
 
 
@@ -1397,27 +1400,27 @@ def install_prompt_reset_hook():
     def patched_add_user_message(self, processing_class, content: str):
         import traceback
         try:
-        # Check for validation logging marker first
-        should_log = False
-        if content.startswith(PROMPT_LOG_VALIDATION_MARKER):
-            should_log = True
-            content = content[len(PROMPT_LOG_VALIDATION_MARKER):]
-            print(f"[patched_add_user_message] DETECTED VALIDATION MARKER! should_log={should_log}")
-        
-        if content.startswith(PROMPT_RESET_PREFIX):
-            print(f"[patched_add_user_message] DETECTED RESET PREFIX! should_log={should_log}")
-            payload = content[len(PROMPT_RESET_PREFIX) :]
-            new_system_content = None
-            new_user_content = payload
-            if payload.startswith(PROMPT_RESET_SYSTEM_TAG):
-                payload = payload[len(PROMPT_RESET_SYSTEM_TAG) :]
-                if PROMPT_RESET_USER_TAG in payload:
-                    system_part, user_part = payload.split(PROMPT_RESET_USER_TAG, 1)
-                    new_system_content = system_part.rstrip("\n")
-                    new_user_content = user_part
-            _reset_request_prompt(self, processing_class, new_user_content, new_system_content, should_log)
-            return
-        return original_add_user_message(self, processing_class, content)
+            # Check for validation logging marker first
+            should_log = False
+            if content.startswith(PROMPT_LOG_VALIDATION_MARKER):
+                should_log = True
+                content = content[len(PROMPT_LOG_VALIDATION_MARKER):]
+                print(f"[patched_add_user_message] DETECTED VALIDATION MARKER! should_log={should_log}")
+            
+            if content.startswith(PROMPT_RESET_PREFIX):
+                print(f"[patched_add_user_message] DETECTED RESET PREFIX! should_log={should_log}")
+                payload = content[len(PROMPT_RESET_PREFIX) :]
+                new_system_content = None
+                new_user_content = payload
+                if payload.startswith(PROMPT_RESET_SYSTEM_TAG):
+                    payload = payload[len(PROMPT_RESET_SYSTEM_TAG) :]
+                    if PROMPT_RESET_USER_TAG in payload:
+                        system_part, user_part = payload.split(PROMPT_RESET_USER_TAG, 1)
+                        new_system_content = system_part.rstrip("\n")
+                        new_user_content = user_part
+                _reset_request_prompt(self, processing_class, new_user_content, new_system_content, should_log)
+                return
+            return original_add_user_message(self, processing_class, content)
         except Exception as e:
             stack_trace = traceback.format_exc()
             print(f"[patched_add_user_message] ERROR: {e}")
