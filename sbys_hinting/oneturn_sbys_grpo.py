@@ -2257,27 +2257,15 @@ def main():
         f"++custom_params.resumed_from_checkpoint={args.resume_from is not None}",
     ]
 
-    # ONE_TURN_MODE: Use sglang with multi_turn enabled but PassthroughInteraction
-    # sglang works better with multi_turn enabled, so we use a no-op interaction
+    # ONE_TURN_MODE: Standard single-turn rollout with sglang (NO multi_turn)
     # try_index updates happen in compute_score reward function
     if ONE_TURN_MODE:
-        print("[ONE_TURN_MODE] Using sglang with multi_turn + PassthroughInteraction")
+        print("[ONE_TURN_MODE] Using sglang single-turn rollout")
         print("[ONE_TURN_MODE] try_index updates happen in compute_score")
-        
-        # Create interaction config path
-        interaction_config_path = os.path.join(os.path.dirname(__file__), "interaction_passthrough.yaml")
-        
         overrides.append("actor_rollout_ref.rollout.name=sglang")
-        # Enable multi_turn with passthrough interaction
-        overrides.append("actor_rollout_ref.rollout.multi_turn.enable=true")
-        overrides.append(f"actor_rollout_ref.rollout.multi_turn.interaction_config_path={interaction_config_path}")
-        overrides.append("actor_rollout_ref.rollout.multi_turn.max_assistant_turns=1")
-        overrides.append("actor_rollout_ref.rollout.multi_turn.max_user_turns=0")
-        
+        # NO multi_turn - just single-turn generation
         overrides.append("+data.dataloader_num_workers=0")  # For DynamicHintDataset
         overrides.append("trainer.val_before_train=false")  # Skip initial validation
-        print(f"[ONE_TURN_MODE] Interaction config: {interaction_config_path}")
-        print("[ONE_TURN_MODE] Set max_assistant_turns=1, max_user_turns=0")
     
     # Add resume_from_path if resuming from checkpoint
     if args.resume_from:
