@@ -251,6 +251,36 @@ import datetime
 import pandas as pd
 import torch
 
+
+# =============================================================================
+# PASSTHROUGH INTERACTION - Does nothing, just makes sglang multi_turn happy
+# =============================================================================
+
+class PassthroughInteraction(BaseInteraction):
+    """Minimal interaction that does nothing - for one-turn mode with sglang.
+    
+    sglang works better with multi_turn enabled, so we enable it but use this
+    no-op interaction that just returns immediately.
+    """
+    
+    def __init__(self, config):
+        super().__init__(config)
+        print("[PassthroughInteraction] Initialized (no-op interaction for sglang)")
+    
+    async def start_interaction(self, instance_id: str, **interaction_kwargs) -> str:
+        """Called before first generation. Just return the instance_id unchanged."""
+        return instance_id
+    
+    async def generate_response(self, instance_id: str, messages, **kwargs):
+        """Called after each assistant turn. Return None to end the conversation."""
+        # Return None immediately - no additional turns
+        return None
+    
+    async def end_interaction(self, instance_id: str) -> None:
+        """Called when interaction ends. Nothing to clean up."""
+        pass
+
+
 # =============================================================================
 # CENTRALIZED CRASH LOGGING - Writes to shared filesystem for all nodes
 # All nodes write to /mnt/task_runtime/sbys_hinting/crash_logs/ via NFS
@@ -2227,17 +2257,27 @@ def main():
         f"++custom_params.resumed_from_checkpoint={args.resume_from is not None}",
     ]
 
-    # ONE_TURN_MODE: NO multi-turn interaction - use standard single-turn rollout
+    # ONE_TURN_MODE: Use sglang with multi_turn enabled but PassthroughInteraction
+    # sglang works better with multi_turn enabled, so we use a no-op interaction
     # try_index updates happen in compute_score reward function
     if ONE_TURN_MODE:
-        print("[ONE_TURN_MODE] Using sglang single-turn rollout (NO multi-turn interaction)")
+        print("[ONE_TURN_MODE] Using sglang with multi_turn + PassthroughInteraction")
         print("[ONE_TURN_MODE] try_index updates happen in compute_score")
+        
+        # Create interaction config path
+        interaction_config_path = os.path.join(os.path.dirname(__file__), "interaction_passthrough.yaml")
+        
         overrides.append("actor_rollout_ref.rollout.name=sglang")
-        # Do NOT enable multi_turn - this is key!
+        # Enable multi_turn with passthrough interaction
+        overrides.append("actor_rollout_ref.rollout.multi_turn.enable=true")
+        overrides.append(f"actor_rollout_ref.rollout.multi_turn.interaction_config_path={interaction_config_path}")
+        overrides.append("actor_rollout_ref.rollout.multi_turn.max_assistant_turns=1")
+        overrides.append("actor_rollout_ref.rollout.multi_turn.max_user_turns=0")
+        
         overrides.append("+data.dataloader_num_workers=0")  # For DynamicHintDataset
         overrides.append("trainer.val_before_train=false")  # Skip initial validation
-        print("[ONE_TURN_MODE] Set dataloader_num_workers=0 for Ray actor access in __getitem__")
-        print("[ONE_TURN_MODE] Disabled val_before_train")
+        print(f"[ONE_TURN_MODE] Interaction config: {interaction_config_path}")
+        print("[ONE_TURN_MODE] Set max_assistant_turns=1, max_user_turns=0")
     
     # Add resume_from_path if resuming from checkpoint
     if args.resume_from:

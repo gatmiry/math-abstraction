@@ -1,0 +1,6 @@
+# Minimal pass-through interaction for one-turn mode
+# This exists to make sglang happy but doesn't add any multi-turn behavior
+
+interaction_cls: sbys_hinting.oneturn_sbys_grpo.PassthroughInteraction
+interaction_kwargs: {}
+
