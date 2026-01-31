@@ -83,11 +83,12 @@ os.environ.setdefault("VLLM_USE_V1", "0")
 # Use shared HF cache so all worker nodes can access cached models
 os.environ.setdefault("HF_HOME", "/mnt/task_runtime/.hf_cache")
 
-# Force HuggingFace OFFLINE MODE to prevent API calls and 504 timeouts
-# This MUST be set before any HuggingFace imports
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_DATASETS_OFFLINE"] = "1"
+# NOTE: We cannot use HF_HUB_OFFLINE=1 because the model cache may be incomplete
+# (missing hf_quant_config.json). Let workers download missing files as needed.
+# The HF_HOME env var in Ray runtime_env ensures all workers use the shared NFS cache.
+# os.environ["HF_HUB_OFFLINE"] = "1"
+# os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# os.environ["HF_DATASETS_OFFLINE"] = "1"
 
 # Set sglang watchdog timeout BEFORE any sglang imports
 # Default is 300s (5 min) - if a forward batch takes longer, sglang kills the server
@@ -884,9 +885,7 @@ try:
     PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HOME"] = HF_CACHE_PATH
     PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HUB_CACHE"] = f"{HF_CACHE_PATH}/hub"
     PPO_RAY_RUNTIME_ENV["env_vars"]["TRANSFORMERS_CACHE"] = f"{HF_CACHE_PATH}/transformers"
-    # Force offline mode to prevent HuggingFace API calls (causes 504 timeouts)
-    PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HUB_OFFLINE"] = "1"
-    PPO_RAY_RUNTIME_ENV["env_vars"]["TRANSFORMERS_OFFLINE"] = "1"
+    # NOTE: Don't use HF_HUB_OFFLINE - model cache may be incomplete, let workers download as needed
     # NCCL P2P workaround for hardware issues
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_IGNORE_DISABLED_P2P"] = "1"
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_P2P_DISABLE"] = "1"
