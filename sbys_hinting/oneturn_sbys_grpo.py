@@ -3276,7 +3276,7 @@ def main():
     # ONE_TURN_MODE: Set dataloader_num_workers=0 because DynamicHintDataset
     # calls ray.get_actor() in __getitem__, which only works in main process
     if ONE_TURN_MODE:
-        overrides.append("data.dataloader_num_workers=0")
+        overrides.append("+data.dataloader_num_workers=0")
         print("[ONE_TURN_MODE] Set dataloader_num_workers=0 for Ray actor access in __getitem__")
     
     # Add resume_from_path if resuming from checkpoint
