@@ -88,12 +88,7 @@ os.environ.setdefault("VLLM_USE_V1", "0")
 # Use shared HF cache so all worker nodes can access cached models
 os.environ.setdefault("HF_HOME", "/mnt/task_runtime/.hf_cache")
 
-# NOTE: We cannot use HF_HUB_OFFLINE=1 because the model cache may be incomplete
-# (missing hf_quant_config.json). Let workers download missing files as needed.
-# The HF_HOME env var in Ray runtime_env ensures all workers use the shared NFS cache.
-# os.environ["HF_HUB_OFFLINE"] = "1"
-# os.environ["TRANSFORMERS_OFFLINE"] = "1"
-# os.environ["HF_DATASETS_OFFLINE"] = "1"
+# HF_HUB_OFFLINE is set at the top of the file
 
 # Set sglang watchdog timeout BEFORE any sglang imports
 # Default is 300s (5 min) - if a forward batch takes longer, sglang kills the server
@@ -250,36 +245,6 @@ import tempfile
 import datetime
 import pandas as pd
 import torch
-
-
-# =============================================================================
-# PASSTHROUGH INTERACTION - Does nothing, just makes sglang multi_turn happy
-# =============================================================================
-
-class PassthroughInteraction(BaseInteraction):
-    """Minimal interaction that does nothing - for one-turn mode with sglang.
-    
-    sglang works better with multi_turn enabled, so we enable it but use this
-    no-op interaction that just returns immediately.
-    """
-    
-    def __init__(self, config):
-        super().__init__(config)
-        print("[PassthroughInteraction] Initialized (no-op interaction for sglang)")
-    
-    async def start_interaction(self, instance_id: str, **interaction_kwargs) -> str:
-        """Called before first generation. Just return the instance_id unchanged."""
-        return instance_id
-    
-    async def generate_response(self, instance_id: str, messages, **kwargs):
-        """Called after each assistant turn. Return None to end the conversation."""
-        # Return None immediately - no additional turns
-        return None
-    
-    async def end_interaction(self, instance_id: str) -> None:
-        """Called when interaction ends. Nothing to clean up."""
-        pass
-
 
 # =============================================================================
 # CENTRALIZED CRASH LOGGING - Writes to shared filesystem for all nodes
