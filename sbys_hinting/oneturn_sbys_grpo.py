@@ -872,6 +872,11 @@ try:
     from verl.trainer.constants_ppo import PPO_RAY_RUNTIME_ENV
     PPO_RAY_RUNTIME_ENV.setdefault("env_vars", {})
     PPO_RAY_RUNTIME_ENV["env_vars"]["VLLM_USE_V1"] = "0"
+    # HuggingFace cache - use shared NFS path so workers don't need to re-download
+    HF_CACHE_PATH = "/mnt/task_runtime/.hf_cache"
+    PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HOME"] = HF_CACHE_PATH
+    PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HUB_CACHE"] = f"{HF_CACHE_PATH}/hub"
+    PPO_RAY_RUNTIME_ENV["env_vars"]["TRANSFORMERS_CACHE"] = f"{HF_CACHE_PATH}/transformers"
     # NCCL P2P workaround for hardware issues
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_IGNORE_DISABLED_P2P"] = "1"
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_P2P_DISABLE"] = "1"
