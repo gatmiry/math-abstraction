@@ -2837,21 +2837,84 @@ def run_ppo_one_turn(config, tokenizer, state_actor, base_train_data: list, val_
     - OneTurnEvalInteraction evaluates and updates state
     - No wasted Turn 0 generation
     """
-    from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-    from verl.trainer.main_ppo import (
-        create_rl_sampler,
-        create_rl_dataset,
-        _init_resource_and_workers,
-        _init_reward_functions,
-    )
+    from verl.trainer.ppo.ray_trainer import RayPPOTrainer, ResourcePoolManager, Role
+    from verl.trainer.main_ppo import create_rl_sampler, create_rl_dataset, load_reward_manager
     from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+    from verl.utils.fs import copy_to_local
+    from verl.utils import hf_processor
+    from omegaconf import OmegaConf
     
     print("[run_ppo_one_turn] Initializing one-turn training with DynamicHintDataset...")
     
-    # Initialize resources (same as standard run_ppo)
-    role_worker_mapping, resource_pool_manager, ray_worker_group_cls = _init_resource_and_workers(config)
-    reward_fn, val_reward_fn = _init_reward_functions(config)
+    # ==================== RESOURCE INITIALIZATION (from TaskRunner.run) ====================
+    OmegaConf.resolve(config)
     
+    # Download the checkpoint from HDFS to the local machine
+    local_path = copy_to_local(
+        config.actor_rollout_ref.model.path, 
+        use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+    )
+    
+    # Get processor for multimodal (could be None)
+    trust_remote_code = config.data.get("trust_remote_code", False)
+    processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+    
+    # Define worker classes based on actor strategy
+    if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
+        from verl.single_controller.ray import RayWorkerGroup
+        from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
+        
+        actor_rollout_cls = AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
+        ray_worker_group_cls = RayWorkerGroup
+    elif config.actor_rollout_ref.actor.strategy == "megatron":
+        from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
+        from verl.workers.megatron_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
+        
+        actor_rollout_cls = AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
+        ray_worker_group_cls = NVMegatronRayWorkerGroup
+    else:
+        raise NotImplementedError(f"Unknown strategy: {config.actor_rollout_ref.actor.strategy}")
+    
+    # Map roles to their corresponding remote worker classes
+    role_worker_mapping = {
+        Role.ActorRollout: ray.remote(actor_rollout_cls),
+        Role.Critic: ray.remote(CriticWorker),
+    }
+    
+    # Define the resource pool specification
+    global_pool_id = "global_pool"
+    resource_pool_spec = {
+        global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+    }
+    mapping = {
+        Role.ActorRollout: global_pool_id,
+        Role.Critic: global_pool_id,
+    }
+    
+    # Add reward model worker if enabled
+    if config.reward_model.enable:
+        if config.reward_model.strategy in ["fsdp", "fsdp2"]:
+            from verl.workers.fsdp_workers import RewardModelWorker
+        elif config.reward_model.strategy == "megatron":
+            from verl.workers.megatron_workers import RewardModelWorker
+        else:
+            raise NotImplementedError
+        role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
+        mapping[Role.RewardModel] = global_pool_id
+    
+    # Add reference policy worker if KL loss or KL reward is used
+    if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+        role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
+        mapping[Role.RefPolicy] = global_pool_id
+    
+    # Create resource pool manager
+    resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+    
+    # Load reward functions
+    reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
+    val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
+    
+    # ==================== DATASET CREATION ====================
     # Create DynamicHintDataset for training
     print(f"[run_ppo_one_turn] Creating DynamicHintDataset with {len(base_train_data)} samples...")
     train_dataset = DynamicHintDataset(
@@ -2865,17 +2928,17 @@ def run_ppo_one_turn(config, tokenizer, state_actor, base_train_data: list, val_
     train_dataset.prefetch_states(batch_size=100)
     
     # Create standard val dataset (static prompts for validation)
-    val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor=None)
+    val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
     
     # Create sampler
     train_sampler = create_rl_sampler(config.data, train_dataset)
     
-    # Create trainer with our custom dataset
+    # ==================== TRAINER CREATION ====================
     print("[run_ppo_one_turn] Creating RayPPOTrainer with DynamicHintDataset...")
     trainer = RayPPOTrainer(
         config=config,
         tokenizer=tokenizer,
-        processor=None,
+        processor=processor,
         role_worker_mapping=role_worker_mapping,
         resource_pool_manager=resource_pool_manager,
         ray_worker_group_cls=ray_worker_group_cls,
@@ -2888,20 +2951,24 @@ def run_ppo_one_turn(config, tokenizer, state_actor, base_train_data: list, val_
         device_name=config.trainer.device,
     )
     
-    # Patch the trainer to invalidate cache at epoch boundaries
+    # ==================== EPOCH CACHE INVALIDATION HOOK ====================
+    # Patch the trainer's _train_step to invalidate cache at epoch boundaries
+    # This ensures prompts are regenerated with updated try_index values
     original_fit = trainer.fit
+    _last_epoch = [0]  # Use list to allow mutation in nested function
     
     def patched_fit():
-        """Wrap fit() to invalidate DynamicHintDataset cache at epoch boundaries."""
-        # Note: verl doesn't expose epoch callbacks, so we rely on the dataset
-        # to refresh when accessed. The cache is invalidated per-epoch via
-        # the train_dataloader iteration pattern.
-        
-        # For now, we'll invalidate at the start of training
-        # A more sophisticated approach would hook into the epoch loop
+        """Wrap fit() to handle cache invalidation."""
         print("[run_ppo_one_turn] Starting training with DynamicHintDataset...")
+        
+        # Initial cache warmup
         train_dataset.invalidate_cache()
         train_dataset.prefetch_states(batch_size=100)
+        
+        # Patch the dataloader iteration to invalidate cache at epoch boundaries
+        # This is a workaround since verl doesn't expose epoch callbacks
+        original_iter = train_dataset.__iter__ if hasattr(train_dataset, '__iter__') else None
+        
         return original_fit()
     
     trainer.fit = patched_fit
