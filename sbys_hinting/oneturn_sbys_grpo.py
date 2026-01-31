@@ -83,6 +83,12 @@ os.environ.setdefault("VLLM_USE_V1", "0")
 # Use shared HF cache so all worker nodes can access cached models
 os.environ.setdefault("HF_HOME", "/mnt/task_runtime/.hf_cache")
 
+# Force HuggingFace OFFLINE MODE to prevent API calls and 504 timeouts
+# This MUST be set before any HuggingFace imports
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+
 # Set sglang watchdog timeout BEFORE any sglang imports
 # Default is 300s (5 min) - if a forward batch takes longer, sglang kills the server
 # 3 minutes should be plenty for any single generation with our batch sizes
