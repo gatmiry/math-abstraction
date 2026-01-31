@@ -1595,6 +1595,13 @@ class OneTurnEvalInteraction(BaseInteraction):
         import time as _time
         _start = _time.time()
         
+        # Debug: log that start_interaction is being called
+        if not hasattr(OneTurnEvalInteraction, '_start_count'):
+            OneTurnEvalInteraction._start_count = 0
+        OneTurnEvalInteraction._start_count += 1
+        if OneTurnEvalInteraction._start_count <= 5:
+            print(f"[OneTurnEval.start_interaction] CALLED #{OneTurnEvalInteraction._start_count}, instance_id={instance_id[:16]}")
+        
         problem = kwargs.get("problem", "")
         sbys_solution = kwargs.get("sbys_solution", [])
         
@@ -1637,8 +1644,12 @@ class OneTurnEvalInteraction(BaseInteraction):
             if hasattr(request, '_processing_class') and request._processing_class:
                 _reset_request_prompt(request, request._processing_class, user_content, system_content)
                 _duration = _time.time() - _start
-                if _duration > 1.0:
-                    print(f"[OneTurnEval.start_interaction] try_index={try_index}, hints={had_hints}, time={_duration:.3f}s")
+                # Always log for first 10 samples, then only slow ones
+                if not hasattr(OneTurnEvalInteraction, '_start_interaction_count'):
+                    OneTurnEvalInteraction._start_interaction_count = 0
+                OneTurnEvalInteraction._start_interaction_count += 1
+                if OneTurnEvalInteraction._start_interaction_count <= 10 or _duration > 1.0:
+                    print(f"[OneTurnEval.start_interaction] #{OneTurnEvalInteraction._start_interaction_count} try_index={try_index}, hints={had_hints}, time={_duration:.3f}s")
             else:
                 print(f"[OneTurnEval.start_interaction] WARNING: No processing_class on request, can't modify prompt")
             
@@ -2462,6 +2473,13 @@ def install_one_turn_prompt_hook():
     
     async def patched_handle_pending_state(self, _req):
         """Store request in map before calling start_interaction."""
+        # Debug logging
+        if not hasattr(SGLangRollout, '_patch_call_count'):
+            SGLangRollout._patch_call_count = 0
+        SGLangRollout._patch_call_count += 1
+        if SGLangRollout._patch_call_count <= 5:
+            print(f"[patched_handle_pending_state] CALLED #{SGLangRollout._patch_call_count}, request_id={_req.request_id[:16]}")
+        
         # Store request in class-level map, keyed by request_id
         OneTurnEvalInteraction._request_map[_req.request_id] = _req
         
@@ -2472,6 +2490,8 @@ def install_one_turn_prompt_hook():
             _req._processing_class = self.tokenizer
         else:
             _req._processing_class = None
+            if SGLangRollout._patch_call_count <= 5:
+                print(f"[patched_handle_pending_state] WARNING: No processing_class available")
         
         try:
             result = await original_handle_pending(self, _req)
