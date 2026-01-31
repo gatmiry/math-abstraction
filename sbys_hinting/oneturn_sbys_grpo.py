@@ -3364,13 +3364,13 @@ def main():
     print("Starting GRPO training with verl...")
     update_worker_state(phase="training_start")
     try:
+        # Both ONE_TURN_MODE and multi-turn mode use standard run_ppo
+        # The difference is in the interaction class (OneTurnEvalInteraction vs PromptUpdateInteraction)
+        # ONE_TURN_MODE uses OneTurnEvalInteraction which evaluates after a single generation
+        # Multi-turn mode uses PromptUpdateInteraction which resets prompt between turns
         if ONE_TURN_MODE:
-            # ONE-TURN MODE: Use custom run_ppo_one_turn with DynamicHintDataset
-            print("[ONE_TURN_MODE] Using custom training loop with DynamicHintDataset")
-            run_ppo_one_turn(config, tokenizer, state_actor, base_train_data, val_data)
-        else:
-            # Standard multi-turn mode
-            run_ppo(config)
+            print("[ONE_TURN_MODE] Using OneTurnEvalInteraction (single generation + eval)")
+        run_ppo(config)
         update_worker_state(phase="training_complete")
         print("Training completed successfully!")
         
