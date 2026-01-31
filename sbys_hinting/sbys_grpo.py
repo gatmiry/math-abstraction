@@ -602,10 +602,11 @@ class CrashMonitorActor:
 def get_or_create_crash_monitor():
     """Get existing CrashMonitorActor or create a new one."""
     try:
-        return ray.get_actor(CRASH_MONITOR_ACTOR_NAME)
+        return ray.get_actor(CRASH_MONITOR_ACTOR_NAME, namespace="sbys_grpo")
     except ValueError:
         return CrashMonitorActor.options(
             name=CRASH_MONITOR_ACTOR_NAME,
+            namespace="sbys_grpo",  # Use consistent namespace
             lifetime="detached",
             num_cpus=0.1,  # Minimal CPU usage
         ).remote()
@@ -741,7 +742,7 @@ def init_worker_crash_monitoring():
     try:
         # Try to connect to the existing CrashMonitorActor
         try:
-            _CRASH_MONITOR = ray.get_actor(CRASH_MONITOR_ACTOR_NAME)
+            _CRASH_MONITOR = ray.get_actor(CRASH_MONITOR_ACTOR_NAME, namespace="sbys_grpo")
         except ValueError:
             # Actor doesn't exist yet, skip (head node will create it)
             print(f"[WorkerCrashMonitor] CrashMonitorActor not found, skipping registration", flush=True)
@@ -1301,11 +1302,12 @@ def get_or_create_problem_state_actor():
     """Get existing ProblemStateActor or create a new one."""
     try:
         # Try to get existing actor
-        return ray.get_actor(PROBLEM_STATE_ACTOR_NAME)
+        return ray.get_actor(PROBLEM_STATE_ACTOR_NAME, namespace="sbys_grpo")
     except ValueError:
         # Actor doesn't exist, create it
         return ProblemStateActor.options(
             name=PROBLEM_STATE_ACTOR_NAME,
+            namespace="sbys_grpo",  # Use consistent namespace
             lifetime="detached",  # Survives driver failure
             max_concurrency=2000,  # Must handle TRAIN_BATCH_SIZE * n concurrent requests (256 * 4 = 1024+)
         ).remote()

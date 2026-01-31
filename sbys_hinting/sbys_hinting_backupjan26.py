@@ -1,62 +1,8 @@
 #!/usr/bin/env python3
 """
-ONE-TURN GRPO training script for Omni-MATH dataset using verl with Ray.
-
-INVESTIGATION RESULTS - How verl handles prompts:
-==================================================
-
-1. verl's SGLang rollout DOES call `start_interaction(instance_id, **interaction_kwargs)` 
-   BEFORE the first generation (in `_handle_pending_state`, line 933 of sglang_rollout.py).
-   
-2. However, `start_interaction()` does NOT receive or return the `AsyncRolloutRequest` object,
-   so we cannot directly modify the prompt messages from within start_interaction.
-
-3. The prompt is set from the dataset in `_preprocess_prompt_to_async_rollout_requests()`:
-   - `messages=raw_prompt.tolist()` comes from dataset's "prompt" field
-   - `interaction_kwargs` comes from dataset's "extra_info.interaction_kwargs"
-
-OPTIONS FOR ONE-TURN APPROACH:
-==============================
-
-Option A: DYNAMIC DATASET GENERATION (Recommended)
-- Modify `to_verl_format()` to include hints in the initial prompt
-- Query ProblemStateActor to get current `try_index` for each problem
-- Requires per-epoch dataset regeneration or dynamic data loading
-
-Option B: PATCH verl's _handle_pending_state
-- Modify verl code to pass AsyncRolloutRequest to start_interaction
-- More invasive but allows interaction to modify prompt directly
-
-Option C: KEEP MULTI-TURN BUT OPTIMIZE (Current approach)
-- Turn 0: Generate without hints (wasted computation)
-- Turn 1: Reset prompt with hints, start real generation
-- Turn 2: Evaluate and update state
-- Slower due to wasted Turn 0, but works with existing verl
-
-INJECTION POINTS IN VERL FOR DYNAMIC PROMPTS:
-=============================================
-
-1. RLHFDataset.__getitem__ (verl/utils/dataset/rl_dataset.py line 212)
-   - Called for each sample when DataLoader fetches it
-   - Can query ProblemStateActor here to get current try_index
-   - Modify prompt to include appropriate hints
-   - BEST for per-sample dynamic modification
-
-2. collate_fn (verl/utils/dataset/rl_dataset.py line 37)
-   - Called after __getitem__ to batch samples together
-   - Can modify prompts at batch level
-   - Passed to StatefulDataLoader at trainer line 503
-
-3. Training loop (verl/trainer/ppo/ray_trainer.py line 959)
-   - After: batch_dict = next(train_dataloader)
-   - Before: batch = DataProto.from_single_dict(batch_dict)
-   - Can modify batch_dict directly here
-
-4. Epoch start (verl/trainer/ppo/ray_trainer.py line 945)
-   - Before: for epoch in range(total_epochs)
-   - Regenerate entire dataset with updated prompts per epoch
-
-This file implements Option A: Custom Dataset with dynamic prompt generation.
+GRPO training script for Omni-MATH dataset using verl with Ray for distributed training.
+Configured for 2 nodes, each with 8 H100 GPUs (16 GPUs total).
+Uses Hydra to properly load verl's default configs and override specific values.
 """
 
 import os
@@ -80,26 +26,6 @@ else:
 # vLLM 0.8.5 V1 engine works fine, but keep this for compatibility with older versions
 os.environ.setdefault("VLLM_USE_V1", "0")
 
-# Use shared HF cache so all worker nodes can access cached models
-os.environ.setdefault("HF_HOME", "/mnt/task_runtime/.hf_cache")
-
-# Force HuggingFace OFFLINE MODE to prevent API calls and 504 timeouts
-# This MUST be set before any HuggingFace imports
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_DATASETS_OFFLINE"] = "1"
-
-# Set sglang watchdog timeout BEFORE any sglang imports
-# Default is 300s (5 min) - if a forward batch takes longer, sglang kills the server
-# 3 minutes should be plenty for any single generation with our batch sizes
-# If generations are taking longer than 3 minutes, something is wrong and we want to know
-try:
-    from sglang.srt.server_args import ServerArgs
-    ServerArgs.watchdog_timeout = 180  # 3 minutes - faster detection of stuck workers
-    print(f"[INFO] Set sglang watchdog_timeout to {ServerArgs.watchdog_timeout}s (3 min)")
-except ImportError:
-    pass  # sglang not installed yet
-
 # Tell wandb to save code with each run
 os.environ["WANDB_SAVE_CODE"] = "true"
 
@@ -116,21 +42,19 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full
 SYSTEM_PROMPT_NAME = "full_solution_simple"
 
 HINT_LEVEL = -1
-VAL_SIZE = 256
+VAL_SIZE = 128
 PROMPT_UPDATE_ENABLED = True
-# ONE-TURN MODE: Generate with hints already in prompt, evaluate immediately
-PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 1  # Single turn: generate and evaluate
-PROMPT_UPDATE_MAX_USER_TURNS = 1
-PROMPT_RESET_PREFIX = "__RESET_PROMPT__\n"  # Kept for compatibility
+PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
+PROMPT_UPDATE_MAX_USER_TURNS = 2
+PROMPT_RESET_PREFIX = "__RESET_PROMPT__\n"
 PROMPT_RESET_SYSTEM_TAG = "__SYSTEM__\n"
 PROMPT_RESET_USER_TAG = "__USER__\n"
-PROMPT_LOG_VALIDATION_MARKER = "__LOG_VALIDATION__\n"
+PROMPT_LOG_VALIDATION_MARKER = "__LOG_VALIDATION__\n"  # Marker to enable logging in _reset_request_prompt
 ENABLE_VALIDATION_INTERACTION = False
-ONE_TURN_MODE = True  # Enable one-turn mode with dynamic prompt generation
 #
-TRAIN_BATCH_SIZE = 256  # Batch size for training
+TRAIN_BATCH_SIZE = 64  # Batch size for training
 TOTAL_EPOCHS = 50
-TEST_BATCH_SIZE = 256  # Reduced for faster validation
+TEST_BATCH_SIZE = 64  # Reduced for faster validation
 
 
 
@@ -256,14 +180,10 @@ import torch
 
 # =============================================================================
 # CENTRALIZED CRASH LOGGING - Writes to shared filesystem for all nodes
-# All nodes write to /mnt/task_runtime/sbys_hinting/crash_logs/ via NFS
 # =============================================================================
 _CRASH_LOG_DIR = os.path.join(os.path.dirname(__file__), "crash_logs")
 _CRASH_LOG_LOCK = threading.Lock()
 _PROCESS_START_TIME = datetime.datetime.now()
-_HEARTBEAT_THREAD = None
-_HEARTBEAT_STOP = threading.Event()
-_WORKER_STATE = {"phase": "init", "iteration": 0, "last_activity": None}
 
 def get_node_identifier():
     """Get a unique identifier for this node."""
@@ -274,84 +194,6 @@ def get_node_identifier():
         ip = "unknown"
     pid = os.getpid()
     return f"{hostname}_{ip}_{pid}"
-
-def get_detailed_system_info():
-    """Get detailed system info for crash diagnosis."""
-    info = {
-        "hostname": socket.gethostname(),
-        "pid": os.getpid(),
-        "ppid": os.getppid(),
-        "cwd": os.getcwd(),
-    }
-    
-    # Get IP address
-    try:
-        info["ip"] = socket.gethostbyname(socket.gethostname())
-    except:
-        info["ip"] = "unknown"
-    
-    # Get GPU info
-    try:
-        if torch.cuda.is_available():
-            info["cuda_device_count"] = torch.cuda.device_count()
-            info["cuda_current_device"] = torch.cuda.current_device()
-            info["gpu_memory"] = []
-            for i in range(torch.cuda.device_count()):
-                mem_allocated = torch.cuda.memory_allocated(i) / 1024**3
-                mem_reserved = torch.cuda.memory_reserved(i) / 1024**3
-                mem_total = torch.cuda.get_device_properties(i).total_memory / 1024**3
-                info["gpu_memory"].append({
-                    "device": i,
-                    "allocated_gb": round(mem_allocated, 2),
-                    "reserved_gb": round(mem_reserved, 2),
-                    "total_gb": round(mem_total, 2),
-                    "free_gb": round(mem_total - mem_reserved, 2),
-                })
-    except Exception as e:
-        info["gpu_error"] = str(e)
-    
-    # Get memory info
-    try:
-        import resource
-        rusage = resource.getrusage(resource.RUSAGE_SELF)
-        info["memory_mb"] = rusage.ru_maxrss / 1024  # Convert KB to MB
-    except:
-        pass
-    
-    # Get thread info
-    info["thread_count"] = threading.active_count()
-    info["thread_names"] = [t.name for t in threading.enumerate()]
-    
-    # Get worker state
-    info["worker_state"] = dict(_WORKER_STATE)
-    
-    return info
-
-def update_worker_state(phase: str = None, iteration: int = None, **kwargs):
-    """Update the current worker state for crash diagnosis."""
-    global _WORKER_STATE
-    now = datetime.datetime.now()
-    
-    # Track phase transition timing for stuck detection
-    if phase is not None:
-        old_phase = _WORKER_STATE.get("phase")
-        if old_phase != phase:
-            # Log phase transition
-            phase_start = _WORKER_STATE.get("_phase_start_time")
-            if phase_start and old_phase:
-                phase_duration = (now - datetime.datetime.fromisoformat(phase_start)).total_seconds()
-                # Log if phase took too long (potential stuck indicator)
-                if phase_duration > 60:  # More than 60 seconds in one phase
-                    print(f"[STUCK DETECTION] Phase '{old_phase}' took {phase_duration:.1f}s (>60s) before transitioning to '{phase}'")
-                    print(f"[STUCK DETECTION] Worker state: {_WORKER_STATE}")
-            _WORKER_STATE["_prev_phase"] = old_phase
-            _WORKER_STATE["_phase_start_time"] = now.isoformat()
-        _WORKER_STATE["phase"] = phase
-    
-    if iteration is not None:
-        _WORKER_STATE["iteration"] = iteration
-    _WORKER_STATE["last_activity"] = now.isoformat()
-    _WORKER_STATE.update(kwargs)
 
 def log_crash(error_type: str, error_msg: str, stack_trace: str = None, extra_info: dict = None):
     """Log a crash/error to the shared crash log directory.
@@ -364,16 +206,31 @@ def log_crash(error_type: str, error_msg: str, stack_trace: str = None, extra_in
         
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         node_id = get_node_identifier()
-        system_info = get_detailed_system_info()
+        
+        # Get GPU memory info if available
+        gpu_info = None
+        try:
+            if torch.cuda.is_available():
+                gpu_info = []
+                for i in range(torch.cuda.device_count()):
+                    mem_allocated = torch.cuda.memory_allocated(i) / 1024**3
+                    mem_reserved = torch.cuda.memory_reserved(i) / 1024**3
+                    gpu_info.append({
+                        "device": i,
+                        "allocated_gb": round(mem_allocated, 2),
+                        "reserved_gb": round(mem_reserved, 2)
+                    })
+        except:
+            pass
         
         log_entry = {
             "timestamp": timestamp,
             "node_id": node_id,
             "error_type": error_type,
-            "error_msg": str(error_msg)[:2000],  # Limit size
-            "stack_trace": (stack_trace or traceback.format_exc())[:10000],  # Limit size
+            "error_msg": str(error_msg),
+            "stack_trace": stack_trace or traceback.format_exc(),
             "extra_info": extra_info or {},
-            "system_info": system_info,
+            "gpu_info": gpu_info,
             "uptime_seconds": (datetime.datetime.now() - _PROCESS_START_TIME).total_seconds(),
         }
         
@@ -388,67 +245,17 @@ def log_crash(error_type: str, error_msg: str, stack_trace: str = None, extra_in
         with open(node_log, "a") as f:
             f.write(f"\n{'='*80}\n")
             f.write(f"[{timestamp}] {error_type}\n")
-            f.write(f"Node: {node_id}\n")
             f.write(f"Error: {error_msg}\n")
-            f.write(f"Worker State: {_WORKER_STATE}\n")
             if stack_trace:
                 f.write(f"Stack trace:\n{stack_trace}\n")
-            if system_info.get("gpu_memory"):
-                f.write(f"GPU Memory:\n")
-                for gpu in system_info["gpu_memory"]:
-                    f.write(f"  GPU {gpu['device']}: {gpu['allocated_gb']:.2f}GB allocated, {gpu['free_gb']:.2f}GB free / {gpu['total_gb']:.2f}GB total\n")
             if extra_info:
                 f.write(f"Extra info: {json.dumps(extra_info, indent=2)}\n")
+            if gpu_info:
+                f.write(f"GPU info: {json.dumps(gpu_info, indent=2)}\n")
         
         print(f"[CRASH_LOG] Logged {error_type} to {combined_log}", flush=True)
     except Exception as e:
         print(f"[CRASH_LOG] Failed to write crash log: {e}", flush=True)
-
-def log_heartbeat():
-    """Log a heartbeat to show this worker is alive."""
-    try:
-        os.makedirs(_CRASH_LOG_DIR, exist_ok=True)
-        
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        node_id = get_node_identifier()
-        system_info = get_detailed_system_info()
-        
-        heartbeat_entry = {
-            "timestamp": timestamp,
-            "node_id": node_id,
-            "type": "HEARTBEAT",
-            "uptime_seconds": (datetime.datetime.now() - _PROCESS_START_TIME).total_seconds(),
-            "worker_state": dict(_WORKER_STATE),
-            "gpu_memory": system_info.get("gpu_memory"),
-            "thread_count": system_info.get("thread_count"),
-        }
-        
-        # Write to heartbeat log (separate from crashes)
-        heartbeat_log = os.path.join(_CRASH_LOG_DIR, "heartbeats.jsonl")
-        with _CRASH_LOG_LOCK:
-            with open(heartbeat_log, "a") as f:
-                f.write(json.dumps(heartbeat_entry) + "\n")
-    except:
-        pass  # Don't crash on heartbeat failure
-
-def start_heartbeat_thread(interval_seconds=30):
-    """Start a background thread that logs heartbeats."""
-    global _HEARTBEAT_THREAD, _HEARTBEAT_STOP
-    
-    def heartbeat_loop():
-        while not _HEARTBEAT_STOP.is_set():
-            log_heartbeat()
-            _HEARTBEAT_STOP.wait(interval_seconds)
-    
-    _HEARTBEAT_STOP.clear()
-    _HEARTBEAT_THREAD = threading.Thread(target=heartbeat_loop, daemon=True, name="HeartbeatThread")
-    _HEARTBEAT_THREAD.start()
-    print(f"[INFO] Started heartbeat thread (interval={interval_seconds}s)", flush=True)
-
-def stop_heartbeat_thread():
-    """Stop the heartbeat thread."""
-    global _HEARTBEAT_STOP
-    _HEARTBEAT_STOP.set()
 
 def install_global_exception_handler():
     """Install a global exception handler that logs uncaught exceptions."""
@@ -512,359 +319,6 @@ def install_atexit_handler():
 install_global_exception_handler()
 install_signal_handlers()
 install_atexit_handler()
-
-# =============================================================================
-# DISTRIBUTED CRASH MONITOR - Ray actor that tracks all workers across nodes
-# =============================================================================
-CRASH_MONITOR_ACTOR_NAME = "crash_monitor_actor"
-_CRASH_MONITOR = None  # Will be set after ray.init()
-
-@ray.remote
-class CrashMonitorActor:
-    """Central actor that monitors all workers across all nodes.
-    
-    Workers register with this actor and send heartbeats.
-    If a worker stops sending heartbeats, we log its last known state.
-    """
-    
-    def __init__(self):
-        self._workers = {}  # worker_id -> {last_heartbeat, state, ip, etc.}
-        self._dead_workers = []  # List of workers that stopped responding
-        self._heartbeat_timeout = 120  # Consider dead after 2 min no heartbeat
-        self._check_interval = 30  # Check for dead workers every 30s
-        self._started = datetime.datetime.now()
-        
-        # Start background thread to check for dead workers
-        self._stop_checker = threading.Event()
-        self._checker_thread = threading.Thread(target=self._check_dead_workers, daemon=True)
-        self._checker_thread.start()
-        print(f"[CrashMonitor] Started on head node", flush=True)
-    
-    def register_worker(self, worker_id: str, worker_info: dict) -> bool:
-        """Worker calls this on startup to register."""
-        self._workers[worker_id] = {
-            "registered_at": datetime.datetime.now().isoformat(),
-            "last_heartbeat": datetime.datetime.now(),
-            "heartbeat_count": 0,
-            "state": worker_info.get("state", {}),
-            "ip": worker_info.get("ip", "unknown"),
-            "hostname": worker_info.get("hostname", "unknown"),
-            "pid": worker_info.get("pid", 0),
-            "gpu_info": worker_info.get("gpu_info", []),
-        }
-        print(f"[CrashMonitor] Worker registered: {worker_id} from {worker_info.get('ip')}", flush=True)
-        return True
-    
-    def heartbeat(self, worker_id: str, state: dict, gpu_memory: list = None) -> bool:
-        """Worker calls this periodically to report it's alive."""
-        if worker_id not in self._workers:
-            # Auto-register if not registered
-            self._workers[worker_id] = {
-                "registered_at": datetime.datetime.now().isoformat(),
-                "last_heartbeat": datetime.datetime.now(),
-                "heartbeat_count": 0,
-                "state": state,
-                "ip": state.get("ip", "unknown"),
-            }
-        
-        worker = self._workers[worker_id]
-        worker["last_heartbeat"] = datetime.datetime.now()
-        worker["heartbeat_count"] += 1
-        worker["state"] = state
-        if gpu_memory:
-            worker["gpu_memory"] = gpu_memory
-        return True
-    
-    def report_crash(self, worker_id: str, error_type: str, error_msg: str, 
-                     stack_trace: str = None, extra_info: dict = None) -> bool:
-        """Worker calls this to report a crash before dying."""
-        crash_info = {
-            "worker_id": worker_id,
-            "timestamp": datetime.datetime.now().isoformat(),
-            "error_type": error_type,
-            "error_msg": error_msg[:2000],
-            "stack_trace": stack_trace[:10000] if stack_trace else None,
-            "extra_info": extra_info,
-            "last_known_state": self._workers.get(worker_id, {}).get("state"),
-        }
-        
-        # Log to file
-        crash_log = os.path.join(_CRASH_LOG_DIR, "distributed_crashes.jsonl")
-        os.makedirs(_CRASH_LOG_DIR, exist_ok=True)
-        with open(crash_log, "a") as f:
-            f.write(json.dumps(crash_info) + "\n")
-        
-        print(f"[CrashMonitor] CRASH REPORTED from {worker_id}: {error_type} - {error_msg[:100]}", flush=True)
-        
-        # Mark worker as dead
-        if worker_id in self._workers:
-            self._dead_workers.append({**self._workers[worker_id], "crash_info": crash_info})
-            del self._workers[worker_id]
-        
-        return True
-    
-    def _check_dead_workers(self):
-        """Background thread that checks for workers that stopped responding."""
-        while not self._stop_checker.is_set():
-            try:
-                now = datetime.datetime.now()
-                dead_workers = []
-                
-                for worker_id, info in list(self._workers.items()):
-                    last_hb = info["last_heartbeat"]
-                    if (now - last_hb).total_seconds() > self._heartbeat_timeout:
-                        dead_workers.append((worker_id, info))
-                
-                for worker_id, info in dead_workers:
-                    # Log the dead worker
-                    dead_info = {
-                        "worker_id": worker_id,
-                        "timestamp": now.isoformat(),
-                        "error_type": "HEARTBEAT_TIMEOUT",
-                        "error_msg": f"Worker stopped responding after {self._heartbeat_timeout}s",
-                        "last_heartbeat": info["last_heartbeat"].isoformat(),
-                        "heartbeat_count": info["heartbeat_count"],
-                        "last_known_state": info.get("state"),
-                        "last_gpu_memory": info.get("gpu_memory"),
-                        "ip": info.get("ip"),
-                    }
-                    
-                    crash_log = os.path.join(_CRASH_LOG_DIR, "distributed_crashes.jsonl")
-                    os.makedirs(_CRASH_LOG_DIR, exist_ok=True)
-                    with open(crash_log, "a") as f:
-                        f.write(json.dumps(dead_info) + "\n")
-                    
-                    print(f"[CrashMonitor] DEAD WORKER DETECTED: {worker_id} on {info.get('ip')}", flush=True)
-                    print(f"[CrashMonitor] Last state: {info.get('state')}", flush=True)
-                    print(f"[CrashMonitor] Last GPU memory: {info.get('gpu_memory')}", flush=True)
-                    
-                    self._dead_workers.append({**info, "death_type": "HEARTBEAT_TIMEOUT"})
-                    del self._workers[worker_id]
-                    
-            except Exception as e:
-                print(f"[CrashMonitor] Error checking dead workers: {e}", flush=True)
-            
-            self._stop_checker.wait(self._check_interval)
-    
-    def get_status(self) -> dict:
-        """Get current status of all workers."""
-        return {
-            "active_workers": len(self._workers),
-            "dead_workers": len(self._dead_workers),
-            "workers": {k: {**v, "last_heartbeat": v["last_heartbeat"].isoformat()} 
-                       for k, v in self._workers.items()},
-            "dead_worker_ids": [d.get("worker_id", d.get("ip", "unknown")) for d in self._dead_workers],
-        }
-    
-    def get_dead_workers(self) -> list:
-        """Get list of dead workers with their last known state."""
-        return self._dead_workers
-
-
-def get_or_create_crash_monitor():
-    """Get existing CrashMonitorActor or create a new one."""
-    try:
-        return ray.get_actor(CRASH_MONITOR_ACTOR_NAME, namespace="sbys_grpo")
-    except ValueError:
-        return CrashMonitorActor.options(
-            name=CRASH_MONITOR_ACTOR_NAME,
-            namespace="sbys_grpo",  # Use consistent namespace
-            lifetime="detached",
-            num_cpus=0.1,  # Minimal CPU usage
-        ).remote()
-
-
-def register_with_crash_monitor():
-    """Register this worker with the crash monitor."""
-    global _CRASH_MONITOR
-    try:
-        _CRASH_MONITOR = get_or_create_crash_monitor()
-        worker_id = get_node_identifier()
-        worker_info = {
-            "ip": socket.gethostbyname(socket.gethostname()),
-            "hostname": socket.gethostname(),
-            "pid": os.getpid(),
-            "state": dict(_WORKER_STATE),
-        }
-        try:
-            if torch.cuda.is_available():
-                worker_info["gpu_info"] = [
-                    {"device": i, "name": torch.cuda.get_device_name(i)}
-                    for i in range(torch.cuda.device_count())
-                ]
-        except:
-            pass
-        
-        ray.get(_CRASH_MONITOR.register_worker.remote(worker_id, worker_info))
-        print(f"[CrashMonitor] Registered with crash monitor as {worker_id}", flush=True)
-    except Exception as e:
-        print(f"[CrashMonitor] Failed to register: {e}", flush=True)
-
-
-def send_heartbeat_to_monitor():
-    """Send heartbeat to the crash monitor."""
-    global _CRASH_MONITOR
-    if _CRASH_MONITOR is None:
-        return
-    
-    try:
-        worker_id = get_node_identifier()
-        state = dict(_WORKER_STATE)
-        state["ip"] = socket.gethostbyname(socket.gethostname())
-        
-        # ==================== STUCK DETECTION ON HEARTBEAT ====================
-        # Check if worker has been in the same phase for too long
-        phase_start_str = _WORKER_STATE.get("_phase_start_time")
-        current_phase = _WORKER_STATE.get("phase", "unknown")
-        if phase_start_str:
-            try:
-                phase_start = datetime.datetime.fromisoformat(phase_start_str)
-                phase_duration = (datetime.datetime.now() - phase_start).total_seconds()
-                state["phase_duration_seconds"] = round(phase_duration, 1)
-                
-                # Log warning if stuck in a phase for too long
-                if phase_duration > 120:  # 2 minutes
-                    print(f"[STUCK ALERT] Worker stuck in phase '{current_phase}' for {phase_duration:.0f}s!")
-                    print(f"[STUCK ALERT] Worker state: {state}")
-                    if phase_duration > 300:  # 5 minutes
-                        print(f"[STUCK CRITICAL] Worker CRITICALLY stuck in '{current_phase}' for {phase_duration:.0f}s!")
-                        print(f"[STUCK CRITICAL] This may cause distributed barrier failures!")
-            except Exception as e:
-                pass  # Ignore parsing errors
-        
-        gpu_memory = None
-        try:
-            if torch.cuda.is_available():
-                gpu_memory = []
-                for i in range(torch.cuda.device_count()):
-                    gpu_memory.append({
-                        "device": i,
-                        "allocated_gb": round(torch.cuda.memory_allocated(i) / 1024**3, 2),
-                        "reserved_gb": round(torch.cuda.memory_reserved(i) / 1024**3, 2),
-                    })
-        except:
-            pass
-        
-        # Fire-and-forget heartbeat (don't block on it)
-        _CRASH_MONITOR.heartbeat.remote(worker_id, state, gpu_memory)
-    except Exception as e:
-        pass  # Don't fail on heartbeat errors
-
-
-def report_crash_to_monitor(error_type: str, error_msg: str, stack_trace: str = None, extra_info: dict = None):
-    """Report a crash to the central monitor."""
-    global _CRASH_MONITOR
-    if _CRASH_MONITOR is None:
-        return
-    
-    try:
-        worker_id = get_node_identifier()
-        # Use ray.get with short timeout to ensure crash is reported before we die
-        ray.get(_CRASH_MONITOR.report_crash.remote(
-            worker_id, error_type, error_msg, stack_trace, extra_info
-        ), timeout=5)
-    except Exception as e:
-        print(f"[CrashMonitor] Failed to report crash: {e}", flush=True)
-
-
-# Override the heartbeat thread to also send to monitor
-def start_heartbeat_thread_v2(interval_seconds=30):
-    """Start a background thread that logs heartbeats to both file and monitor."""
-    global _HEARTBEAT_THREAD, _HEARTBEAT_STOP
-    
-    def heartbeat_loop():
-        while not _HEARTBEAT_STOP.is_set():
-            log_heartbeat()  # Original file-based heartbeat
-            send_heartbeat_to_monitor()  # New monitor-based heartbeat
-            _HEARTBEAT_STOP.wait(interval_seconds)
-    
-    _HEARTBEAT_STOP.clear()
-    _HEARTBEAT_THREAD = threading.Thread(target=heartbeat_loop, daemon=True, name="HeartbeatThread")
-    _HEARTBEAT_THREAD.start()
-    print(f"[INFO] Started heartbeat thread v2 (interval={interval_seconds}s)", flush=True)
-
-
-# =============================================================================
-# WORKER CRASH MONITORING - Initialize on remote workers
-# =============================================================================
-_WORKER_CRASH_MONITORING_INITIALIZED = False
-
-def init_worker_crash_monitoring():
-    """Initialize crash monitoring on a worker process.
-    
-    This should be called from PromptUpdateInteraction.__init__ to ensure
-    remote workers also register with the CrashMonitorActor and send heartbeats.
-    Safe to call multiple times - will only initialize once per process.
-    """
-    global _WORKER_CRASH_MONITORING_INITIALIZED, _CRASH_MONITOR
-    
-    if _WORKER_CRASH_MONITORING_INITIALIZED:
-        return  # Already initialized
-    
-    try:
-        # Try to connect to the existing CrashMonitorActor
-        try:
-            _CRASH_MONITOR = ray.get_actor(CRASH_MONITOR_ACTOR_NAME, namespace="sbys_grpo")
-        except ValueError:
-            # Actor doesn't exist yet, skip (head node will create it)
-            print(f"[WorkerCrashMonitor] CrashMonitorActor not found, skipping registration", flush=True)
-            _WORKER_CRASH_MONITORING_INITIALIZED = True
-            return
-        
-        worker_id = get_node_identifier()
-        ip = socket.gethostbyname(socket.gethostname())
-        
-        # Build worker_info dict with all relevant info
-        worker_info = {
-            "ip": ip,
-            "hostname": socket.gethostname(),
-            "pid": os.getpid(),
-            "state": dict(_WORKER_STATE),
-            "gpu_info": [],
-        }
-        try:
-            if torch.cuda.is_available():
-                for i in range(torch.cuda.device_count()):
-                    worker_info["gpu_info"].append({
-                        "device": i,
-                        "name": torch.cuda.get_device_name(i),
-                    })
-        except:
-            pass
-        
-        # Register this worker
-        try:
-            ray.get(_CRASH_MONITOR.register_worker.remote(worker_id, worker_info), timeout=10)
-            print(f"[WorkerCrashMonitor] Registered worker {worker_id} from {ip}", flush=True)
-        except Exception as e:
-            print(f"[WorkerCrashMonitor] Failed to register: {e}", flush=True)
-        
-        # Start heartbeat thread (if not already running)
-        global _HEARTBEAT_THREAD
-        if _HEARTBEAT_THREAD is None or not _HEARTBEAT_THREAD.is_alive():
-            start_heartbeat_thread_v2(interval_seconds=15)
-            print(f"[WorkerCrashMonitor] Started heartbeat thread on {worker_id}", flush=True)
-        
-        # Update worker state to show we're a remote worker
-        update_worker_state(phase="worker_initialized", worker_type="remote_rollout_worker")
-        
-        _WORKER_CRASH_MONITORING_INITIALIZED = True
-        print(f"[WorkerCrashMonitor] Crash monitoring initialized on {worker_id}", flush=True)
-        
-    except Exception as e:
-        print(f"[WorkerCrashMonitor] Failed to initialize crash monitoring: {e}", flush=True)
-        _WORKER_CRASH_MONITORING_INITIALIZED = True  # Don't retry on failure
-
-
-# Override crash logger to also report to monitor
-_original_log_crash = log_crash
-def log_crash_v2(error_type: str, error_msg: str, stack_trace: str = None, extra_info: dict = None):
-    """Log crash to both file and central monitor."""
-    _original_log_crash(error_type, error_msg, stack_trace, extra_info)
-    report_crash_to_monitor(error_type, error_msg, stack_trace, extra_info)
-
-log_crash = log_crash_v2
-
 # =============================================================================
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
@@ -879,14 +333,6 @@ try:
     from verl.trainer.constants_ppo import PPO_RAY_RUNTIME_ENV
     PPO_RAY_RUNTIME_ENV.setdefault("env_vars", {})
     PPO_RAY_RUNTIME_ENV["env_vars"]["VLLM_USE_V1"] = "0"
-    # HuggingFace cache - use shared NFS path so workers don't need to re-download
-    HF_CACHE_PATH = "/mnt/task_runtime/.hf_cache"
-    PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HOME"] = HF_CACHE_PATH
-    PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HUB_CACHE"] = f"{HF_CACHE_PATH}/hub"
-    PPO_RAY_RUNTIME_ENV["env_vars"]["TRANSFORMERS_CACHE"] = f"{HF_CACHE_PATH}/transformers"
-    # Force offline mode to prevent HuggingFace API calls (causes 504 timeouts)
-    PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HUB_OFFLINE"] = "1"
-    PPO_RAY_RUNTIME_ENV["env_vars"]["TRANSFORMERS_OFFLINE"] = "1"
     # NCCL P2P workaround for hardware issues
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_IGNORE_DISABLED_P2P"] = "1"
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_P2P_DISABLE"] = "1"
@@ -899,8 +345,6 @@ try:
     # Torch distributed settings for better error reporting
     PPO_RAY_RUNTIME_ENV["env_vars"]["TORCH_DISTRIBUTED_DEBUG"] = "OFF"  # Set to DETAIL for debugging
     PPO_RAY_RUNTIME_ENV["env_vars"]["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"  # Better error handling
-    # Gloo timeout for CPU barriers (prevents Connection closed by peer errors)
-    PPO_RAY_RUNTIME_ENV["env_vars"]["GLOO_SOCKET_TIMEOUT"] = "3600000"  # 1 hour in milliseconds
     # Add PYTHONPATH so verl workers can import sbys_hinting module
     PPO_RAY_RUNTIME_ENV["env_vars"]["PYTHONPATH"] = _parent_dir
     # Add CUDA library paths for sglang subprocesses
@@ -961,8 +405,8 @@ def parse_args():
     return parser.parse_args()
 
 # Distributed training configuration
-# 1 node, 8 GPUs = 8 GPUs total
-NUM_NODES = 8
+# 2 nodes, 8 GPUs per node = 16 GPUs total
+NUM_NODES = 4  # Debugging NCCL timeout
 GPUS_PER_NODE = 8
 
 
@@ -1086,78 +530,9 @@ class ProblemStateActor:
         """Get state for a problem, returns None if not exists."""
         return self._problem_state.get(problem_key)
     
-    def get_states_batch(self, problem_keys: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
-        """Get states for multiple problems in a single call (reduces actor contention)."""
-        return {key: self._problem_state.get(key) for key in problem_keys}
-    
     def set_state(self, problem_key: str, state: Dict[str, Any]) -> None:
         """Set state for a problem."""
         self._problem_state[problem_key] = state
-    
-    def process_turn1_batch(self, problem_keys: List[str], target_count: int = 8) -> Dict[str, int]:
-        """Process Turn 1 for multiple problems in a single call.
-        
-        Increments turn_counter for each problem and returns the new counter values.
-        Much more efficient than calling increment_turn_counter individually.
-        """
-        results = {}
-        for key in problem_keys:
-            if key in self._problem_state:
-                state = self._problem_state[key]
-                counter = state.get("turn_counter", 0) + 1
-                state["turn_counter"] = counter
-                results[key] = counter
-        return results
-    
-    def process_turn2_batch(self, updates: List[Dict[str, Any]], target_count: int = 8) -> Dict[str, tuple]:
-        """Process Turn 2 for multiple problems in a single call.
-        
-        Each update dict should contain: problem_key, is_correct
-        Returns dict of problem_key -> (update_success, old_try_index, new_try_index, state)
-        """
-        results = {}
-        for update in updates:
-            key = update["problem_key"]
-            is_correct = update["is_correct"]
-            
-            if key not in self._problem_state:
-                results[key] = (False, 0, 0, {})
-                continue
-                
-            state = self._problem_state[key]
-            counter = state.get("turn_counter", 0) + 1
-            state["turn_counter"] = counter
-            
-            # Check if this call claims the update (hits target_count)
-            if counter == target_count:
-                old_try_index = state.get("try_index", 0)
-                able = state.get("able_index", 0)
-                unable = state.get("unable_index", 0)
-                
-                if is_correct:
-                    # Correct: move able_index down (need fewer hints)
-                    able = old_try_index
-                else:
-                    # Incorrect: move unable_index up (need more hints)
-                    unable = old_try_index + 1
-                
-                # Binary search: next try is midpoint
-                new_try_index = (able + unable) // 2
-                
-                state["able_index"] = able
-                state["unable_index"] = unable
-                state["try_index"] = new_try_index
-                state["total_attempts"] = state.get("total_attempts", 0) + 1
-                if is_correct:
-                    state["total_correct"] = state.get("total_correct", 0) + 1
-                state["turn_counter"] = 0  # Reset for next step
-                state["last_verified_attempts"] = state.get("total_attempts", 0)
-                
-                results[key] = (True, old_try_index, new_try_index, dict(state))
-            else:
-                results[key] = (False, state.get("try_index", 0), state.get("try_index", 0), dict(state))
-        
-        return results
     
     def update_state(self, problem_key: str, updates: Dict[str, Any]) -> Dict[str, Any]:
         """Update specific fields in problem state and return the updated state."""
@@ -1183,27 +558,6 @@ class ProblemStateActor:
             "total_correct": total_correct,
         }
     
-    def verify_counters_reset(self, problem_keys: List[str]) -> Dict[str, Any]:
-        """Verify that turn_counter is 0 for all specified problems.
-        
-        Called after each GRPO step to ensure all counters were properly reset.
-        
-        Returns:
-            Dict with 'all_zero': bool, 'non_zero_problems': list of (key, counter) tuples
-        """
-        non_zero = []
-        for key in problem_keys:
-            if key in self._problem_state:
-                counter = self._problem_state[key].get("turn_counter", 0)
-                if counter != 0:
-                    non_zero.append((key[:50], counter))
-        
-        return {
-            "all_zero": len(non_zero) == 0,
-            "non_zero_problems": non_zero,
-            "checked_count": len(problem_keys),
-        }
-    
     def initialize_all_problems(self, problems_data: List[Dict[str, Any]]) -> int:
         """Initialize state for all problems at once (called at start of training).
         
@@ -1225,143 +579,9 @@ class ProblemStateActor:
                     "try_index": 0,
                     "total_attempts": 0,
                     "total_correct": 0,
-                    "turn_counter": 0,  # For race-free state updates
-                    "last_verified_attempts": -1,  # Sentinel for step completion verification
                 }
                 count += 1
         return count
-    
-    def increment_turn_counter(self, problem_key: str, target_count: int = 8) -> int:
-        """Increment the turn counter. Called in both Turn 1 and Turn 2.
-        
-        Returns the counter value AFTER increment.
-        
-        VERIFICATION: When counter transitions from 0 to 1 (first increment of a new step),
-        we check if total_attempts increased since the last time counter was 0.
-        If not, the previous step didn't complete (counter never hit target_count).
-        """
-        if problem_key not in self._problem_state:
-            return 0
-        state = self._problem_state[problem_key]
-        counter = state.get("turn_counter", 0)
-        total_attempts = state.get("total_attempts", 0)
-        last_verified_attempts = state.get("last_verified_attempts", -1)
-        
-        # VERIFICATION: First increment of a new step (counter == 0)
-        if counter == 0:
-            # Check if total_attempts increased since last time we started a step
-            # If not (and this isn't the first step), the previous step didn't complete!
-            if last_verified_attempts != -1 and total_attempts == last_verified_attempts:
-                error_msg = (
-                    f"FATAL ERROR: Previous step did not complete!\n"
-                    f"Counter is 0 but total_attempts ({total_attempts}) did not increase since last step.\n"
-                    f"This means counter never reached {target_count} in the previous step.\n"
-                    f"Problem key: {problem_key[:100]}..."
-                )
-                print(f"[ProblemStateActor] {error_msg}")
-                raise RuntimeError(error_msg)
-            
-            # Mark current total_attempts as verified (we'll check it increased at next step start)
-            state["last_verified_attempts"] = total_attempts
-        
-        elif counter >= target_count:
-            # Counter should have been reset when it hit target_count
-            error_msg = (
-                f"FATAL ERROR: turn_counter ({counter}) >= target ({target_count}) at start of increment!\n"
-                f"Previous step did not reset counter properly.\n"
-                f"Problem key: {problem_key[:100]}..."
-            )
-            print(f"[ProblemStateActor] {error_msg}")
-            raise RuntimeError(error_msg)
-        
-        counter += 1
-        state["turn_counter"] = counter
-        return counter
-    
-    def try_claim_and_update(self, problem_key: str, is_correct: bool, target_count: int) -> tuple:
-        """Try to claim this step's update. Only the generation that hits target_count wins.
-        
-        Counter-based approach (RACE-FREE for any interleaving):
-        - Turn 1: Each of 4 generations increments counter (+4 total)
-        - Turn 2: Each of 4 generations increments counter (+4 total)
-        - Total per step = 8 (n_samples_per_prompt * 2)
-        - Only the generation whose increment hits exactly target_count claims
-        - After claiming, reset counter to 0 for next step
-        
-        Returns:
-            (success, old_try_index, new_try_index, state)
-        """
-        import math
-        
-        state = self._problem_state.get(problem_key, {})
-        old_try_index = state.get("try_index", 0)
-        
-        # Increment counter and check if we hit the target
-        counter = state.get("turn_counter", 0) + 1
-        state["turn_counter"] = counter
-        
-        # SANITY CHECK: Counter should NEVER exceed target_count
-        # If it does, something is seriously wrong (duplicate calls, missing reset, etc.)
-        if counter > target_count:
-            error_msg = (
-                f"FATAL ERROR: turn_counter ({counter}) exceeded target ({target_count})!\n"
-                f"This indicates a bug: duplicate calls, missing reset, or race condition.\n"
-                f"Problem key: {problem_key[:100]}...\n"
-                f"State: total_attempts={state.get('total_attempts')}, "
-                f"try_index={state.get('try_index')}, "
-                f"able_index={state.get('able_index')}, "
-                f"unable_index={state.get('unable_index')}"
-            )
-            print(f"[ProblemStateActor] {error_msg}")
-            # Save state for debugging before crashing
-            self._problem_state[problem_key] = state
-            raise RuntimeError(error_msg)
-        
-        if counter != target_count:
-            # Not the last one, don't claim
-            self._problem_state[problem_key] = state
-            return False, old_try_index, old_try_index, state
-        
-        # We hit the target! Claim and reset counter for next step
-        state["turn_counter"] = 0
-        
-        # Apply updates
-        state["total_attempts"] = state.get("total_attempts", 0) + 1
-        if is_correct:
-            state["total_correct"] = state.get("total_correct", 0) + 1
-        
-        # Binary search logic to update try_index
-        try_index = state.get("try_index", 0)
-        able_index = state.get("able_index", 0)
-        unable_index = state.get("unable_index", 0)
-        guide_steps_count = state.get("guide_steps_count", 0)
-        
-        if try_index <= unable_index and is_correct:
-            state["able_index"] = try_index
-            if try_index == unable_index:
-                state["try_index"] = try_index - 1
-            else:
-                state["try_index"] = try_index - (unable_index - try_index)
-            state["try_index"] = max(state["try_index"], 0)
-        elif try_index >= able_index and not is_correct:
-            state["unable_index"] = try_index
-            if try_index == able_index:
-                state["try_index"] = try_index + 1
-            else:
-                state["try_index"] = try_index + (try_index - able_index)
-            state["try_index"] = min(state["try_index"], guide_steps_count)
-        else:
-            if not is_correct:
-                state["unable_index"] = try_index
-                state["try_index"] = math.ceil((try_index + able_index) / 2)
-            else:
-                state["able_index"] = try_index
-                state["try_index"] = math.floor((try_index + unable_index) / 2)
-        
-        new_try_index = state["try_index"]
-        self._problem_state[problem_key] = state
-        
-        return True, old_try_index, new_try_index, state
 
 
 # Global name for the shared actor
@@ -1372,286 +592,14 @@ def get_or_create_problem_state_actor():
     """Get existing ProblemStateActor or create a new one."""
     try:
         # Try to get existing actor
-        return ray.get_actor(PROBLEM_STATE_ACTOR_NAME, namespace="sbys_grpo")
+        return ray.get_actor(PROBLEM_STATE_ACTOR_NAME)
     except ValueError:
         # Actor doesn't exist, create it
         return ProblemStateActor.options(
             name=PROBLEM_STATE_ACTOR_NAME,
-            namespace="sbys_grpo",  # Use consistent namespace
             lifetime="detached",  # Survives driver failure
             max_concurrency=2000,  # Must handle TRAIN_BATCH_SIZE * n concurrent requests (256 * 4 = 1024+)
         ).remote()
-
-
-# =============================================================================
-# DYNAMIC HINT DATASET - Queries state actor at __getitem__ time (runs on head node)
-# =============================================================================
-
-# Global actor name for lookup (avoids storing actor reference in dataset)
-PROBLEM_STATE_ACTOR_NAME = "ProblemStateActor"
-
-class DynamicHintDataset(torch.utils.data.Dataset):
-    """
-    Dataset that queries ProblemStateActor for try_index and builds prompts WITH hints.
-    
-    KEY DESIGN: __getitem__ runs on HEAD NODE where Ray is accessible.
-    We DON'T store the actor reference - we look it up by name using ray.get_actor().
-    This avoids serialization issues when the dataset metadata is sent to workers.
-    
-    The batch (with tokenized prompts including hints) is then sent to workers as tensors.
-    """
-    
-    def __init__(self, base_data: list, tokenizer, max_prompt_length: int = 4096):
-        """
-        Args:
-            base_data: List of dicts with 'problem', 'answer', 'sbys_solution' keys
-            tokenizer: HuggingFace tokenizer
-            max_prompt_length: Maximum prompt length in tokens
-        """
-        self.base_data = base_data
-        self.tokenizer = tokenizer
-        self.max_prompt_length = max_prompt_length
-        
-        # System prompts (loaded once)
-        self._system_prompt_no_hints = load_system_prompt("full_solution_simple")
-        self._system_prompt_with_hints = load_system_prompt("full_solution_with_hint")
-        
-        # Cache for state lookups within a batch/epoch
-        self._state_cache = {}
-        self._cache_hits = 0
-        self._cache_misses = 0
-        self._log_count = 0
-        
-        print(f"[DynamicHintDataset] Initialized with {len(base_data)} samples (no actor reference stored)")
-    
-    def __len__(self):
-        return len(self.base_data)
-    
-    def _get_state_actor(self):
-        """Look up ProblemStateActor by name. Called at __getitem__ time on head node."""
-        try:
-            return ray.get_actor(PROBLEM_STATE_ACTOR_NAME)
-        except ValueError:
-            return None
-    
-    def _get_try_index(self, problem: str) -> int:
-        """Get current try_index for a problem, using cache."""
-        if problem in self._state_cache:
-            self._cache_hits += 1
-            return self._state_cache[problem]
-        
-        self._cache_misses += 1
-        
-        actor = self._get_state_actor()
-        if actor is None:
-            self._state_cache[problem] = 0
-            return 0
-        
-        try:
-            state = ray.get(actor.get_state.remote(problem), timeout=2)
-            try_index = (state or {}).get("try_index", 0)
-            self._state_cache[problem] = try_index
-            return try_index
-        except Exception:
-            self._state_cache[problem] = 0
-            return 0
-    
-    def _build_prompt_with_hints(self, problem: str, sbys_solution: list, try_index: int) -> list:
-        """Build chat messages with hints based on try_index."""
-        if try_index > 0 and sbys_solution and len(sbys_solution) >= try_index:
-            partial_answer = "\n".join(sbys_solution[:try_index])
-            user_content = f"Problem: {problem}\nIncomplete proof: {partial_answer}\n"
-            system_prompt = self._system_prompt_with_hints
-        else:
-            user_content = f"Problem: {problem}\n"
-            system_prompt = self._system_prompt_no_hints
-        
-        return [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
-        ]
-    
-    def __getitem__(self, idx):
-        """Get sample with prompt built using CURRENT try_index from ProblemStateActor."""
-        item = self.base_data[idx]
-        problem = item["problem"]
-        answer = item["answer"]
-        sbys_solution = item.get("sbys_solution", [])
-        
-        # Query current try_index (cached within batch/epoch)
-        try_index = self._get_try_index(problem)
-        
-        # Build prompt WITH hints
-        messages = self._build_prompt_with_hints(problem, sbys_solution, try_index)
-        
-        # Tokenize
-        raw_prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-        model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
-        input_ids = model_inputs["input_ids"]
-        attention_mask = model_inputs["attention_mask"]
-        
-        # Truncate/pad
-        from verl.utils.torch_functional import postprocess_data
-        input_ids, attention_mask = postprocess_data(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_length=self.max_prompt_length,
-            pad_token_id=self.tokenizer.pad_token_id,
-            left_pad=True,
-            truncation="left",
-        )
-        
-        position_ids = compute_position_id_with_mask(attention_mask)
-        
-        raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
-        if len(raw_prompt_ids) > self.max_prompt_length:
-            raw_prompt_ids = raw_prompt_ids[-self.max_prompt_length:]
-        
-        # Log first few samples
-        self._log_count += 1
-        if self._log_count <= 5:
-            print(f"[DynamicHintDataset] #{self._log_count}: try_index={try_index}, has_hints={try_index > 0}, prompt_len={len(raw_prompt_ids)}")
-        
-        return {
-            "input_ids": input_ids[0],
-            "attention_mask": attention_mask[0],
-            "position_ids": position_ids[0],
-            "raw_prompt_ids": raw_prompt_ids,
-            "raw_prompt": messages,
-            "ground_truth": answer,
-            "data_source": "omni_math",
-            "index": idx,
-            "tools_kwargs": {},
-            "interaction_kwargs": {
-                "ground_truth": answer,
-                "problem": problem,
-                "sbys_solution": sbys_solution,
-                "try_index": try_index,
-                "is_validation": False,
-            },
-        }
-    
-    def invalidate_cache(self):
-        """Clear cache - call at epoch/step boundaries to refresh try_index values."""
-        hits = self._cache_hits
-        misses = self._cache_misses
-        hit_rate = hits / max(1, hits + misses) * 100
-        print(f"[DynamicHintDataset] Cache: {hits} hits, {misses} misses ({hit_rate:.1f}% hit rate)")
-        self._state_cache.clear()
-        self._cache_hits = 0
-        self._cache_misses = 0
-        self._log_count = 0
-        print(f"[DynamicHintDataset] Cache invalidated")
-
-
-# =============================================================================
-# ONE-TURN EVALUATION INTERACTION
-# =============================================================================
-
-class OneTurnEvalInteraction(BaseInteraction):
-    """
-    ONE-TURN Interaction: Evaluate generation and update state.
-    
-    Prompts WITH hints are built by DynamicHintDataset at __getitem__ time,
-    so by the time this interaction is called, the prompt already contains hints.
-    
-    This interaction just:
-    1. Evaluates the model's response (compute reward)
-    2. Updates try_index in ProblemStateActor
-    """
-    
-    def __init__(self, config):
-        super().__init__(config)
-        self._state_actor = get_or_create_problem_state_actor()
-        init_worker_crash_monitoring()
-        print(f"[OneTurnEvalInteraction] Initialized on worker")
-    
-    async def generate_response(self, instance_id, messages, **kwargs):
-        """
-        Single turn: Evaluate the generation and update state.
-        
-        Returns: (should_terminate, content, reward, metrics)
-        """
-        import time as _time
-        _start = _time.time()
-        
-        try:
-            # Extract kwargs
-            ground_truth = kwargs.get("ground_truth")
-            problem = kwargs.get("problem")
-            sbys_solution = kwargs.get("sbys_solution", [])
-            try_index = kwargs.get("try_index", 0)  # The try_index used for this prompt
-            is_validation = kwargs.get("is_validation", False)
-            
-            # For validation, just return immediately
-            if is_validation:
-                return True, "", 0.0, {"mode": "validation", "skipped": True}
-            
-            # Extract the assistant's response
-            last_assistant = ""
-            for msg in reversed(messages):
-                if msg.get("role") == "assistant":
-                    last_assistant = msg.get("content", "")
-                    break
-            
-            # Compute reward
-            reward = compute_score(solution_str=last_assistant, ground_truth=ground_truth)
-            boxed_answer = extract_boxed_answer(last_assistant) or "N/A"
-            is_correct = reward > 0.5
-            
-            # Update state in ProblemStateActor
-            # In one-turn mode, each generation updates state immediately
-            # Counter-based approach: with n=4 samples, the 4th one wins
-            N_SAMPLES_PER_PROMPT = 4
-            TARGET_COUNT = N_SAMPLES_PER_PROMPT  # Only 1 turn, so target is just n
-            
-            result = await self._safe_actor_call(
-                self._state_actor.try_claim_and_update.remote(problem, is_correct, TARGET_COUNT),
-                timeout_seconds=30,
-                default=(False, try_index, try_index, {}),
-                call_name="try_claim_and_update"
-            )
-            update_success, old_try_index, new_try_index, updated_state = result
-            
-            _duration = _time.time() - _start
-            
-            if update_success:
-                print(f"[OneTurnEval] WON update: try_index {old_try_index}->{new_try_index}, reward={reward}, time={_duration:.3f}s")
-            
-            # Terminate immediately (single turn)
-            return True, "", reward, {
-                "try_index": try_index,
-                "new_try_index": new_try_index,
-                "reward": reward,
-                "is_correct": is_correct,
-                "update_won": update_success,
-                "duration": _duration,
-            }
-            
-        except Exception as e:
-            import traceback
-            print(f"[OneTurnEvalInteraction] ERROR: {e}")
-            traceback.print_exc()
-            log_crash("ONE_TURN_EVAL_ERROR", str(e), traceback.format_exc())
-            return True, "", 0.0, {"error": str(e)}
-    
-    async def _safe_actor_call(self, coro, timeout_seconds=30, default=None, call_name="unknown"):
-        """Safely await a Ray actor call with timeout."""
-        import asyncio
-        import time as _time
-        _start = _time.time()
-        try:
-            result = await asyncio.wait_for(coro, timeout=timeout_seconds)
-            _duration = _time.time() - _start
-            if _duration > 2.0:
-                print(f"[OneTurnEval] SLOW actor call {call_name}: {_duration:.2f}s")
-            return result
-        except asyncio.TimeoutError:
-            print(f"[OneTurnEval] TIMEOUT: {call_name} after {timeout_seconds}s")
-            return default
-        except Exception as e:
-            print(f"[OneTurnEval] ERROR in {call_name}: {e}")
-            return default
 
 
 class PromptUpdateInteraction(BaseInteraction):
@@ -1663,20 +611,6 @@ class PromptUpdateInteraction(BaseInteraction):
     
     # Class-level dict to store Turn 1 info by problem_key (since instance_id changes between calls)
     _turn1_info_by_problem = {}
-    # Class-level dict to track Turn 1 start times for timing measurement
-    _turn1_start_times = {}
-    # Aggregated timing stats for periodic logging
-    _timing_stats = {
-        "turn1_count": 0,
-        "turn2_count": 0,
-        "turn1_durations": [],
-        "turn2_durations": [],
-        "generation_times": [],  # Time between Turn 1 end and Turn 2 start
-        "state_actor_durations": [],
-        "try_claim_durations": [],
-        "last_summary_at": 0,
-        "summary_interval": 50,  # Log summary every N turn2 completions
-    }
     
     def __init__(self, config):
         super().__init__(config)
@@ -1685,33 +619,6 @@ class PromptUpdateInteraction(BaseInteraction):
         self._state_actor = get_or_create_problem_state_actor()
         # Install the prompt reset hook on this worker (needed for multi-turn with prompt reset)
         install_prompt_reset_hook()
-        
-        # Initialize distributed crash monitoring on this worker (registers with CrashMonitorActor)
-        # This ensures remote workers also send heartbeats and report crashes
-        init_worker_crash_monitoring()
-        
-        # Cache our system prompts for turn detection
-        self._our_system_prompts = {
-            load_system_prompt("full_solution_simple_turn2"),  # No hints, Turn 2 variant
-            load_system_prompt("full_solution_with_hint"),      # With hints
-        }
-    
-    def _detect_turn_from_messages(self, messages) -> int:
-        """Detect if this is Turn 1 or Turn 2 by checking the system prompt.
-        
-        Turn 1: System prompt is the ORIGINAL from dataset (full_solution_simple or similar)
-        Turn 2: System prompt is one of OURS (full_solution_simple_turn2 or full_solution_with_hint)
-        
-        Returns: 1 for Turn 1, 2 for Turn 2
-        """
-        for msg in messages:
-            if msg.get("role") == "system":
-                system_content = msg.get("content", "")
-                if system_content in self._our_system_prompts:
-                    return 2  # This is our prompt from Turn 1's reset
-                else:
-                    return 1  # This is the original prompt from dataset
-        return 1  # Default to Turn 1 if no system message found
     
     ##generate_response returns a 4‑tuple:
     # 1) should_terminate_sequence (bool)
@@ -1734,7 +641,6 @@ class PromptUpdateInteraction(BaseInteraction):
         
         # Wrap entire method in try/except to prevent worker crashes
         try:
-            update_worker_state(phase="generate_response", instance_id=instance_id[:16])
             return await self._generate_response_impl(instance_id, messages, **kwargs)
         except Exception as e:
             # Log the error to centralized crash log AND console
@@ -1750,50 +656,23 @@ class PromptUpdateInteraction(BaseInteraction):
             # Return safe default: terminate with 0 reward
             return True, "", 0.0, {"error": str(e), "fallback": True}
     
-    async def _safe_actor_call(self, coro, timeout_seconds=30, default=None, call_name="unknown"):
+    async def _safe_actor_call(self, coro, timeout_seconds=30, default=None):
         """Safely await a Ray actor call with timeout and error handling."""
         import asyncio
-        import time as _time
-        _call_start = _time.time()
         try:
-            result = await asyncio.wait_for(coro, timeout=timeout_seconds)
-            _call_duration = _time.time() - _call_start
-            if _call_duration > 5.0:
-                print(f"[ACTOR CALL SLOW] {call_name} took {_call_duration:.2f}s (>5s)")
-            return result
+            return await asyncio.wait_for(coro, timeout=timeout_seconds)
         except asyncio.TimeoutError:
-            _call_duration = _time.time() - _call_start
-            print(f"[ACTOR CALL TIMEOUT] {call_name} TIMED OUT after {_call_duration:.2f}s (limit={timeout_seconds}s)")
-            print(f"[ACTOR CALL TIMEOUT] Worker state: {dict(_WORKER_STATE)}")
-            log_crash("ACTOR_TIMEOUT", f"Actor call '{call_name}' timed out after {timeout_seconds}s",
-                     extra_info={"call_name": call_name, "timeout": timeout_seconds})
+            print(f"[PromptUpdateInteraction] WARNING: Actor call timed out after {timeout_seconds}s")
+            log_crash("ACTOR_TIMEOUT", f"Actor call timed out after {timeout_seconds}s")
             return default
         except Exception as e:
-            _call_duration = _time.time() - _call_start
-            print(f"[ACTOR CALL FAILED] {call_name} failed after {_call_duration:.2f}s: {e}")
-            log_crash("ACTOR_CALL_FAILED", str(e), traceback.format_exc(),
-                     extra_info={"call_name": call_name})
+            print(f"[PromptUpdateInteraction] WARNING: Actor call failed: {e}")
+            log_crash("ACTOR_CALL_FAILED", str(e), traceback.format_exc())
             return default
     
     async def _generate_response_impl(self, instance_id, messages, **kwargs):
         """Internal implementation of generate_response with actual logic."""
         import math
-        import time as _time
-        
-        # ==================== DETAILED TIMING START ====================
-        _impl_start = _time.time()
-        _timing_log = {
-            "instance_id": instance_id[:16],
-            "impl_start": _impl_start,
-            "state_actor_calls": [],  # Track all state actor calls
-        }
-        
-        # Track detailed state for crash diagnosis
-        update_worker_state(
-            phase="generate_response_start",
-            instance_id=instance_id[:16],
-            message_count=len(messages),
-        )
         
         # Extract kwargs from interaction_kwargs
         ground_truth = kwargs.get("ground_truth")
@@ -1806,7 +685,6 @@ class PromptUpdateInteraction(BaseInteraction):
         # For validation, we don't want multi-turn interaction - just single generation
         # with scoring handled by custom_reward_function. Terminate immediately.
         if is_validation:
-            update_worker_state(phase="validation_skip")
             print(f"[PromptUpdateInteraction] VALIDATION mode - terminating immediately")
             # Return: (should_terminate=True, content="", reward=0.0, metrics={})
             # The actual reward will be computed by compute_score in custom_reward_function
@@ -1859,17 +737,11 @@ class PromptUpdateInteraction(BaseInteraction):
         
         # Get persistent state from Ray Actor (initialized at start of training)
         # Use safe wrapper with timeout to avoid blocking and handle actor issues gracefully
-        _get_state_start = _time.time()
         problem_state = await self._safe_actor_call(
             self._state_actor.get_state.remote(problem_key),
             timeout_seconds=30,
-            default=None,
-            call_name="get_state"
+            default=None
         )
-        _get_state_duration = _time.time() - _get_state_start
-        _timing_log["state_actor_calls"].append(("get_state", _get_state_duration))
-        if _get_state_duration > 1.0:
-            print(f"[TIMING WARNING] get_state took {_get_state_duration:.3f}s (>1s) for {instance_id[:8]}...")
         
         # Fallback initialization if state wasn't pre-initialized (shouldn't happen normally)
         if problem_state is None:
@@ -1881,23 +753,27 @@ class PromptUpdateInteraction(BaseInteraction):
                 "try_index": 0,
                 "total_attempts": 0,
                 "total_correct": 0,
+                "current_turn": 0,  # Track turn number per-problem (persists across instance_ids)
             }
-            _set_state_start = _time.time()
             await self._safe_actor_call(
                 self._state_actor.set_state.remote(problem_key, problem_state),
-                timeout_seconds=30,
-                call_name="set_state_init"
+                timeout_seconds=30
             )
-            _set_state_duration = _time.time() - _set_state_start
-            _timing_log["state_actor_calls"].append(("set_state_init", _set_state_duration))
-            if _set_state_duration > 1.0:
-                print(f"[TIMING WARNING] set_state (init) took {_set_state_duration:.3f}s (>1s)")
         
-        # Detect turn by checking system prompt content (not by counter!)
-        # Turn 1: System prompt is ORIGINAL from dataset
-        # Turn 2: System prompt is OURS (from Turn 1's reset)
-        current_turn = self._detect_turn_from_messages(messages)
-        print(f"[PromptUpdateInteraction] Detected turn {current_turn} via system prompt content")
+        # Ensure current_turn field exists (for backward compatibility with old state)
+        if "current_turn" not in problem_state:
+            problem_state["current_turn"] = 0
+        
+        # Increment turn counter (tracked by problem_key, not instance_id!)
+        # This is critical because verl uses different instance_ids for continuation calls
+        problem_state["current_turn"] = problem_state.get("current_turn", 0) + 1
+        current_turn = problem_state["current_turn"]
+        
+        # Persist the incremented turn immediately
+        await self._safe_actor_call(
+            self._state_actor.set_state.remote(problem_key, problem_state),
+            timeout_seconds=30
+        )
         
         # Keep instance_state for storing Turn 1 info needed by Turn 2
         if instance_id not in self._instance_state:
@@ -1908,12 +784,8 @@ class PromptUpdateInteraction(BaseInteraction):
         # Link instance_id to problem_key so Turn 2 can find Turn 1's stored info
         instance_state["problem_key"] = problem_key
         
-        import time as _time
-        _turn_start_time = _time.time()
-        print(f"[PromptUpdateInteraction] Turn {current_turn}, problem_key={problem_key[:50] if problem_key else None}... [timestamp={_turn_start_time:.3f}]")
+        print(f"[PromptUpdateInteraction] Turn {current_turn}, problem_key={problem_key[:50] if problem_key else None}...")
         print(f"[PromptUpdateInteraction] Persistent state: try_index={problem_state['try_index']}, able={problem_state['able_index']}, unable={problem_state['unable_index']}")
-        _timing_log["turn_detected"] = current_turn
-        _timing_log["turn_detection_time"] = _time.time() - _impl_start
         
         # Note: Validation state logging moved to Turn 2 where we have the reward
         
@@ -1924,21 +796,12 @@ class PromptUpdateInteraction(BaseInteraction):
             problem_state["able_index"] = len(sbys_solution)
             await self._safe_actor_call(
                 self._state_actor.set_state.remote(problem_key, problem_state),
-                timeout_seconds=30,
-                call_name="set_state_guide_steps_fix"
+                timeout_seconds=30
             )
         
         # ==================== TURN 1: Inject hints ====================
         # Ignore the initial generation (it had no hints), return prompt WITH hints
         if current_turn == 1:
-            _turn1_start = _time.time()
-            _timing_log["turn1_start"] = _turn1_start
-            update_worker_state(
-                phase="turn1_processing",
-                problem_key=problem_key[:50] if problem_key else None,
-                try_index=problem_state.get("try_index", 0),
-            )
-            print(f"[TIMING] Turn 1 START at {_turn1_start:.3f}, setup_time={_turn1_start - _impl_start:.3f}s")
             print(f"[PromptUpdateInteraction] Turn 1, problem_key={problem_key[:50]}..., try_index={problem_state['try_index']}")
             print(f"[PromptUpdateInteraction] Turn 1: problem={problem[:80] if problem else 'None'}...")
             print(f"[PromptUpdateInteraction] Turn 1: sbys_solution has {len(sbys_solution)} steps")
@@ -1966,11 +829,7 @@ class PromptUpdateInteraction(BaseInteraction):
             
             print(f"[PromptUpdateInteraction] Turn 1: updated_prompt={updated_prompt[:100]}...")
             
-            # Use turn2 variant of simple prompt so we can detect Turn 2 by checking system prompt
-            # "full_solution_simple" = original from dataset (Turn 1)
-            # "full_solution_simple_turn2" = our variant with "studying" instead of "learning" (Turn 2)
-            # "full_solution_with_hint" = our hint prompt (Turn 2)
-            system_prompt_name = "full_solution_with_hint" if problem_state["try_index"] > 0 else "full_solution_simple_turn2"
+            system_prompt_name = "full_solution_simple" if problem_state["try_index"] > 0 else "full_solution_with_hint"
             system_prompt = load_system_prompt(system_prompt_name)
             # Add validation marker if this is a validation sample (enables logging in _reset_request_prompt)
             validation_marker = PROMPT_LOG_VALIDATION_MARKER if is_validation else ""
@@ -1995,59 +854,12 @@ class PromptUpdateInteraction(BaseInteraction):
                 "problem": problem[:500] if problem else "None",
                 "ground_truth": ground_truth[:200] if ground_truth else "None",
             }
-            # Actually save turn1_info to class dict for retrieval in Turn 2
-            PromptUpdateInteraction._turn1_info_by_problem[problem_key] = turn1_info
-            
-            # Increment turn counter - FIRE AND FORGET (don't await)
-            # This is critical for performance: avoids 768 serialized actor calls per batch
-            # Each Turn 1 and Turn 2 increments by 1. Last one to reach target claims.
-            N_SAMPLES_PER_PROMPT = 4  # Must match actor_rollout_ref.rollout.n
-            TARGET_COUNT = N_SAMPLES_PER_PROMPT * 2  # 4 Turn 1s + 4 Turn 2s = 8
-            
-            # Track fire-and-forget call (we don't await but track when we sent it)
-            _increment_fire_time = _time.time()
-            self._state_actor.increment_turn_counter.remote(problem_key, TARGET_COUNT)  # No await!
-            _timing_log["state_actor_calls"].append(("increment_turn_counter_fire", 0.0))  # Fire and forget
-            
-            # Record Turn 1 end time for timing measurement
-            _turn1_end = _time.time()
-            _turn1_duration = _turn1_end - _turn1_start
-            PromptUpdateInteraction._turn1_start_times[problem_key] = _turn1_end
-            _timing_log["turn1_duration"] = _turn1_duration
-            _timing_log["turn1_end"] = _turn1_end
-            
-            # Log Turn 1 timing summary
-            print(f"[TIMING] Turn 1 END: total={_turn1_duration:.3f}s, instance={instance_id[:8]}")
-            if _turn1_duration > 5.0:
-                print(f"[TIMING WARNING] Turn 1 took {_turn1_duration:.3f}s (>5s) for {instance_id[:8]}")
-                print(f"[TIMING WARNING] State actor calls: {_timing_log['state_actor_calls']}")
-            
-            # Record timing stats (class-level aggregation)
-            PromptUpdateInteraction._timing_stats["turn1_count"] += 1
-            PromptUpdateInteraction._timing_stats["turn1_durations"].append(_turn1_duration)
-            # Keep only last 100 samples
-            if len(PromptUpdateInteraction._timing_stats["turn1_durations"]) > 100:
-                PromptUpdateInteraction._timing_stats["turn1_durations"] = PromptUpdateInteraction._timing_stats["turn1_durations"][-100:]
             
             # Return 0 reward for turn 1 (we're not evaluating this generation)
             # NOTE: The finalized prompt is logged in _reset_request_prompt when verl processes our reset_payload
-            return False, reset_payload, 0.0, {"turn": 1, "try_index": problem_state["try_index"], "turn1_duration": _turn1_duration}
+            return False, reset_payload, 0.0, {"turn": 1, "try_index": problem_state["try_index"]}
         
         # ==================== TURN 2: Evaluate and update state ====================
-        _turn2_start = _time.time()
-        _timing_log["turn2_start"] = _turn2_start
-        
-        # Calculate time since Turn 1 ended (this is approximately the generation time)
-        _turn1_end_time = PromptUpdateInteraction._turn1_start_times.get(problem_key, 0)
-        _generation_time_approx = _turn2_start - _turn1_end_time if _turn1_end_time > 0 else -1
-        _timing_log["generation_time_approx"] = _generation_time_approx
-        
-        update_worker_state(
-            phase="turn2_evaluating",
-            problem_key=problem_key[:50] if problem_key else None,
-            try_index=problem_state.get("try_index", 0),
-        )
-        print(f"[TIMING] Turn 2 START at {_turn2_start:.3f}, gen_time_approx={_generation_time_approx:.3f}s")
         print(f"[PromptUpdateInteraction] Turn 2: Evaluating generation for problem_key={problem_key[:50] if problem_key else None}...")
         
         # Extract the assistant's response
@@ -2057,14 +869,9 @@ class PromptUpdateInteraction(BaseInteraction):
                 last_assistant = msg.get("content", "")
                 break
 
-        # Compute reward (time this)
-        _compute_score_start = _time.time()
+        # Compute reward
         reward = compute_score(solution_str=last_assistant, ground_truth=ground_truth)
         boxed_answer = extract_boxed_answer(last_assistant) or "N/A"
-        _compute_score_duration = _time.time() - _compute_score_start
-        _timing_log["compute_score_duration"] = _compute_score_duration
-        if _compute_score_duration > 1.0:
-            print(f"[TIMING WARNING] compute_score took {_compute_score_duration:.3f}s (>1s)")
         
         print(f"[PromptUpdateInteraction] ground_truth={ground_truth[:50] if ground_truth else None}...")
         print(f"[PromptUpdateInteraction] boxed_answer={boxed_answer[:50] if boxed_answer else 'N/A'}...")
@@ -2134,104 +941,70 @@ class PromptUpdateInteraction(BaseInteraction):
             print(f">>> REWARD: {reward}")
             print("=" * 80 + "\n")
         
-        # ==================== RACE-FREE STATE UPDATE ====================
-        # Counter-based approach (works regardless of interleaving):
-        # - Turn 1: Each of 4 generations increments counter (+4)
-        # - Turn 2: Each of 4 generations increments counter (+4)
-        # - Total per step = 8 (N_SAMPLES_PER_PROMPT * 2)
-        # - The generation whose increment reaches exactly 8 claims and updates
-        # - After claiming, counter resets to 0 for next step
-        is_correct = reward > 0.5
-        N_SAMPLES_PER_PROMPT = 4  # Must match actor_rollout_ref.rollout.n
-        TARGET_COUNT = N_SAMPLES_PER_PROMPT * 2  # 4 Turn 1s + 4 Turn 2s = 8
-        
-        # Await this call - it updates try_index which must complete before next step
-        # Only 256 Turn 2 calls per batch (not 768), so this is acceptable
-        _try_claim_start = _time.time()
-        print(f"[TIMING] try_claim_and_update STARTING at {_try_claim_start:.3f} for {instance_id[:8]}...")
-        result = await self._safe_actor_call(
-            self._state_actor.try_claim_and_update.remote(problem_key, is_correct, TARGET_COUNT),
-            timeout_seconds=30,
-            default=(False, problem_state.get("try_index", 0), problem_state.get("try_index", 0), problem_state),
-            call_name="try_claim_and_update"
-        )
-        _try_claim_duration = _time.time() - _try_claim_start
-        _timing_log["state_actor_calls"].append(("try_claim_and_update", _try_claim_duration))
-        _timing_log["try_claim_duration"] = _try_claim_duration
-        if _try_claim_duration > 2.0:
-            print(f"[TIMING WARNING] try_claim_and_update took {_try_claim_duration:.3f}s (>2s) for {instance_id[:8]}")
-            print(f"[TIMING WARNING] This is a BLOCKING state actor call!")
-        
-        update_success, old_try_index, new_try_index, updated_state = result
-        
-        if update_success:
-            print(f"[PromptUpdateInteraction] WON update claim! Updated hint level: {old_try_index} -> {new_try_index}")
-        else:
-            print(f"[PromptUpdateInteraction] Turn 2 complete: try_index={old_try_index}, is_correct={is_correct}")
+        # Update persistent problem state statistics
+        problem_state["total_attempts"] = problem_state.get("total_attempts", 0) + 1
+        if reward > 0.5:
+            problem_state["total_correct"] = problem_state.get("total_correct", 0) + 1
 
+        # Check if solved without hints (try_index == 0 means no hints were given)
+        if reward > 0.5 and problem_state["try_index"] == 0:
+            print(f"[PromptUpdateInteraction] Correct without hints! attempts={problem_state['total_attempts']}, correct={problem_state['total_correct']}")
+            # Reset current_turn for next time this problem is seen
+            problem_state["current_turn"] = 0
+            await self._safe_actor_call(
+                self._state_actor.set_state.remote(problem_key, problem_state),
+                timeout_seconds=30
+            )
             # Clean up instance state and turn1_info
             if instance_id in self._instance_state:
                 del self._instance_state[instance_id]
             if hasattr(PromptUpdateInteraction, '_turn1_info_by_problem') and problem_key in PromptUpdateInteraction._turn1_info_by_problem:
                 del PromptUpdateInteraction._turn1_info_by_problem[problem_key]
-        if problem_key in PromptUpdateInteraction._turn1_start_times:
-            del PromptUpdateInteraction._turn1_start_times[problem_key]
+            return True, "", reward, {"correct": True, "try_index": 0, "turn": 2}
+
+        # Binary search logic to update try_index for NEXT time this problem is seen
+        old_try_index = problem_state["try_index"]
+        if problem_state["try_index"] <= problem_state["unable_index"] and reward > 0.5:
+            problem_state["able_index"] = problem_state["try_index"]
+            if problem_state["try_index"] == problem_state["unable_index"]:
+                problem_state["try_index"] = problem_state["try_index"] - 1
+            else:
+                problem_state["try_index"] = problem_state["try_index"] - (problem_state["unable_index"] - problem_state["try_index"])
+            problem_state["try_index"] = max(problem_state["try_index"], 0)
+        elif problem_state["try_index"] >= problem_state["able_index"] and reward < 0.5:
+            problem_state["unable_index"] = problem_state["try_index"]
+            if problem_state["try_index"] == problem_state["able_index"]:
+                problem_state["try_index"] = problem_state["try_index"] + 1
+            else:
+                problem_state["try_index"] = problem_state["try_index"] + (problem_state["try_index"] - problem_state["able_index"])
+            problem_state["try_index"] = min(problem_state["try_index"], problem_state["guide_steps_count"])
+        else:
+            if reward < 0.5:
+                problem_state["unable_index"] = problem_state["try_index"]
+                problem_state["try_index"] = math.ceil((problem_state["try_index"] + problem_state["able_index"]) / 2)
+            else:
+                problem_state["able_index"] = problem_state["try_index"]
+                problem_state["try_index"] = math.floor((problem_state["try_index"] + problem_state["unable_index"]) / 2)
+
+        # Reset current_turn for next time this problem is seen
+        problem_state["current_turn"] = 0
         
-        # ==================== TURN 2 TIMING SUMMARY ====================
-        _turn2_end = _time.time()
-        _turn2_duration = _turn2_end - _turn2_start
-        _total_duration = _turn2_end - _impl_start
-        _timing_log["turn2_duration"] = _turn2_duration
-        _timing_log["turn2_end"] = _turn2_end
-        _timing_log["total_impl_duration"] = _total_duration
+        # Persist updated state to Ray Actor
+        await self._safe_actor_call(
+            self._state_actor.set_state.remote(problem_key, problem_state),
+            timeout_seconds=30
+        )
         
-        print(f"[TIMING] Turn 2 END: turn2={_turn2_duration:.3f}s, total_impl={_total_duration:.3f}s, instance={instance_id[:8]}")
-        
-        # Log warning if any phase took too long
-        if _turn2_duration > 5.0 or _total_duration > 10.0:
-            print(f"[TIMING WARNING] Turn 2 or total took too long!")
-            print(f"[TIMING WARNING] turn2_duration={_turn2_duration:.3f}s, total={_total_duration:.3f}s")
-            print(f"[TIMING WARNING] gen_time_approx={_timing_log.get('generation_time_approx', -1):.3f}s")
-            print(f"[TIMING WARNING] try_claim_duration={_timing_log.get('try_claim_duration', -1):.3f}s")
-            print(f"[TIMING WARNING] State actor calls: {_timing_log['state_actor_calls']}")
-        
-        # ==================== AGGREGATED TIMING STATS ====================
-        stats = PromptUpdateInteraction._timing_stats
-        stats["turn2_count"] += 1
-        stats["turn2_durations"].append(_turn2_duration)
-        if _timing_log.get("generation_time_approx", -1) > 0:
-            stats["generation_times"].append(_timing_log["generation_time_approx"])
-        if _timing_log.get("try_claim_duration", -1) > 0:
-            stats["try_claim_durations"].append(_timing_log["try_claim_duration"])
-        
-        # Keep only last 100 samples
-        for key in ["turn2_durations", "generation_times", "try_claim_durations"]:
-            if len(stats[key]) > 100:
-                stats[key] = stats[key][-100:]
-        
-        # Log summary periodically
-        if stats["turn2_count"] - stats["last_summary_at"] >= stats["summary_interval"]:
-            stats["last_summary_at"] = stats["turn2_count"]
-            def _avg(lst): return sum(lst) / len(lst) if lst else 0
-            def _max(lst): return max(lst) if lst else 0
-            print(f"\n{'='*60}")
-            print(f"[TIMING SUMMARY] After {stats['turn2_count']} Turn 2 completions (worker pid={os.getpid()})")
-            print(f"  Turn 1: count={stats['turn1_count']}, avg={_avg(stats['turn1_durations']):.2f}s, max={_max(stats['turn1_durations']):.2f}s")
-            print(f"  Turn 2: count={stats['turn2_count']}, avg={_avg(stats['turn2_durations']):.2f}s, max={_max(stats['turn2_durations']):.2f}s")
-            print(f"  Generation (T1->T2): avg={_avg(stats['generation_times']):.2f}s, max={_max(stats['generation_times']):.2f}s")
-            print(f"  try_claim_and_update: avg={_avg(stats['try_claim_durations']):.3f}s, max={_max(stats['try_claim_durations']):.3f}s")
-            print(f"{'='*60}\n")
+        print(f"[PromptUpdateInteraction] Updated hint level: {old_try_index} -> {problem_state['try_index']} (able={problem_state['able_index']}, unable={problem_state['unable_index']})")
+
+        # Clean up instance state and turn1_info
+        if instance_id in self._instance_state:
+            del self._instance_state[instance_id]
+        if hasattr(PromptUpdateInteraction, '_turn1_info_by_problem') and problem_key in PromptUpdateInteraction._turn1_info_by_problem:
+            del PromptUpdateInteraction._turn1_info_by_problem[problem_key]
         
         # Terminate the sequence - we're done with this problem for this GRPO step
-        return True, "", reward, {
-            "try_index": new_try_index, 
-            "turn": 2, 
-            "reward": reward, 
-            "update_won": update_success,
-            "turn2_duration": _turn2_duration,
-            "try_claim_duration": _timing_log.get("try_claim_duration", -1),
-            "generation_time_approx": _timing_log.get("generation_time_approx", -1),
-        }
+        return True, "", reward, {"try_index": problem_state["try_index"], "turn": 2, "reward": reward}
 
 _RESET_PROMPT_LOG_FILE = None
 _RESET_PROMPT_LOG_COUNT = 0
@@ -2240,9 +1013,6 @@ _VALIDATION_STATE_LOG_FILE = None
 # Note: Validation log counter is now stored in ProblemStateActor for distributed consistency
 
 def _reset_request_prompt(self, processing_class, new_user_content: str, new_system_content: Optional[str] = None, should_log: bool = False) -> None:
-    import time as _time
-    _reset_start = _time.time()
-    
     global _RESET_PROMPT_LOG_FILE, _RESET_PROMPT_LOG_COUNT
     
     if new_system_content is None:
@@ -2354,62 +1124,6 @@ def _reset_request_prompt(self, processing_class, new_user_content: str, new_sys
     self.response_attention_mask = []
     self.response_position_ids = []
     self.response_loss_mask = []
-    
-    _reset_duration = _time.time() - _reset_start
-    print(f"[TIMING] _reset_request_prompt completed in {_reset_duration:.4f}s, new input_ids len={len(self.input_ids)}, messages={len(self.messages)}")
-
-
-def install_one_turn_prompt_hook():
-    """
-    Patch the sglang rollout to store request objects in OneTurnEvalInteraction._request_map.
-    
-    This allows start_interaction to access and modify the request's messages
-    before generation starts, enabling dynamic hint injection.
-    """
-    try:
-        from verl.workers.rollout.sglang_rollout.sglang_rollout import SGLangRollout
-    except ImportError:
-        print("[install_one_turn_prompt_hook] WARNING: Could not import SGLangRollout")
-        return
-    
-    if getattr(SGLangRollout, "_one_turn_prompt_hook_installed", False):
-        return
-    
-    original_handle_pending = SGLangRollout._handle_pending_state
-    
-    async def patched_handle_pending_state(self, _req):
-        """Store request in map before calling start_interaction."""
-        # Debug logging
-        if not hasattr(SGLangRollout, '_patch_call_count'):
-            SGLangRollout._patch_call_count = 0
-        SGLangRollout._patch_call_count += 1
-        if SGLangRollout._patch_call_count <= 5:
-            print(f"[patched_handle_pending_state] CALLED #{SGLangRollout._patch_call_count}, request_id={_req.request_id[:16]}")
-        
-        # Store request in class-level map, keyed by request_id
-        OneTurnEvalInteraction._request_map[_req.request_id] = _req
-        
-        # Store processing_class on request for later use in prompt modification
-        if hasattr(self, 'processing_class'):
-            _req._processing_class = self.processing_class
-        elif hasattr(self, 'tokenizer'):
-            _req._processing_class = self.tokenizer
-        else:
-            _req._processing_class = None
-            if SGLangRollout._patch_call_count <= 5:
-                print(f"[patched_handle_pending_state] WARNING: No processing_class available")
-        
-        try:
-            result = await original_handle_pending(self, _req)
-            return result
-        finally:
-            # Clean up to avoid memory leaks (but keep during generation)
-            # Actual cleanup happens after generate_response completes
-            pass
-    
-    SGLangRollout._handle_pending_state = patched_handle_pending_state
-    SGLangRollout._one_turn_prompt_hook_installed = True
-    print("[install_one_turn_prompt_hook] Installed request map hook on SGLangRollout")
 
 
 def install_prompt_reset_hook():
@@ -2421,8 +1135,6 @@ def install_prompt_reset_hook():
 
     def patched_add_user_message(self, processing_class, content: str):
         import traceback
-        import time as _time
-        _patch_start = _time.time()
         try:
             # Check for validation logging marker first
             should_log = False
@@ -2432,7 +1144,7 @@ def install_prompt_reset_hook():
                 print(f"[patched_add_user_message] DETECTED VALIDATION MARKER! should_log={should_log}")
             
             if content.startswith(PROMPT_RESET_PREFIX):
-                print(f"[TIMING] patched_add_user_message DETECTED RESET at {_patch_start:.3f}, current input_ids len={len(self.input_ids)}")
+                print(f"[patched_add_user_message] DETECTED RESET PREFIX! should_log={should_log}")
                 payload = content[len(PROMPT_RESET_PREFIX) :]
                 new_system_content = None
                 new_user_content = payload
@@ -2443,7 +1155,6 @@ def install_prompt_reset_hook():
                         new_system_content = system_part.rstrip("\n")
                         new_user_content = user_part
                 _reset_request_prompt(self, processing_class, new_user_content, new_system_content, should_log)
-                print(f"[TIMING] patched_add_user_message RESET COMPLETE in {_time.time() - _patch_start:.4f}s")
                 return
             return original_add_user_message(self, processing_class, content)
         except Exception as e:
@@ -2641,23 +1352,12 @@ def get_verl_config_path():
 
 def write_interaction_config() -> str:
     """Write a minimal interaction config for prompt updates and return its path."""
-    if ONE_TURN_MODE:
-        # One-turn mode: use OneTurnEvalInteraction (evaluate only, no prompt reset)
-        config_text = (
-            "interaction:\n"
-            "  - class_name: sbys_hinting.oneturn_sbys_grpo.OneTurnEvalInteraction\n"
-            "    config: {}\n"
-        )
-        target_path = os.path.join(os.path.dirname(__file__), "interaction_one_turn.yaml")
-    else:
-        # Multi-turn mode: use PromptUpdateInteraction (reset prompt between turns)
-        config_text = (
-            "interaction:\n"
-            "  - class_name: sbys_hinting.oneturn_sbys_grpo.PromptUpdateInteraction\n"
-            "    config: {}\n"
-        )
-        target_path = os.path.join(os.path.dirname(__file__), "interaction_prompt_update.yaml")
-    
+    config_text = (
+        "interaction:\n"
+        "  - class_name: sbys_hinting.sbys_grpo.PromptUpdateInteraction\n"
+        "    config: {}\n"
+    )
+    target_path = os.path.join(os.path.dirname(__file__), "interaction_prompt_update.yaml")
     with open(target_path, "w") as f:
         f.write(config_text)
     return target_path
@@ -2883,157 +1583,11 @@ def gather_checkpoint_to_head_node(checkpoint_dir: str, output_dir: str, num_nod
         return False
 
 
-# =============================================================================
-# ONE-TURN CUSTOM TRAINING LOOP
-# =============================================================================
-
-def run_ppo_one_turn(config, tokenizer, base_train_data: list):
-    """
-    Custom run_ppo that uses DynamicHintDataset to query try_index at __getitem__ time.
-    
-    KEY: DynamicHintDataset uses ray.get_actor() to find the ProblemStateActor
-    instead of storing an actor reference, avoiding serialization issues.
-    
-    This enables true one-turn training:
-    - Dataset queries try_index and builds prompts with hints
-    - OneTurnEvalInteraction evaluates and updates state after generation
-    - No wasted Turn 0 generation
-    """
-    from verl.trainer.ppo.ray_trainer import RayPPOTrainer, ResourcePoolManager, Role
-    from verl.trainer.main_ppo import create_rl_sampler, create_rl_dataset, load_reward_manager
-    from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
-    from verl.utils.fs import copy_to_local
-    from verl.utils import hf_processor
-    from omegaconf import OmegaConf
-    
-    print("[run_ppo_one_turn] Initializing one-turn training with DynamicHintDataset...")
-    
-    # ==================== RESOURCE INITIALIZATION ====================
-    OmegaConf.resolve(config)
-    
-    local_path = copy_to_local(
-        config.actor_rollout_ref.model.path, 
-        use_shm=config.actor_rollout_ref.model.get("use_shm", False)
-    )
-    
-    trust_remote_code = config.data.get("trust_remote_code", False)
-    processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
-    
-    # Define worker classes
-    if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
-        from verl.single_controller.ray import RayWorkerGroup
-        from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
-        actor_rollout_cls = AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
-        ray_worker_group_cls = RayWorkerGroup
-    elif config.actor_rollout_ref.actor.strategy == "megatron":
-        from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
-        from verl.workers.megatron_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
-        actor_rollout_cls = AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
-        ray_worker_group_cls = NVMegatronRayWorkerGroup
-    else:
-        raise NotImplementedError(f"Unknown strategy: {config.actor_rollout_ref.actor.strategy}")
-    
-    role_worker_mapping = {
-        Role.ActorRollout: ray.remote(actor_rollout_cls),
-        Role.Critic: ray.remote(CriticWorker),
-    }
-    
-    global_pool_id = "global_pool"
-    resource_pool_spec = {global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes}
-    mapping = {Role.ActorRollout: global_pool_id, Role.Critic: global_pool_id}
-    
-    if config.reward_model.enable:
-        if config.reward_model.strategy in ["fsdp", "fsdp2"]:
-            from verl.workers.fsdp_workers import RewardModelWorker
-        elif config.reward_model.strategy == "megatron":
-            from verl.workers.megatron_workers import RewardModelWorker
-        else:
-            raise NotImplementedError
-        role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
-        mapping[Role.RewardModel] = global_pool_id
-    
-    if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-        role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
-        mapping[Role.RefPolicy] = global_pool_id
-    
-    resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
-    
-    reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
-    val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
-    
-    # ==================== DATASET CREATION ====================
-    # CRITICAL: Set dataloader_num_workers=0 so __getitem__ runs in main process
-    # where Ray actors are accessible (not in worker processes)
-    from omegaconf import OmegaConf
-    OmegaConf.set_struct(config, False)  # Allow modifications
-    config.data.dataloader_num_workers = 0
-    print(f"[run_ppo_one_turn] Set config.data.dataloader_num_workers=0")
-    
-    # Create DynamicHintDataset from base_train_data (list of dicts)
-    # This dataset queries try_index via ray.get_actor() at __getitem__ time
-    print(f"[run_ppo_one_turn] Creating DynamicHintDataset with {len(base_train_data)} samples...")
-    train_dataset = DynamicHintDataset(
-        base_data=base_train_data,
-        tokenizer=tokenizer,
-        max_prompt_length=config.data.max_prompt_length,
-    )
-    
-    # Create standard val dataset
-    val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
-    
-    # Create sampler
-    train_sampler = create_rl_sampler(config.data, train_dataset)
-    
-    # ==================== TRAINER CREATION ====================
-    print("[run_ppo_one_turn] Creating RayPPOTrainer with DynamicHintDataset...")
-    trainer = RayPPOTrainer(
-        config=config,
-        tokenizer=tokenizer,
-        processor=processor,
-        role_worker_mapping=role_worker_mapping,
-        resource_pool_manager=resource_pool_manager,
-        ray_worker_group_cls=ray_worker_group_cls,
-        reward_fn=reward_fn,
-        val_reward_fn=val_reward_fn,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        collate_fn=default_collate_fn,
-        train_sampler=train_sampler,
-        device_name=config.trainer.device,
-    )
-    
-    # ==================== CACHE INVALIDATION HOOK ====================
-    # Invalidate cache between epochs so prompts reflect updated try_index
-    original_fit = trainer.fit
-    
-    def patched_fit():
-        """Wrap fit() to invalidate cache at start."""
-        print("[run_ppo_one_turn] Starting training...")
-        train_dataset.invalidate_cache()
-        return original_fit()
-    
-    trainer.fit = patched_fit
-    
-    # Start training
-    trainer.init_workers()
-    trainer.fit()
-    
-    print("[run_ppo_one_turn] Training completed!")
-
-
 def main():
     """Main function to run GRPO training with verl and Ray."""
-    # Start heartbeat thread for crash diagnosis
-    start_heartbeat_thread_v2(interval_seconds=15)  # More frequent heartbeats for better crash detection
-    
-    # Register this worker with the central crash monitor
-    register_with_crash_monitor()
-    update_worker_state(phase="main_init", iteration=0)
-    
-    # Set NCCL and Gloo environment variables EARLY - before any distributed init
-    # These help prevent socket errors during multi-node training
-    distributed_env_vars = {
-        # NCCL settings
+    # Set NCCL environment variables EARLY - before any distributed init
+    # These help prevent NCCL socket errors (code 3) during multi-node training
+    nccl_env_vars = {
         "NCCL_TIMEOUT": "3600",  # 1 hour timeout (default 30 min)
         "NCCL_DEBUG": "INFO",  # Full debug logging to catch network issues
         "NCCL_SOCKET_NTHREADS": "4",  # More socket threads
@@ -3042,15 +1596,10 @@ def main():
         "NCCL_P2P_DISABLE": "1",  # Disable P2P (can cause issues)
         "NCCL_IGNORE_DISABLED_P2P": "1",
         "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",  # Better error handling
-        # Gloo settings (used for CPU barriers)
-        "GLOO_SOCKET_TIMEOUT": "3600000",  # 1 hour in milliseconds
-        # PyTorch distributed timeout
-        "TORCH_DISTRIBUTED_DEBUG": "OFF",  # Set to DETAIL for debugging
     }
-    for key, value in distributed_env_vars.items():
+    for key, value in nccl_env_vars.items():
         os.environ[key] = value
-    print(f"[INFO] Set NCCL/Gloo environment variables for network stability")
-    update_worker_state(phase="nccl_env_set")
+    print(f"[INFO] Set NCCL environment variables for network stability")
     
     # Parse command line arguments
     args = parse_args()
@@ -3144,22 +1693,6 @@ def main():
     train_data, val_data = create_rl_dataset(tokenizer, DATASET_NAME, max_samples=MAX_NUM, val_size=VAL_SIZE, hint_level=hint_level)
     print(f"Created {len(train_data)} training samples, {len(val_data)} validation samples")
     
-    # For ONE_TURN_MODE, we'll store base data and create DynamicHintDataset later
-    # The DynamicHintDataset will query ProblemStateActor for each sample's current try_index
-    if ONE_TURN_MODE:
-        print("[ONE_TURN_MODE] Will use DynamicHintDataset for dynamic prompt generation")
-        # Extract base data (problem, answer, sbys_solution) from train_data
-        base_train_data = []
-        for item in train_data:
-            extra_info = item.get("extra_info", {})
-            interaction_kwargs = extra_info.get("interaction_kwargs", {})
-            base_train_data.append({
-                "problem": interaction_kwargs.get("problem", ""),
-                "answer": item.get("ground_truth", ""),
-                "sbys_solution": interaction_kwargs.get("sbys_solution", []),
-            })
-        print(f"[ONE_TURN_MODE] Extracted {len(base_train_data)} problems for dynamic dataset")
-    
     # Calculate total training steps (same formula verl uses)
     num_batches_per_epoch = len(train_data) // TRAIN_BATCH_SIZE
     total_training_steps = num_batches_per_epoch * TOTAL_EPOCHS
@@ -3209,11 +1742,11 @@ def main():
         "actor_rollout_ref.rollout.n=4",  # Multiple generations for GRPO
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",  # Reduced to 50% - more headroom for FSDP
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.6",  # Leave room for FSDP actor
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
         "actor_rollout_ref.rollout.response_length=16384",  # Increased from 12288 to further reduce LENGTH truncation
         "actor_rollout_ref.rollout.max_model_len=20480",  # 4096 + 16384
-        "actor_rollout_ref.rollout.max_num_batched_tokens=1310720",  # 20480*16 = ~102GB KV cache total, ~12.8GB per GPU with TP=8
+        "actor_rollout_ref.rollout.max_num_batched_tokens=40960",  # Reduced from 81920 to ease init memory pressure
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
@@ -3232,7 +1765,6 @@ def main():
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         "+actor_rollout_ref.actor.offload_param=true",  # Offload actor params to CPU to reduce GPU memory pressure
-        # "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1",  # Only needed when use_kl_in_reward=true
         "actor_rollout_ref.ref.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         
         # Enable gradient checkpointing to reduce memory usage during policy update
@@ -3240,8 +1772,7 @@ def main():
         
         # Algorithm - GRPO
         "algorithm.adv_estimator=grpo",
-        "algorithm.use_kl_in_reward=false",  # Disabled to test if ref model init is causing crashes
-        # "algorithm.kl_ctrl.kl_coef=0.01",  # KL coefficient - disabled for now
+        "algorithm.use_kl_in_reward=false",
         "algorithm.norm_adv_by_std_in_grpo=true",
         
         # Data config
@@ -3295,14 +1826,6 @@ def main():
             f"actor_rollout_ref.rollout.multi_turn.max_assistant_turns={PROMPT_UPDATE_MAX_ASSISTANT_TURNS}",
             f"actor_rollout_ref.rollout.multi_turn.max_user_turns={PROMPT_UPDATE_MAX_USER_TURNS}",
         ])
-    
-    # ONE_TURN_MODE: Set dataloader_num_workers=0 because DynamicHintDataset
-    # calls ray.get_actor() in __getitem__, which only works in main process
-    if ONE_TURN_MODE:
-        overrides.append("+data.dataloader_num_workers=0")
-        overrides.append("trainer.val_before_train=false")  # Skip initial validation
-        print("[ONE_TURN_MODE] Set dataloader_num_workers=0 for Ray actor access in __getitem__")
-        print("[ONE_TURN_MODE] Disabled val_before_train")
     
     # Add resume_from_path if resuming from checkpoint
     if args.resume_from:
@@ -3411,18 +1934,8 @@ def main():
     
     # Run PPO training
     print("Starting GRPO training with verl...")
-    update_worker_state(phase="training_start")
     try:
-        if ONE_TURN_MODE:
-            # ONE-TURN MODE: Use custom run_ppo_one_turn with DynamicHintDataset
-            # DynamicHintDataset queries ProblemStateActor at __getitem__ time
-            # to get current try_index and build prompts WITH hints
-            print("[ONE_TURN_MODE] Using run_ppo_one_turn with DynamicHintDataset")
-            run_ppo_one_turn(config, tokenizer, base_train_data)
-        else:
-            # Multi-turn mode: Use standard run_ppo with PromptUpdateInteraction
-            run_ppo(config)
-        update_worker_state(phase="training_complete")
+        run_ppo(config)
         print("Training completed successfully!")
         
         # After training, gather checkpoint shards from all nodes to head node
