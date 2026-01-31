@@ -3273,6 +3273,12 @@ def main():
             f"actor_rollout_ref.rollout.multi_turn.max_user_turns={PROMPT_UPDATE_MAX_USER_TURNS}",
         ])
     
+    # ONE_TURN_MODE: Set dataloader_num_workers=0 because DynamicHintDataset
+    # calls ray.get_actor() in __getitem__, which only works in main process
+    if ONE_TURN_MODE:
+        overrides.append("data.dataloader_num_workers=0")
+        print("[ONE_TURN_MODE] Set dataloader_num_workers=0 for Ray actor access in __getitem__")
+    
     # Add resume_from_path if resuming from checkpoint
     if args.resume_from:
         # Validate that the path contains global_step_ (required by verl)
