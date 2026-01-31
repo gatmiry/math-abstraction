@@ -877,6 +877,9 @@ try:
     PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HOME"] = HF_CACHE_PATH
     PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HUB_CACHE"] = f"{HF_CACHE_PATH}/hub"
     PPO_RAY_RUNTIME_ENV["env_vars"]["TRANSFORMERS_CACHE"] = f"{HF_CACHE_PATH}/transformers"
+    # Force offline mode to prevent HuggingFace API calls (causes 504 timeouts)
+    PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HUB_OFFLINE"] = "1"
+    PPO_RAY_RUNTIME_ENV["env_vars"]["TRANSFORMERS_OFFLINE"] = "1"
     # NCCL P2P workaround for hardware issues
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_IGNORE_DISABLED_P2P"] = "1"
     PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_P2P_DISABLE"] = "1"
