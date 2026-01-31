@@ -3277,7 +3277,9 @@ def main():
     # calls ray.get_actor() in __getitem__, which only works in main process
     if ONE_TURN_MODE:
         overrides.append("+data.dataloader_num_workers=0")
+        overrides.append("trainer.val_before_train=false")  # Skip initial validation
         print("[ONE_TURN_MODE] Set dataloader_num_workers=0 for Ray actor access in __getitem__")
+        print("[ONE_TURN_MODE] Disabled val_before_train")
     
     # Add resume_from_path if resuming from checkpoint
     if args.resume_from:
