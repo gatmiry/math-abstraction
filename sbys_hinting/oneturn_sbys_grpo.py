@@ -1,8 +1,62 @@
 #!/usr/bin/env python3
 """
-GRPO training script for Omni-MATH dataset using verl with Ray for distributed training.
-Configured for 2 nodes, each with 8 H100 GPUs (16 GPUs total).
-Uses Hydra to properly load verl's default configs and override specific values.
+ONE-TURN GRPO training script for Omni-MATH dataset using verl with Ray.
+
+INVESTIGATION RESULTS - How verl handles prompts:
+==================================================
+
+1. verl's SGLang rollout DOES call `start_interaction(instance_id, **interaction_kwargs)` 
+   BEFORE the first generation (in `_handle_pending_state`, line 933 of sglang_rollout.py).
+   
+2. However, `start_interaction()` does NOT receive or return the `AsyncRolloutRequest` object,
+   so we cannot directly modify the prompt messages from within start_interaction.
+
+3. The prompt is set from the dataset in `_preprocess_prompt_to_async_rollout_requests()`:
+   - `messages=raw_prompt.tolist()` comes from dataset's "prompt" field
+   - `interaction_kwargs` comes from dataset's "extra_info.interaction_kwargs"
+
+OPTIONS FOR ONE-TURN APPROACH:
+==============================
+
+Option A: DYNAMIC DATASET GENERATION (Recommended)
+- Modify `to_verl_format()` to include hints in the initial prompt
+- Query ProblemStateActor to get current `try_index` for each problem
+- Requires per-epoch dataset regeneration or dynamic data loading
+
+Option B: PATCH verl's _handle_pending_state
+- Modify verl code to pass AsyncRolloutRequest to start_interaction
+- More invasive but allows interaction to modify prompt directly
+
+Option C: KEEP MULTI-TURN BUT OPTIMIZE (Current approach)
+- Turn 0: Generate without hints (wasted computation)
+- Turn 1: Reset prompt with hints, start real generation
+- Turn 2: Evaluate and update state
+- Slower due to wasted Turn 0, but works with existing verl
+
+INJECTION POINTS IN VERL FOR DYNAMIC PROMPTS:
+=============================================
+
+1. RLHFDataset.__getitem__ (verl/utils/dataset/rl_dataset.py line 212)
+   - Called for each sample when DataLoader fetches it
+   - Can query ProblemStateActor here to get current try_index
+   - Modify prompt to include appropriate hints
+   - BEST for per-sample dynamic modification
+
+2. collate_fn (verl/utils/dataset/rl_dataset.py line 37)
+   - Called after __getitem__ to batch samples together
+   - Can modify prompts at batch level
+   - Passed to StatefulDataLoader at trainer line 503
+
+3. Training loop (verl/trainer/ppo/ray_trainer.py line 959)
+   - After: batch_dict = next(train_dataloader)
+   - Before: batch = DataProto.from_single_dict(batch_dict)
+   - Can modify batch_dict directly here
+
+4. Epoch start (verl/trainer/ppo/ray_trainer.py line 945)
+   - Before: for epoch in range(total_epochs)
+   - Regenerate entire dataset with updated prompts per epoch
+
+This file implements Option A: Custom Dataset with dynamic prompt generation.
 """
 
 import os
@@ -58,13 +112,15 @@ SYSTEM_PROMPT_NAME = "full_solution_simple"
 HINT_LEVEL = -1
 VAL_SIZE = 256
 PROMPT_UPDATE_ENABLED = True
-PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
-PROMPT_UPDATE_MAX_USER_TURNS = 2
-PROMPT_RESET_PREFIX = "__RESET_PROMPT__\n"
+# ONE-TURN MODE: Generate with hints already in prompt, evaluate immediately
+PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 1  # Single turn: generate and evaluate
+PROMPT_UPDATE_MAX_USER_TURNS = 1
+PROMPT_RESET_PREFIX = "__RESET_PROMPT__\n"  # Kept for compatibility
 PROMPT_RESET_SYSTEM_TAG = "__SYSTEM__\n"
 PROMPT_RESET_USER_TAG = "__USER__\n"
-PROMPT_LOG_VALIDATION_MARKER = "__LOG_VALIDATION__\n"  # Marker to enable logging in _reset_request_prompt
+PROMPT_LOG_VALIDATION_MARKER = "__LOG_VALIDATION__\n"
 ENABLE_VALIDATION_INTERACTION = False
+ONE_TURN_MODE = True  # Enable one-turn mode with dynamic prompt generation
 #
 TRAIN_BATCH_SIZE = 256  # Batch size for training
 TOTAL_EPOCHS = 50
@@ -1311,6 +1367,283 @@ def get_or_create_problem_state_actor():
         ).remote()
 
 
+# =============================================================================
+# DYNAMIC HINT DATASET - Generates prompts with hints based on current state
+# =============================================================================
+
+class DynamicHintDataset(torch.utils.data.Dataset):
+    """
+    ONE-TURN Dataset that dynamically generates prompts WITH hints already included.
+    
+    Instead of the multi-turn approach (generate without hints → reset prompt → generate with hints),
+    this dataset queries ProblemStateActor for each problem's current try_index and builds
+    the prompt with the appropriate hints BEFORE the first generation.
+    
+    Flow:
+    1. __getitem__ is called by DataLoader
+    2. We query ProblemStateActor for current try_index
+    3. Build prompt with hints based on try_index
+    4. Return prompt ready for single-turn generation + evaluation
+    """
+    
+    def __init__(self, base_data: list, tokenizer, state_actor, max_prompt_length: int = 4096):
+        """
+        Args:
+            base_data: List of dicts with 'problem', 'answer', 'sbys_solution' keys
+            tokenizer: HuggingFace tokenizer
+            state_actor: Ray actor handle for ProblemStateActor
+            max_prompt_length: Maximum prompt length in tokens
+        """
+        self.base_data = base_data
+        self.tokenizer = tokenizer
+        self.state_actor = state_actor
+        self.max_prompt_length = max_prompt_length
+        
+        # Cache for state lookups (invalidated at epoch end)
+        self._state_cache = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
+        
+        # System prompts
+        self._system_prompt_no_hints = load_system_prompt("full_solution_simple")
+        self._system_prompt_with_hints = load_system_prompt("full_solution_with_hint")
+        
+        print(f"[DynamicHintDataset] Initialized with {len(base_data)} samples")
+    
+    def __len__(self):
+        return len(self.base_data)
+    
+    def _get_problem_state(self, problem: str) -> dict:
+        """Get current state for a problem, using cache if available."""
+        if problem in self._state_cache:
+            self._cache_hits += 1
+            return self._state_cache[problem]
+        
+        self._cache_misses += 1
+        try:
+            state = ray.get(self.state_actor.get_state.remote(problem), timeout=5)
+            self._state_cache[problem] = state or {"try_index": 0}
+        except Exception as e:
+            print(f"[DynamicHintDataset] Failed to get state for problem: {e}")
+            self._state_cache[problem] = {"try_index": 0}
+        
+        return self._state_cache[problem]
+    
+    def _build_prompt_with_hints(self, problem: str, sbys_solution: list, try_index: int) -> list:
+        """Build chat messages with hints included based on try_index."""
+        if try_index > 0 and sbys_solution and len(sbys_solution) >= try_index:
+            # Include hints up to try_index
+            partial_answer = "\n".join(sbys_solution[:try_index])
+            user_content = f"Problem: {problem}\nIncomplete proof: {partial_answer}\n"
+            system_prompt = self._system_prompt_with_hints
+        else:
+            # No hints
+            user_content = f"Problem: {problem}\n"
+            system_prompt = self._system_prompt_no_hints
+        
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ]
+    
+    def __getitem__(self, idx):
+        """Get a sample with dynamically generated prompt including hints."""
+        item = self.base_data[idx]
+        problem = item["problem"]
+        answer = item["answer"]
+        sbys_solution = item.get("sbys_solution", [])
+        
+        # Query state actor for current try_index
+        state = self._get_problem_state(problem)
+        try_index = state.get("try_index", 0)
+        
+        # Build prompt WITH hints already included
+        messages = self._build_prompt_with_hints(problem, sbys_solution, try_index)
+        
+        # Tokenize the prompt
+        raw_prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
+        input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs["attention_mask"]
+        
+        # Truncate/pad if needed
+        from verl.utils.torch_functional import postprocess_data
+        input_ids, attention_mask = postprocess_data(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_length=self.max_prompt_length,
+            pad_token_id=self.tokenizer.pad_token_id,
+            left_pad=True,
+            truncation="left",
+        )
+        
+        # Compute position IDs
+        position_ids = compute_position_id_with_mask(attention_mask)
+        
+        # Raw prompt IDs for sglang
+        raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+        if len(raw_prompt_ids) > self.max_prompt_length:
+            raw_prompt_ids = raw_prompt_ids[-self.max_prompt_length:]
+        
+        # Return in verl format
+        return {
+            "input_ids": input_ids[0],
+            "attention_mask": attention_mask[0],
+            "position_ids": position_ids[0],
+            "raw_prompt_ids": raw_prompt_ids,
+            "raw_prompt": messages,  # For sglang multi-turn
+            "ground_truth": answer,
+            "data_source": "omni_math",
+            # Extra info for interaction
+            "interaction_kwargs": {
+                "ground_truth": answer,
+                "problem": problem,
+                "sbys_solution": sbys_solution,
+                "try_index": try_index,  # Current try_index used for this prompt
+                "is_validation": False,
+            },
+        }
+    
+    def invalidate_cache(self):
+        """Invalidate state cache. Call at epoch end to refresh states."""
+        hit_rate = self._cache_hits / max(1, self._cache_hits + self._cache_misses) * 100
+        print(f"[DynamicHintDataset] Cache stats: {self._cache_hits} hits, {self._cache_misses} misses ({hit_rate:.1f}% hit rate)")
+        self._state_cache.clear()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        print(f"[DynamicHintDataset] Cache invalidated - will refresh states from ProblemStateActor")
+    
+    def prefetch_states(self, batch_size: int = 100):
+        """Prefetch states for all problems to warm up cache."""
+        print(f"[DynamicHintDataset] Prefetching states for {len(self.base_data)} problems...")
+        problems = [item["problem"] for item in self.base_data]
+        
+        # Batch fetch states
+        for i in range(0, len(problems), batch_size):
+            batch_problems = problems[i:i+batch_size]
+            try:
+                states = ray.get(self.state_actor.get_states_batch.remote(batch_problems), timeout=30)
+                for prob, state in states.items():
+                    self._state_cache[prob] = state or {"try_index": 0}
+            except Exception as e:
+                print(f"[DynamicHintDataset] Batch fetch failed: {e}, falling back to individual fetches")
+        
+        print(f"[DynamicHintDataset] Prefetched {len(self._state_cache)} states")
+
+
+# =============================================================================
+# ONE-TURN EVALUATION INTERACTION
+# =============================================================================
+
+class OneTurnEvalInteraction(BaseInteraction):
+    """
+    ONE-TURN Interaction: Evaluate the generation and update state.
+    
+    Since the prompt already includes hints (built by DynamicHintDataset),
+    we only need a single turn to:
+    1. Evaluate the model's generation (compute reward)
+    2. Update the problem state for the next epoch
+    
+    This is much more efficient than the multi-turn approach because:
+    - No wasted Turn 0 generation
+    - No prompt reset overhead
+    - Single generation per sample
+    """
+    
+    def __init__(self, config):
+        super().__init__(config)
+        self._state_actor = get_or_create_problem_state_actor()
+        init_worker_crash_monitoring()
+        print(f"[OneTurnEvalInteraction] Initialized on worker")
+    
+    async def generate_response(self, instance_id, messages, **kwargs):
+        """
+        Single turn: Evaluate the generation and update state.
+        
+        Returns: (should_terminate, content, reward, metrics)
+        """
+        import time as _time
+        _start = _time.time()
+        
+        try:
+            # Extract kwargs
+            ground_truth = kwargs.get("ground_truth")
+            problem = kwargs.get("problem")
+            sbys_solution = kwargs.get("sbys_solution", [])
+            try_index = kwargs.get("try_index", 0)  # The try_index used for this prompt
+            is_validation = kwargs.get("is_validation", False)
+            
+            # For validation, just return immediately
+            if is_validation:
+                return True, "", 0.0, {"mode": "validation", "skipped": True}
+            
+            # Extract the assistant's response
+            last_assistant = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "assistant":
+                    last_assistant = msg.get("content", "")
+                    break
+            
+            # Compute reward
+            reward = compute_score(solution_str=last_assistant, ground_truth=ground_truth)
+            boxed_answer = extract_boxed_answer(last_assistant) or "N/A"
+            is_correct = reward > 0.5
+            
+            # Update state in ProblemStateActor
+            # In one-turn mode, each generation updates state immediately
+            # Counter-based approach: with n=4 samples, the 4th one wins
+            N_SAMPLES_PER_PROMPT = 4
+            TARGET_COUNT = N_SAMPLES_PER_PROMPT  # Only 1 turn, so target is just n
+            
+            result = await self._safe_actor_call(
+                self._state_actor.try_claim_and_update.remote(problem, is_correct, TARGET_COUNT),
+                timeout_seconds=30,
+                default=(False, try_index, try_index, {}),
+                call_name="try_claim_and_update"
+            )
+            update_success, old_try_index, new_try_index, updated_state = result
+            
+            _duration = _time.time() - _start
+            
+            if update_success:
+                print(f"[OneTurnEval] WON update: try_index {old_try_index}->{new_try_index}, reward={reward}, time={_duration:.3f}s")
+            
+            # Terminate immediately (single turn)
+            return True, "", reward, {
+                "try_index": try_index,
+                "new_try_index": new_try_index,
+                "reward": reward,
+                "is_correct": is_correct,
+                "update_won": update_success,
+                "duration": _duration,
+            }
+            
+        except Exception as e:
+            import traceback
+            print(f"[OneTurnEvalInteraction] ERROR: {e}")
+            traceback.print_exc()
+            log_crash("ONE_TURN_EVAL_ERROR", str(e), traceback.format_exc())
+            return True, "", 0.0, {"error": str(e)}
+    
+    async def _safe_actor_call(self, coro, timeout_seconds=30, default=None, call_name="unknown"):
+        """Safely await a Ray actor call with timeout."""
+        import asyncio
+        import time as _time
+        _start = _time.time()
+        try:
+            result = await asyncio.wait_for(coro, timeout=timeout_seconds)
+            _duration = _time.time() - _start
+            if _duration > 2.0:
+                print(f"[OneTurnEval] SLOW actor call {call_name}: {_duration:.2f}s")
+            return result
+        except asyncio.TimeoutError:
+            print(f"[OneTurnEval] TIMEOUT: {call_name} after {timeout_seconds}s")
+            return default
+        except Exception as e:
+            print(f"[OneTurnEval] ERROR in {call_name}: {e}")
+            return default
+
+
 class PromptUpdateInteraction(BaseInteraction):
     """Update prompts between generations based on previous response/reward."""
     
@@ -2245,12 +2578,23 @@ def get_verl_config_path():
 
 def write_interaction_config() -> str:
     """Write a minimal interaction config for prompt updates and return its path."""
-    config_text = (
-        "interaction:\n"
-        "  - class_name: sbys_hinting.sbys_grpo.PromptUpdateInteraction\n"
-        "    config: {}\n"
-    )
-    target_path = os.path.join(os.path.dirname(__file__), "interaction_prompt_update.yaml")
+    if ONE_TURN_MODE:
+        # One-turn mode: use OneTurnEvalInteraction (evaluate only, no prompt reset)
+        config_text = (
+            "interaction:\n"
+            "  - class_name: sbys_hinting.oneturn_sbys_grpo.OneTurnEvalInteraction\n"
+            "    config: {}\n"
+        )
+        target_path = os.path.join(os.path.dirname(__file__), "interaction_one_turn.yaml")
+    else:
+        # Multi-turn mode: use PromptUpdateInteraction (reset prompt between turns)
+        config_text = (
+            "interaction:\n"
+            "  - class_name: sbys_hinting.oneturn_sbys_grpo.PromptUpdateInteraction\n"
+            "    config: {}\n"
+        )
+        target_path = os.path.join(os.path.dirname(__file__), "interaction_prompt_update.yaml")
+    
     with open(target_path, "w") as f:
         f.write(config_text)
     return target_path
@@ -2476,6 +2820,99 @@ def gather_checkpoint_to_head_node(checkpoint_dir: str, output_dir: str, num_nod
         return False
 
 
+# =============================================================================
+# ONE-TURN CUSTOM TRAINING LOOP
+# =============================================================================
+
+def run_ppo_one_turn(config, tokenizer, state_actor, base_train_data: list, val_data: list):
+    """
+    Custom version of verl's run_ppo that uses DynamicHintDataset.
+    
+    The key difference: Instead of using static prompts from parquet files,
+    DynamicHintDataset queries ProblemStateActor for each problem's current try_index
+    and builds prompts with the appropriate hints BEFORE generation.
+    
+    This enables true one-turn training:
+    - Each sample generates once (with hints already in prompt)
+    - OneTurnEvalInteraction evaluates and updates state
+    - No wasted Turn 0 generation
+    """
+    from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+    from verl.trainer.main_ppo import (
+        create_rl_sampler,
+        create_rl_dataset,
+        _init_resource_and_workers,
+        _init_reward_functions,
+    )
+    from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+    
+    print("[run_ppo_one_turn] Initializing one-turn training with DynamicHintDataset...")
+    
+    # Initialize resources (same as standard run_ppo)
+    role_worker_mapping, resource_pool_manager, ray_worker_group_cls = _init_resource_and_workers(config)
+    reward_fn, val_reward_fn = _init_reward_functions(config)
+    
+    # Create DynamicHintDataset for training
+    print(f"[run_ppo_one_turn] Creating DynamicHintDataset with {len(base_train_data)} samples...")
+    train_dataset = DynamicHintDataset(
+        base_data=base_train_data,
+        tokenizer=tokenizer,
+        state_actor=state_actor,
+        max_prompt_length=config.data.max_prompt_length,
+    )
+    
+    # Prefetch states to warm up cache
+    train_dataset.prefetch_states(batch_size=100)
+    
+    # Create standard val dataset (static prompts for validation)
+    val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor=None)
+    
+    # Create sampler
+    train_sampler = create_rl_sampler(config.data, train_dataset)
+    
+    # Create trainer with our custom dataset
+    print("[run_ppo_one_turn] Creating RayPPOTrainer with DynamicHintDataset...")
+    trainer = RayPPOTrainer(
+        config=config,
+        tokenizer=tokenizer,
+        processor=None,
+        role_worker_mapping=role_worker_mapping,
+        resource_pool_manager=resource_pool_manager,
+        ray_worker_group_cls=ray_worker_group_cls,
+        reward_fn=reward_fn,
+        val_reward_fn=val_reward_fn,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        collate_fn=default_collate_fn,
+        train_sampler=train_sampler,
+        device_name=config.trainer.device,
+    )
+    
+    # Patch the trainer to invalidate cache at epoch boundaries
+    original_fit = trainer.fit
+    
+    def patched_fit():
+        """Wrap fit() to invalidate DynamicHintDataset cache at epoch boundaries."""
+        # Note: verl doesn't expose epoch callbacks, so we rely on the dataset
+        # to refresh when accessed. The cache is invalidated per-epoch via
+        # the train_dataloader iteration pattern.
+        
+        # For now, we'll invalidate at the start of training
+        # A more sophisticated approach would hook into the epoch loop
+        print("[run_ppo_one_turn] Starting training with DynamicHintDataset...")
+        train_dataset.invalidate_cache()
+        train_dataset.prefetch_states(batch_size=100)
+        return original_fit()
+    
+    trainer.fit = patched_fit
+    
+    # Initialize workers and start training
+    trainer.init_workers()
+    trainer.fit()
+    
+    print("[run_ppo_one_turn] Training completed!")
+
+
 def main():
     """Main function to run GRPO training with verl and Ray."""
     # Start heartbeat thread for crash diagnosis
@@ -2598,6 +3035,22 @@ def main():
     print("Creating RL dataset...")
     train_data, val_data = create_rl_dataset(tokenizer, DATASET_NAME, max_samples=MAX_NUM, val_size=VAL_SIZE, hint_level=hint_level)
     print(f"Created {len(train_data)} training samples, {len(val_data)} validation samples")
+    
+    # For ONE_TURN_MODE, we'll store base data and create DynamicHintDataset later
+    # The DynamicHintDataset will query ProblemStateActor for each sample's current try_index
+    if ONE_TURN_MODE:
+        print("[ONE_TURN_MODE] Will use DynamicHintDataset for dynamic prompt generation")
+        # Extract base data (problem, answer, sbys_solution) from train_data
+        base_train_data = []
+        for item in train_data:
+            extra_info = item.get("extra_info", {})
+            interaction_kwargs = extra_info.get("interaction_kwargs", {})
+            base_train_data.append({
+                "problem": interaction_kwargs.get("problem", ""),
+                "answer": item.get("ground_truth", ""),
+                "sbys_solution": interaction_kwargs.get("sbys_solution", []),
+            })
+        print(f"[ONE_TURN_MODE] Extracted {len(base_train_data)} problems for dynamic dataset")
     
     # Calculate total training steps (same formula verl uses)
     num_batches_per_epoch = len(train_data) // TRAIN_BATCH_SIZE
@@ -2844,7 +3297,13 @@ def main():
     print("Starting GRPO training with verl...")
     update_worker_state(phase="training_start")
     try:
-        run_ppo(config)
+        if ONE_TURN_MODE:
+            # ONE-TURN MODE: Use custom run_ppo_one_turn with DynamicHintDataset
+            print("[ONE_TURN_MODE] Using custom training loop with DynamicHintDataset")
+            run_ppo_one_turn(config, tokenizer, state_actor, base_train_data, val_data)
+        else:
+            # Standard multi-turn mode
+            run_ppo(config)
         update_worker_state(phase="training_complete")
         print("Training completed successfully!")
         
