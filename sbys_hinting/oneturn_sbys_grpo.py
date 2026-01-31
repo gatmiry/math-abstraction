@@ -1555,24 +1555,99 @@ class DynamicHintDatasetWrapper(torch.utils.data.Dataset):
 
 class OneTurnEvalInteraction(BaseInteraction):
     """
-    ONE-TURN Interaction: Evaluate the generation and update state.
+    ONE-TURN Interaction with DYNAMIC HINT INJECTION.
     
-    Since the prompt already includes hints (built by DynamicHintDataset),
-    we only need a single turn to:
-    1. Evaluate the model's generation (compute reward)
-    2. Update the problem state for the next epoch
+    Key feature: In start_interaction (before generation), we:
+    1. Query ProblemStateActor for current try_index
+    2. Modify the prompt to include hints based on try_index
+    3. Then generation happens with the hinted prompt
     
-    This is much more efficient than the multi-turn approach because:
-    - No wasted Turn 0 generation
-    - No prompt reset overhead
-    - Single generation per sample
+    After generation, we evaluate and update state for next epoch.
     """
+    
+    # Class-level storage for request objects (set by install_one_turn_prompt_hook)
+    _request_map = {}
     
     def __init__(self, config):
         super().__init__(config)
         self._state_actor = get_or_create_problem_state_actor()
         init_worker_crash_monitoring()
-        print(f"[OneTurnEvalInteraction] Initialized on worker")
+        
+        # Install the hook that gives us access to request objects
+        install_one_turn_prompt_hook()
+        
+        # System prompts for hint injection
+        self._system_prompt_no_hints = load_system_prompt("full_solution_simple")
+        self._system_prompt_with_hints = load_system_prompt("full_solution_with_hint")
+        
+        print(f"[OneTurnEvalInteraction] Initialized on worker with dynamic hint injection")
+    
+    async def start_interaction(self, instance_id, **kwargs):
+        """
+        Called BEFORE generation. This is where we inject hints into the prompt.
+        
+        Flow:
+        1. Get the request object from _request_map
+        2. Query ProblemStateActor for current try_index
+        3. Build new prompt with hints
+        4. Modify request's messages
+        """
+        import time as _time
+        _start = _time.time()
+        
+        problem = kwargs.get("problem", "")
+        sbys_solution = kwargs.get("sbys_solution", [])
+        
+        if not problem:
+            # No problem info, skip hint injection
+            return instance_id
+        
+        try:
+            # Query current try_index from ProblemStateActor
+            state = await self._safe_actor_call(
+                self._state_actor.get_state.remote(problem),
+                timeout_seconds=5,
+                default={"try_index": 0},
+                call_name="get_state"
+            )
+            try_index = (state or {}).get("try_index", 0)
+            
+            # Store try_index in kwargs for later use in generate_response
+            kwargs["try_index"] = try_index
+            
+            # Get the request object
+            request = OneTurnEvalInteraction._request_map.get(instance_id)
+            if request is None:
+                print(f"[OneTurnEval.start_interaction] WARNING: No request found for {instance_id[:16]}")
+                return instance_id
+            
+            # Build new prompt with hints
+            if try_index > 0 and sbys_solution and len(sbys_solution) >= try_index:
+                partial_answer = "\n".join(sbys_solution[:try_index])
+                user_content = f"Problem: {problem}\nIncomplete proof: {partial_answer}\n"
+                system_content = self._system_prompt_with_hints
+                had_hints = True
+            else:
+                user_content = f"Problem: {problem}\n"
+                system_content = self._system_prompt_no_hints
+                had_hints = False
+            
+            # Reset the request's prompt using _reset_request_prompt
+            # We need the processing_class (tokenizer/processor) which is stored on the request
+            if hasattr(request, '_processing_class') and request._processing_class:
+                _reset_request_prompt(request, request._processing_class, user_content, system_content)
+                _duration = _time.time() - _start
+                if _duration > 1.0:
+                    print(f"[OneTurnEval.start_interaction] try_index={try_index}, hints={had_hints}, time={_duration:.3f}s")
+            else:
+                print(f"[OneTurnEval.start_interaction] WARNING: No processing_class on request, can't modify prompt")
+            
+        except Exception as e:
+            import traceback
+            print(f"[OneTurnEval.start_interaction] ERROR: {e}")
+            traceback.print_exc()
+        
+        return instance_id
     
     async def generate_response(self, instance_id, messages, **kwargs):
         """
@@ -2365,6 +2440,50 @@ def _reset_request_prompt(self, processing_class, new_user_content: str, new_sys
     
     _reset_duration = _time.time() - _reset_start
     print(f"[TIMING] _reset_request_prompt completed in {_reset_duration:.4f}s, new input_ids len={len(self.input_ids)}, messages={len(self.messages)}")
+
+
+def install_one_turn_prompt_hook():
+    """
+    Patch the sglang rollout to store request objects in OneTurnEvalInteraction._request_map.
+    
+    This allows start_interaction to access and modify the request's messages
+    before generation starts, enabling dynamic hint injection.
+    """
+    try:
+        from verl.workers.rollout.sglang_rollout.sglang_rollout import SGLangRollout
+    except ImportError:
+        print("[install_one_turn_prompt_hook] WARNING: Could not import SGLangRollout")
+        return
+    
+    if getattr(SGLangRollout, "_one_turn_prompt_hook_installed", False):
+        return
+    
+    original_handle_pending = SGLangRollout._handle_pending_state
+    
+    async def patched_handle_pending_state(self, _req):
+        """Store request in map before calling start_interaction."""
+        # Store request in class-level map, keyed by request_id
+        OneTurnEvalInteraction._request_map[_req.request_id] = _req
+        
+        # Store processing_class on request for later use in prompt modification
+        if hasattr(self, 'processing_class'):
+            _req._processing_class = self.processing_class
+        elif hasattr(self, 'tokenizer'):
+            _req._processing_class = self.tokenizer
+        else:
+            _req._processing_class = None
+        
+        try:
+            result = await original_handle_pending(self, _req)
+            return result
+        finally:
+            # Clean up to avoid memory leaks (but keep during generation)
+            # Actual cleanup happens after generate_response completes
+            pass
+    
+    SGLangRollout._handle_pending_state = patched_handle_pending_state
+    SGLangRollout._one_turn_prompt_hook_installed = True
+    print("[install_one_turn_prompt_hook] Installed request map hook on SGLangRollout")
 
 
 def install_prompt_reset_hook():
