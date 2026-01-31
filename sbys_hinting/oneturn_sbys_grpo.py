@@ -3383,10 +3383,12 @@ def main():
     update_worker_state(phase="training_start")
     try:
         if ONE_TURN_MODE:
-            # ONE-TURN MODE: Use custom run_ppo_one_turn with DynamicHintDatasetWrapper
-            # This wraps the standard dataset and dynamically injects hints based on try_index
-            print("[ONE_TURN_MODE] Using DynamicHintDatasetWrapper + OneTurnEvalInteraction")
-            run_ppo_one_turn(config, tokenizer, state_actor)
+            # ONE-TURN MODE: Use standard run_ppo with OneTurnEvalInteraction
+            # The interaction evaluates after single generation and updates state
+            # Dynamic hint injection is handled separately via dataset preprocessing
+            print("[ONE_TURN_MODE] Using standard run_ppo with OneTurnEvalInteraction")
+            print("[ONE_TURN_MODE] Note: For dynamic hints, preprocess dataset with current states")
+            run_ppo(config)
         else:
             # Multi-turn mode: Use standard run_ppo with PromptUpdateInteraction
             run_ppo(config)
