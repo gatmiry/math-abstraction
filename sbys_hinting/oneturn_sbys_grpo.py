@@ -2946,6 +2946,13 @@ def run_ppo_one_turn(config, tokenizer, base_train_data: list):
     val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
     
     # ==================== DATASET CREATION ====================
+    # CRITICAL: Set dataloader_num_workers=0 so __getitem__ runs in main process
+    # where Ray actors are accessible (not in worker processes)
+    from omegaconf import OmegaConf
+    OmegaConf.set_struct(config, False)  # Allow modifications
+    config.data.dataloader_num_workers = 0
+    print(f"[run_ppo_one_turn] Set config.data.dataloader_num_workers=0")
+    
     # Create DynamicHintDataset from base_train_data (list of dicts)
     # This dataset queries try_index via ray.get_actor() at __getitem__ time
     print(f"[run_ppo_one_turn] Creating DynamicHintDataset with {len(base_train_data)} samples...")
