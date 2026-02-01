@@ -56,7 +56,7 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full
 SYSTEM_PROMPT_NAME = "full_solution_simple"
 
 HINT_LEVEL = -1
-VAL_SIZE = 128
+VAL_SIZE = 64
 PROMPT_UPDATE_ENABLED = True
 PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
 PROMPT_UPDATE_MAX_USER_TURNS = 2
@@ -66,9 +66,9 @@ PROMPT_RESET_USER_TAG = "__USER__\n"
 PROMPT_LOG_VALIDATION_MARKER = "__LOG_VALIDATION__\n"  # Marker to enable logging in _reset_request_prompt
 ENABLE_VALIDATION_INTERACTION = False
 #
-TRAIN_BATCH_SIZE = 256  # Minimum for 8 GPUs - debugging multi-turn
+TRAIN_BATCH_SIZE = 64  # Minimum for 8 GPUs - debugging multi-turn
 TOTAL_EPOCHS = 50
-TEST_BATCH_SIZE = 128  # Minimum for 8 GPUs
+TEST_BATCH_SIZE = 64  # Minimum for 8 GPUs
 
 
 
@@ -895,7 +895,7 @@ def parse_args():
 
 # Distributed training configuration
 # 1 node, 8 GPUs = 8 GPUs total
-NUM_NODES = 2  # Single node (8 GPUs)
+NUM_NODES = 8  # Single node (8 GPUs)
 GPUS_PER_NODE = 8
 
 
@@ -1294,6 +1294,15 @@ class ProblemStateActor:
         new_try_index = state["try_index"]
         self._problem_state[problem_key] = state
         
+        # Log hint level changes
+        if old_try_index != new_try_index:
+            print(f"[HINT_LEVEL_UPDATE] problem={problem_key[:60]}... is_correct={is_correct} "
+                  f"try_index: {old_try_index} → {new_try_index} "
+                  f"(able={state.get('able_index')}, unable={state.get('unable_index')}, max={guide_steps_count})")
+        else:
+            print(f"[HINT_LEVEL_SAME] problem={problem_key[:60]}... is_correct={is_correct} "
+                  f"try_index={old_try_index} (no change)")
+        
         return True, old_try_index, new_try_index, state
 
 
@@ -1610,6 +1619,23 @@ class PromptUpdateInteraction(BaseInteraction):
             print(f"[PromptUpdateInteraction] Turn 1: problem={problem[:80] if problem else 'None'}...")
             print(f"[PromptUpdateInteraction] Turn 1: sbys_solution has {len(sbys_solution)} steps")
             
+            # Track hint levels per problem to verify all 4 samples use same level
+            if not hasattr(PromptUpdateInteraction, '_hint_level_tracker'):
+                PromptUpdateInteraction._hint_level_tracker = {}
+            hint_level = problem_state['try_index']
+            if problem_key not in PromptUpdateInteraction._hint_level_tracker:
+                PromptUpdateInteraction._hint_level_tracker[problem_key] = {'level': hint_level, 'count': 1}
+                print(f"[HINT_LEVEL_CHECK] problem={problem_key[:40]}... FIRST sample, hint_level={hint_level}")
+            else:
+                tracker = PromptUpdateInteraction._hint_level_tracker[problem_key]
+                tracker['count'] += 1
+                if tracker['level'] != hint_level:
+                    print(f"[HINT_LEVEL_MISMATCH] problem={problem_key[:40]}... "
+                          f"sample #{tracker['count']} has hint_level={hint_level} but expected {tracker['level']}!")
+                else:
+                    print(f"[HINT_LEVEL_CHECK] problem={problem_key[:40]}... "
+                          f"sample #{tracker['count']}/4 hint_level={hint_level} ✓")
+            
             # Extract Turn 0 generation (the one we're discarding)
             turn0_generation = ""
             turn0_prompt = ""
@@ -1736,6 +1762,11 @@ class PromptUpdateInteraction(BaseInteraction):
         print(f"[PromptUpdateInteraction] ground_truth={ground_truth[:50] if ground_truth else None}...")
         print(f"[PromptUpdateInteraction] boxed_answer={boxed_answer[:50] if boxed_answer else 'N/A'}...")
         print(f"[PromptUpdateInteraction] reward={reward}")
+        
+        # Log Turn 2 evaluation with hint level used
+        is_correct = reward > 0
+        print(f"[TURN2_EVAL] problem={problem_key[:40]}... hint_level={problem_state.get('try_index', 0)} "
+              f"is_correct={is_correct} boxed={boxed_answer[:30] if boxed_answer else 'N/A'}")
         
         # Log validation state with reward (only for validation, at Turn 2)
         # NOTE: Avoid blocking operations (ray.get, file locking) here to prevent deadlocks
@@ -1887,6 +1918,16 @@ class PromptUpdateInteraction(BaseInteraction):
             print(f"  Turn 2: count={stats['turn2_count']}, avg={_avg(stats['turn2_durations']):.2f}s, max={_max(stats['turn2_durations']):.2f}s")
             print(f"  Generation (T1->T2): avg={_avg(stats['generation_times']):.2f}s, max={_max(stats['generation_times']):.2f}s")
             print(f"  try_claim_and_update: avg={_avg(stats['try_claim_durations']):.3f}s, max={_max(stats['try_claim_durations']):.3f}s")
+            
+            # Hint level tracker summary
+            if hasattr(PromptUpdateInteraction, '_hint_level_tracker'):
+                tracker = PromptUpdateInteraction._hint_level_tracker
+                if tracker:
+                    problems_tracked = len(tracker)
+                    all_4_samples = sum(1 for v in tracker.values() if v['count'] >= 4)
+                    print(f"  Hint levels: {problems_tracked} problems tracked, {all_4_samples} had all 4 samples")
+                    # Clear tracker after summary to avoid memory growth
+                    PromptUpdateInteraction._hint_level_tracker = {}
             print(f"{'='*60}\n")
         
         # Terminate the sequence - we're done with this problem for this GRPO step
