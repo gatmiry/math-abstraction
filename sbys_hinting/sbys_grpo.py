@@ -56,7 +56,7 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full
 SYSTEM_PROMPT_NAME = "full_solution_simple"
 
 HINT_LEVEL = -1
-VAL_SIZE = 256
+VAL_SIZE = 128
 PROMPT_UPDATE_ENABLED = True
 PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
 PROMPT_UPDATE_MAX_USER_TURNS = 2
@@ -68,7 +68,7 @@ ENABLE_VALIDATION_INTERACTION = False
 #
 TRAIN_BATCH_SIZE = 256  # Minimum for 8 GPUs - debugging multi-turn
 TOTAL_EPOCHS = 50
-TEST_BATCH_SIZE = 256  # Minimum for 8 GPUs
+TEST_BATCH_SIZE = 128  # Minimum for 8 GPUs
 
 
 
@@ -895,7 +895,7 @@ def parse_args():
 
 # Distributed training configuration
 # 1 node, 8 GPUs = 8 GPUs total
-NUM_NODES = 1  # Single node (8 GPUs)
+NUM_NODES = 2  # Single node (8 GPUs)
 GPUS_PER_NODE = 8
 
 
@@ -2266,52 +2266,67 @@ def write_interaction_config() -> str:
     return target_path
 
 
-def patch_sglang_on_all_nodes():
+def patch_verl_on_all_nodes():
     """
-    Apply patched sglang_rollout.py to all nodes in the Ray cluster.
+    Apply patched verl files to all nodes in the Ray cluster.
     
-    This patches verl's sglang_rollout.py to increase watchdog_timeout from 300s to 600s,
-    which prevents sglang from killing itself during long sequence generation.
+    Patches:
+    1. sglang_rollout.py - watchdog_timeout=600, Turn 1 optimization (32 tokens)
+    2. fsdp_workers.py - distributed timeout=3600s (was 30min default causing timeouts)
     """
-    # Path to our patched version (in git repo)
-    patched_file = os.path.join(os.path.dirname(__file__), "patches", "sglang_rollout_patched.py")
+    patches_dir = os.path.join(os.path.dirname(__file__), "patches")
     
-    # Target path in verl installation
-    target_path = "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/workers/rollout/sglang_rollout/sglang_rollout.py"
+    # Define patches to apply: (source_file, target_path)
+    patches = [
+        (
+            os.path.join(patches_dir, "sglang_rollout_patched.py"),
+            "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/workers/rollout/sglang_rollout/sglang_rollout.py"
+        ),
+        (
+            os.path.join(patches_dir, "fsdp_workers_patched.py"),
+            "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/workers/fsdp_workers.py"
+        ),
+    ]
     
-    if not os.path.exists(patched_file):
-        print(f"[WARN] Patched sglang_rollout.py not found at {patched_file}, skipping patch")
+    # Read all patches
+    patch_data = []
+    for source_file, target_path in patches:
+        if not os.path.exists(source_file):
+            print(f"[WARN] Patch file not found: {source_file}, skipping")
+            continue
+        with open(source_file, 'rb') as f:
+            content = f.read()
+        patch_data.append((content, target_path, os.path.basename(source_file)))
+        print(f"[INFO] Read {os.path.basename(source_file)} ({len(content)} bytes)")
+    
+    if not patch_data:
+        print("[WARN] No patches to apply")
         return False
     
-    # Read the patched file
-    with open(patched_file, 'rb') as f:
-        patched_content = f.read()
-    
-    print(f"[INFO] Read patched sglang_rollout.py ({len(patched_content)} bytes)")
-    
     @ray.remote
-    def apply_patch(content: bytes, target: str) -> str:
-        """Apply the patch on this node."""
+    def apply_patches(patches_list: list) -> str:
+        """Apply all patches on this node."""
         import os
         import socket
-        
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, 'wb') as f:
-            f.write(content)
-        
-        return f"{socket.gethostname()}: patched {target}"
+        results = []
+        for content, target, name in patches_list:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, 'wb') as f:
+                f.write(content)
+            results.append(name)
+        return f"{socket.gethostname()}: patched {', '.join(results)}"
     
     # Get all nodes
     nodes = ray.nodes()
     node_ips = [node["NodeManagerAddress"] for node in nodes if node["Alive"]]
-    print(f"[INFO] Patching sglang_rollout.py on {len(node_ips)} nodes: {node_ips}")
+    print(f"[INFO] Patching verl on {len(node_ips)} nodes: {node_ips}")
     
-    # Apply patch on all nodes
+    # Apply patches on all nodes
     tasks = []
     for node_ip in node_ips:
-        task = apply_patch.options(
+        task = apply_patches.options(
             resources={f"node:{node_ip}": 0.001}
-        ).remote(patched_content, target_path)
+        ).remote(patch_data)
         tasks.append((node_ip, task))
     
     # Wait for all patches to complete
@@ -2325,8 +2340,13 @@ def patch_sglang_on_all_nodes():
             success = False
     
     if success:
-        print(f"[INFO] ✓ sglang_rollout.py patched on all nodes")
+        print(f"[INFO] ✓ All verl patches applied on all nodes")
     return success
+
+
+# Keep old name as alias for backward compatibility
+def patch_sglang_on_all_nodes():
+    return patch_verl_on_all_nodes()
 
 
 def distribute_checkpoint_to_all_nodes(checkpoint_dir: str, target_dir: str):
@@ -2572,8 +2592,17 @@ def main():
         "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",  # Better error handling
         # Gloo settings (used for CPU barriers)
         "GLOO_SOCKET_TIMEOUT": "3600000",  # 1 hour in milliseconds
-        # PyTorch distributed timeout
+        "GLOO_TIMEOUT_MS": "2700000",  # 45 min - Gloo collective timeout
+        # PyTorch distributed timeout (affects init_process_group default)
+        "TORCH_DISTRIBUTED_TIMEOUT": "2700",  # 45 min in seconds
         "TORCH_DISTRIBUTED_DEBUG": "OFF",  # Set to DETAIL for debugging
+        # Ray gRPC keepalive settings - prevent "keepalive watchdog timeout" during slow model init
+        "RAY_grpc_keepalive_time_ms": "60000",  # Send keepalive ping every 60s (default 10s)
+        "RAY_grpc_keepalive_timeout_ms": "600000",  # Wait 10 min for keepalive response (default 20s)
+        "RAY_health_check_initial_delay_ms": "60000",  # Delay first health check by 60s
+        "RAY_health_check_period_ms": "60000",  # Health check every 60s
+        "RAY_health_check_timeout_ms": "600000",  # 10 min timeout for health checks
+        "RAY_health_check_failure_threshold": "10",  # Allow 10 failures before considering dead
     }
     for key, value in distributed_env_vars.items():
         os.environ[key] = value
@@ -2723,9 +2752,9 @@ def main():
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",  # Reduced to 50% - more headroom for FSDP
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
-        "actor_rollout_ref.rollout.response_length=16384",  # 16k for Turn 2
-        "actor_rollout_ref.rollout.max_model_len=20480",  # 4096 + 16384
-        "actor_rollout_ref.rollout.max_num_batched_tokens=1310720",  # 20480*64
+        "actor_rollout_ref.rollout.response_length=10240",  # 10k for Turn 2 (reduced from 16k)
+        "actor_rollout_ref.rollout.max_model_len=14336",  # 4096 + 10240
+        "actor_rollout_ref.rollout.max_num_batched_tokens=917504",  # 14336*64
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
@@ -2761,7 +2790,7 @@ def main():
         f"data.val_files={val_dataset_file}",
         "data.prompt_key=prompt",
         "data.max_prompt_length=4096",  # Match increased prompt_length for multi-turn
-        "data.max_response_length=16384",  # Match response_length for Turn 2
+        "data.max_response_length=10240",  # Match response_length for Turn 2
         f"data.train_batch_size={TRAIN_BATCH_SIZE}",
         f"data.val_batch_size={TEST_BATCH_SIZE}",
         "data.return_raw_chat=true",  # Required for sglang rollout
