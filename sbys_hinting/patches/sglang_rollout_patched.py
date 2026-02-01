@@ -818,13 +818,18 @@ class SGLangRollout(BaseRollout):
                     finish_reason_type = FinishReasonTypeEnum.LENGTH
                     break
                 # Video support is not implemented yet
-                output = await self._handle_engine_call(_req, request_sampling_params, image_data=image_data)
+                # For Turn 1, use short max_tokens (32) since it's discarded anyway in multi-turn with hints
+                turn_sampling_params = request_sampling_params.copy()
+                if current_turns == 0:  # First turn - limit to 32 tokens
+                    turn_sampling_params["max_new_tokens"] = 32
+                output = await self._handle_engine_call(_req, turn_sampling_params, image_data=image_data)
                 content = output["text"]
                 finish_reason_type = FinishReasonTypeEnum.from_str(output["meta_info"]["finish_reason"]["type"])
                 current_turns += 1
                 if finish_reason_type == FinishReasonTypeEnum.LENGTH:
                     _req.add_assistant_message(self.processing_class, content)
-                    break
+                    if current_turns > 1:  # Only break after first turn - allow Turn 1 to continue to Turn 2
+                        break
                 else:
                     if self._function_call_parser and self._function_call_parser.has_tool_call(content):
                         finish_reason_type = FinishReasonTypeEnum.TOOL_CALL
