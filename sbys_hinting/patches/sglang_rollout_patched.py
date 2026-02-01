@@ -828,8 +828,17 @@ class SGLangRollout(BaseRollout):
                 current_turns += 1
                 if finish_reason_type == FinishReasonTypeEnum.LENGTH:
                     _req.add_assistant_message(self.processing_class, content)
-                    if current_turns > 1:  # Only break after first turn - allow Turn 1 to continue to Turn 2
+                    if current_turns > 1:  # Turn 2 finished with LENGTH
+                        # Still need to call interaction for scoring before breaking
+                        if _req.interaction_kwargs:
+                            messages = [{"role": x.role, "content": x.content} for x in _req.messages]
+                            should_terminate_sequence, _, reward, metrics = await self.interaction.generate_response(_req.request_id, messages, **_req.interaction_kwargs)
+                            user_turn_rewards.append(reward)
                         break
+                    else:  # Turn 1 finished with LENGTH - need to call interaction for hint injection
+                        if _req.interaction_kwargs and user_turns < self.config.multi_turn.max_user_turns:
+                            _req.state = AsyncRolloutRequestStateEnum.INTERACTING
+                        # If no interaction needed, continue to next turn
                 else:
                     if self._function_call_parser and self._function_call_parser.has_tool_call(content):
                         finish_reason_type = FinishReasonTypeEnum.TOOL_CALL
@@ -874,6 +883,11 @@ class SGLangRollout(BaseRollout):
                         if _req.interaction_kwargs and user_turns < self.config.multi_turn.max_user_turns and current_turns < self.config.multi_turn.max_assistant_turns:
                             _req.state = AsyncRolloutRequestStateEnum.INTERACTING
                         else:
+                            # Final turn - call interaction for scoring before breaking
+                            if _req.interaction_kwargs:
+                                messages = [{"role": x.role, "content": x.content} for x in _req.messages]
+                                should_terminate_sequence, _, reward, metrics = await self.interaction.generate_response(_req.request_id, messages, **_req.interaction_kwargs)
+                                user_turn_rewards.append(reward)
                             break
             elif _req.state == AsyncRolloutRequestStateEnum.INTERACTING:
                 user_turns += 1
