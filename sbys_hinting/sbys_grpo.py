@@ -895,7 +895,7 @@ def parse_args():
 
 # Distributed training configuration
 # 1 node, 8 GPUs = 8 GPUs total
-NUM_NODES = 8  # Single node (8 GPUs)
+NUM_NODES = 1  # Single node (8 GPUs)
 GPUS_PER_NODE = 8
 
 
@@ -2266,6 +2266,69 @@ def write_interaction_config() -> str:
     return target_path
 
 
+def patch_sglang_on_all_nodes():
+    """
+    Apply patched sglang_rollout.py to all nodes in the Ray cluster.
+    
+    This patches verl's sglang_rollout.py to increase watchdog_timeout from 300s to 600s,
+    which prevents sglang from killing itself during long sequence generation.
+    """
+    # Path to our patched version (in git repo)
+    patched_file = os.path.join(os.path.dirname(__file__), "patches", "sglang_rollout_patched.py")
+    
+    # Target path in verl installation
+    target_path = "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/workers/rollout/sglang_rollout/sglang_rollout.py"
+    
+    if not os.path.exists(patched_file):
+        print(f"[WARN] Patched sglang_rollout.py not found at {patched_file}, skipping patch")
+        return False
+    
+    # Read the patched file
+    with open(patched_file, 'rb') as f:
+        patched_content = f.read()
+    
+    print(f"[INFO] Read patched sglang_rollout.py ({len(patched_content)} bytes)")
+    
+    @ray.remote
+    def apply_patch(content: bytes, target: str) -> str:
+        """Apply the patch on this node."""
+        import os
+        import socket
+        
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, 'wb') as f:
+            f.write(content)
+        
+        return f"{socket.gethostname()}: patched {target}"
+    
+    # Get all nodes
+    nodes = ray.nodes()
+    node_ips = [node["NodeManagerAddress"] for node in nodes if node["Alive"]]
+    print(f"[INFO] Patching sglang_rollout.py on {len(node_ips)} nodes: {node_ips}")
+    
+    # Apply patch on all nodes
+    tasks = []
+    for node_ip in node_ips:
+        task = apply_patch.options(
+            resources={f"node:{node_ip}": 0.001}
+        ).remote(patched_content, target_path)
+        tasks.append((node_ip, task))
+    
+    # Wait for all patches to complete
+    success = True
+    for node_ip, task in tasks:
+        try:
+            result = ray.get(task, timeout=60)
+            print(f"[INFO] {result}")
+        except Exception as e:
+            print(f"[ERROR] Failed to patch on {node_ip}: {e}")
+            success = False
+    
+    if success:
+        print(f"[INFO] ✓ sglang_rollout.py patched on all nodes")
+    return success
+
+
 def distribute_checkpoint_to_all_nodes(checkpoint_dir: str, target_dir: str):
     """
     Distribute checkpoint shards from head node to all worker nodes.
@@ -2849,6 +2912,10 @@ def main():
     import time
     print("[INFO] Waiting 5 seconds for Ray cluster to stabilize...")
     time.sleep(5)
+    
+    # Patch sglang_rollout.py on all nodes (increases watchdog timeout for long sequences)
+    print("[INFO] Patching sglang_rollout.py on all nodes...")
+    patch_sglang_on_all_nodes()
     
     # Run PPO training
     print("Starting GRPO training with verl...")
