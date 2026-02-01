@@ -864,57 +864,7 @@ from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from verl.utils.model import compute_position_id_with_mask
 from verl.workers.rollout.schemas import AsyncRolloutRequest, BASE_CHAT_HISTORY, Message
-# Ensure Ray runtime_env carries necessary env vars
-try:
-    from verl.trainer.constants_ppo import PPO_RAY_RUNTIME_ENV
-    PPO_RAY_RUNTIME_ENV.setdefault("env_vars", {})
-    PPO_RAY_RUNTIME_ENV["env_vars"]["VLLM_USE_V1"] = "0"
-    # HuggingFace cache - use shared NFS path so workers don't need to re-download
-    HF_CACHE_PATH = "/mnt/task_runtime/.hf_cache"
-    PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HOME"] = HF_CACHE_PATH
-    PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HUB_CACHE"] = f"{HF_CACHE_PATH}/hub"
-    PPO_RAY_RUNTIME_ENV["env_vars"]["TRANSFORMERS_CACHE"] = f"{HF_CACHE_PATH}/transformers"
-    # Force offline mode to prevent HuggingFace API timeouts blocking training
-    PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HUB_OFFLINE"] = "1"
-    PPO_RAY_RUNTIME_ENV["env_vars"]["TRANSFORMERS_OFFLINE"] = "1"
-    # NCCL P2P workaround for hardware issues
-    PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_IGNORE_DISABLED_P2P"] = "1"
-    PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_P2P_DISABLE"] = "1"
-    # NCCL network stability settings - fix for socket errors (code 3)
-    PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_TIMEOUT"] = "3600"  # 1 hour timeout (default is 30 min)
-    PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_DEBUG"] = "INFO"  # Full debug logging to catch network issues
-    PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_SOCKET_NTHREADS"] = "4"  # More socket threads for stability
-    PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_NSOCKS_PERTHREAD"] = "4"  # More sockets per thread
-    PPO_RAY_RUNTIME_ENV["env_vars"]["NCCL_IB_DISABLE"] = "1"  # Disable InfiniBand, use TCP sockets
-    # Torch distributed settings for better error reporting
-    PPO_RAY_RUNTIME_ENV["env_vars"]["TORCH_DISTRIBUTED_DEBUG"] = "OFF"  # Set to DETAIL for debugging
-    PPO_RAY_RUNTIME_ENV["env_vars"]["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"  # Better error handling
-    # Gloo timeout for CPU barriers (prevents Connection closed by peer errors)
-    PPO_RAY_RUNTIME_ENV["env_vars"]["GLOO_SOCKET_TIMEOUT"] = "3600000"  # 1 hour in milliseconds
-    # Add PYTHONPATH so verl workers can import sbys_hinting module
-    PPO_RAY_RUNTIME_ENV["env_vars"]["PYTHONPATH"] = _parent_dir
-    # Add CUDA library paths for sglang subprocesses
-    cuda_lib_paths = [
-        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib",
-        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib",
-        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cublas/lib",
-        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cudnn/lib",
-        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cufft/lib",
-        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/curand/lib",
-        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cusolver/lib",
-        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cusparse/lib",
-        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/nccl/lib",
-        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/nvjitlink/lib",
-    ]
-    existing_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-    PPO_RAY_RUNTIME_ENV["env_vars"]["LD_LIBRARY_PATH"] = ":".join(cuda_lib_paths) + ":" + existing_ld_path
-    # Use triton attention backend instead of flashinfer JIT (system CUDA doesn't support sm_100a)
-    PPO_RAY_RUNTIME_ENV["env_vars"]["SGLANG_ATTENTION_BACKEND"] = "triton"
-    # Add sglang to pip packages for workers
-    PPO_RAY_RUNTIME_ENV.setdefault("pip", [])
-    PPO_RAY_RUNTIME_ENV["pip"].append("sglang[all]==0.4.6.post1")
-except ImportError:
-    pass  # verl 0.4.x may not have this
+# PPO_RAY_RUNTIME_ENV removed - not needed for single node
 
 # Configuration
 DEFAULT_MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507"
@@ -952,7 +902,7 @@ def parse_args():
 
 # Distributed training configuration
 # 1 node, 8 GPUs = 8 GPUs total
-NUM_NODES = 8
+NUM_NODES = 1
 GPUS_PER_NODE = 8
 
 

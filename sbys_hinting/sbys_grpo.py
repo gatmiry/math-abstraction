@@ -56,7 +56,7 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full
 SYSTEM_PROMPT_NAME = "full_solution_simple"
 
 HINT_LEVEL = -1
-VAL_SIZE = 256
+VAL_SIZE = 8
 PROMPT_UPDATE_ENABLED = True
 PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
 PROMPT_UPDATE_MAX_USER_TURNS = 2
@@ -66,9 +66,9 @@ PROMPT_RESET_USER_TAG = "__USER__\n"
 PROMPT_LOG_VALIDATION_MARKER = "__LOG_VALIDATION__\n"  # Marker to enable logging in _reset_request_prompt
 ENABLE_VALIDATION_INTERACTION = False
 #
-TRAIN_BATCH_SIZE = 256  # Batch size for training
+TRAIN_BATCH_SIZE = 8  # Minimum for 8 GPUs - debugging multi-turn
 TOTAL_EPOCHS = 50
-TEST_BATCH_SIZE = 256  # Reduced for faster validation
+TEST_BATCH_SIZE = 8  # Minimum for 8 GPUs
 
 
 
@@ -850,6 +850,9 @@ try:
     PPO_RAY_RUNTIME_ENV["env_vars"]["LD_LIBRARY_PATH"] = ":".join(cuda_lib_paths) + ":" + existing_ld_path
     # Use triton attention backend instead of flashinfer JIT (system CUDA doesn't support sm_100a)
     PPO_RAY_RUNTIME_ENV["env_vars"]["SGLANG_ATTENTION_BACKEND"] = "triton"
+    # Enable sglang debug logging to diagnose multi-turn issues
+    PPO_RAY_RUNTIME_ENV["env_vars"]["SGLANG_LOG_LEVEL"] = "DEBUG"
+    PPO_RAY_RUNTIME_ENV["env_vars"]["SGLANG_SHOW_TIME_COST"] = "1"
     # Add sglang to pip packages for workers
     PPO_RAY_RUNTIME_ENV.setdefault("pip", [])
     PPO_RAY_RUNTIME_ENV["pip"].append("sglang[all]==0.4.6.post1")
@@ -892,7 +895,7 @@ def parse_args():
 
 # Distributed training configuration
 # 1 node, 8 GPUs = 8 GPUs total
-NUM_NODES = 8
+NUM_NODES = 1  # Single node for testing
 GPUS_PER_NODE = 8
 
 
@@ -1366,7 +1369,12 @@ class PromptUpdateInteraction(BaseInteraction):
         for msg in messages:
             if msg.get("role") == "system":
                 system_content = msg.get("content", "")
-                if system_content in self._our_system_prompts:
+                # Debug: check if it matches our prompts
+                is_our_prompt = system_content in self._our_system_prompts
+                # Also check substring match as fallback
+                is_turn2_keyword = "studying mathematics" in system_content or "Incomplete proof:" in system_content
+                print(f"[TURN_DETECT] system_len={len(system_content)}, is_our_prompt={is_our_prompt}, is_turn2_keyword={is_turn2_keyword}, first50={system_content[:50]!r}", flush=True)
+                if is_our_prompt or is_turn2_keyword:
                     return 2  # This is our prompt from Turn 1's reset
                 else:
                     return 1  # This is the original prompt from dataset
@@ -2039,11 +2047,11 @@ def install_prompt_reset_hook():
             
             if content.startswith(PROMPT_RESET_PREFIX):
                 print(f"[TIMING] patched_add_user_message DETECTED RESET at {_patch_start:.3f}, current input_ids len={len(self.input_ids)}")
-                payload = content[len(PROMPT_RESET_PREFIX) :]
+                payload = content[len(PROMPT_RESET_PREFIX):]
                 new_system_content = None
                 new_user_content = payload
                 if payload.startswith(PROMPT_RESET_SYSTEM_TAG):
-                    payload = payload[len(PROMPT_RESET_SYSTEM_TAG) :]
+                    payload = payload[len(PROMPT_RESET_SYSTEM_TAG):]
                     if PROMPT_RESET_USER_TAG in payload:
                         system_part, user_part = payload.split(PROMPT_RESET_USER_TAG, 1)
                         new_system_content = system_part.rstrip("\n")
@@ -2652,9 +2660,9 @@ def main():
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",  # Reduced to 50% - more headroom for FSDP
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
-        "actor_rollout_ref.rollout.response_length=16384",  # Increased from 12288 to further reduce LENGTH truncation
+        "actor_rollout_ref.rollout.response_length=16384",  # 16k for Turn 2
         "actor_rollout_ref.rollout.max_model_len=20480",  # 4096 + 16384
-        "actor_rollout_ref.rollout.max_num_batched_tokens=1310720",  # 20480*16 = ~102GB KV cache total, ~12.8GB per GPU with TP=8
+        "actor_rollout_ref.rollout.max_num_batched_tokens=1310720",  # 20480*64
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
@@ -2690,7 +2698,7 @@ def main():
         f"data.val_files={val_dataset_file}",
         "data.prompt_key=prompt",
         "data.max_prompt_length=4096",  # Match increased prompt_length for multi-turn
-        "data.max_response_length=16384",  # Match rollout.response_length
+        "data.max_response_length=16384",  # Match response_length for Turn 2
         f"data.train_batch_size={TRAIN_BATCH_SIZE}",
         f"data.val_batch_size={TEST_BATCH_SIZE}",
         "data.return_raw_chat=true",  # Required for sglang rollout
@@ -2703,7 +2711,7 @@ def main():
         f"trainer.default_local_dir={output_dir}",
         f"trainer.total_epochs={TOTAL_EPOCHS}",
         "trainer.save_freq=50",  # Save checkpoint every N steps
-        "trainer.val_before_train=true",  # Skip validation before training (too slow)
+        "trainer.val_before_train=true",  # Initial evaluation enabled
         "trainer.test_freq=5",  # Validate every 50 training steps
         "trainer.log_val_generations=3",  # Log N validation samples to wandb
         
