@@ -56,7 +56,7 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full
 SYSTEM_PROMPT_NAME = "full_solution_simple"
 
 HINT_LEVEL = -1
-VAL_SIZE = 8
+VAL_SIZE = 256
 PROMPT_UPDATE_ENABLED = True
 PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
 PROMPT_UPDATE_MAX_USER_TURNS = 2
@@ -66,9 +66,9 @@ PROMPT_RESET_USER_TAG = "__USER__\n"
 PROMPT_LOG_VALIDATION_MARKER = "__LOG_VALIDATION__\n"  # Marker to enable logging in _reset_request_prompt
 ENABLE_VALIDATION_INTERACTION = False
 #
-TRAIN_BATCH_SIZE = 8  # Minimum for 8 GPUs - debugging multi-turn
+TRAIN_BATCH_SIZE = 256  # Minimum for 8 GPUs - debugging multi-turn
 TOTAL_EPOCHS = 50
-TEST_BATCH_SIZE = 8  # Minimum for 8 GPUs
+TEST_BATCH_SIZE = 256  # Minimum for 8 GPUs
 
 
 
@@ -895,7 +895,7 @@ def parse_args():
 
 # Distributed training configuration
 # 1 node, 8 GPUs = 8 GPUs total
-NUM_NODES = 1  # Single node for testing
+NUM_NODES = 8  # Single node (8 GPUs)
 GPUS_PER_NODE = 8
 
 
