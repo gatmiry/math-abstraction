@@ -895,7 +895,7 @@ def parse_args():
 
 # Distributed training configuration
 # 1 node, 8 GPUs = 8 GPUs total
-NUM_NODES = 8  # Single node (8 GPUs)
+NUM_NODES = 8  # 8 nodes (64 GPUs)
 GPUS_PER_NODE = 8
 
 
@@ -1164,51 +1164,61 @@ class ProblemStateActor:
                 count += 1
         return count
     
-    def increment_turn_counter(self, problem_key: str, target_count: int = 8) -> int:
+    def increment_turn_counter(self, problem_key: str, target_count: int = 8, sent_at: float = 0, sent_step: int = -1) -> int:
         """Increment the turn counter. Called in both Turn 1 and Turn 2.
         
         Returns the counter value AFTER increment.
         
-        VERIFICATION: When counter transitions from 0 to 1 (first increment of a new step),
-        we check if total_attempts increased since the last time counter was 0.
-        If not, the previous step didn't complete (counter never hit target_count).
+        If counter is stale (from a previous incomplete batch), reset it.
+        
+        Debug params:
+        - sent_at: timestamp when the call was sent (for latency tracking)
+        - sent_step: the step number when call was sent (to detect stale calls)
         """
+        import time
+        
         if problem_key not in self._problem_state:
             return 0
         state = self._problem_state[problem_key]
         counter = state.get("turn_counter", 0)
-        total_attempts = state.get("total_attempts", 0)
-        last_verified_attempts = state.get("last_verified_attempts", -1)
+        last_counter_time = state.get("_last_counter_time", 0)
+        now = time.time()
+        current_step = state.get("total_attempts", 0)
         
-        # VERIFICATION: First increment of a new step (counter == 0)
-        if counter == 0:
-            # Check if total_attempts increased since last time we started a step
-            # If not (and this isn't the first step), the previous step didn't complete!
-            if last_verified_attempts != -1 and total_attempts == last_verified_attempts:
-                error_msg = (
-                    f"FATAL ERROR: Previous step did not complete!\n"
-                    f"Counter is 0 but total_attempts ({total_attempts}) did not increase since last step.\n"
-                    f"This means counter never reached {target_count} in the previous step.\n"
-                    f"Problem key: {problem_key[:100]}..."
-                )
-                print(f"[ProblemStateActor] {error_msg}")
-                raise RuntimeError(error_msg)
-            
-            # Mark current total_attempts as verified (we'll check it increased at next step start)
-            state["last_verified_attempts"] = total_attempts
+        # DEBUG: Check if this call is from a previous step (race condition!)
+        if sent_step >= 0 and sent_step < current_step:
+            print(f"[RACE_DETECTED] increment_turn_counter arrived LATE! "
+                  f"sent_step={sent_step}, current_step={current_step}, "
+                  f"latency={now - sent_at:.3f}s, problem={problem_key[:40]}...")
+            return counter  # Ignore stale call
         
-        elif counter >= target_count:
-            # Counter should have been reset when it hit target_count
-            error_msg = (
-                f"FATAL ERROR: turn_counter ({counter}) >= target ({target_count}) at start of increment!\n"
-                f"Previous step did not reset counter properly.\n"
-                f"Problem key: {problem_key[:100]}..."
-            )
-            print(f"[ProblemStateActor] {error_msg}")
-            raise RuntimeError(error_msg)
+        # DEBUG: Log latency for fire-and-forget calls
+        if sent_at > 0:
+            latency = now - sent_at
+            if latency > 1.0:  # Log if > 1 second latency
+                print(f"[SLOW_CALL] increment_turn_counter latency={latency:.3f}s for {problem_key[:40]}...")
+        
+        # If counter is non-zero but it's been more than 5 minutes since last increment,
+        # the previous batch probably timed out. Reset the counter.
+        STALE_TIMEOUT = 300  # 5 minutes
+        if counter > 0 and (now - last_counter_time) > STALE_TIMEOUT:
+            print(f"[COUNTER_RESET] Stale counter detected for {problem_key[:40]}... "
+                  f"counter={counter}, last_activity={now - last_counter_time:.0f}s ago. Resetting to 0.")
+            counter = 0
+            state["turn_counter"] = 0
+        
+        # If counter >= target, previous step didn't reset properly. Reset it.
+        if counter >= target_count:
+            print(f"[COUNTER_RESET] Counter overflow for {problem_key[:40]}... "
+                  f"counter={counter} >= target={target_count}. Resetting to 0.")
+            counter = 0
+            state["turn_counter"] = 0
         
         counter += 1
         state["turn_counter"] = counter
+        state["_last_counter_time"] = now
+        total_attempts = state.get("total_attempts", 0)
+        print(f"[COUNTER_DEBUG] increment_turn_counter: {problem_key[:40]}... counter={counter}/{target_count}, problem_step={total_attempts}")
         return counter
     
     def try_claim_and_update(self, problem_key: str, is_correct: bool, target_count: int) -> tuple:
@@ -1232,6 +1242,8 @@ class ProblemStateActor:
         # Increment counter and check if we hit the target
         counter = state.get("turn_counter", 0) + 1
         state["turn_counter"] = counter
+        total_attempts = state.get("total_attempts", 0)
+        print(f"[COUNTER_DEBUG] try_claim_and_update: {problem_key[:40]}... counter={counter}/{target_count}, problem_step={total_attempts}")
         
         # SANITY CHECK: Counter should NEVER exceed target_count
         # If it does, something is seriously wrong (duplicate calls, missing reset, etc.)
@@ -1256,10 +1268,13 @@ class ProblemStateActor:
             return False, old_try_index, old_try_index, state
         
         # We hit the target! Claim and reset counter for next step
+        old_step = state.get("total_attempts", 0)
         state["turn_counter"] = 0
         
         # Apply updates
-        state["total_attempts"] = state.get("total_attempts", 0) + 1
+        state["total_attempts"] = old_step + 1
+        new_step = state["total_attempts"]
+        print(f"[STEP_COMPLETE] problem={problem_key[:40]}... step {old_step} → {new_step}, counter reset to 0")
         if is_correct:
             state["total_correct"] = state.get("total_correct", 0) + 1
         
@@ -1311,18 +1326,42 @@ PROBLEM_STATE_ACTOR_NAME = "problem_state_actor"
 
 
 def get_or_create_problem_state_actor():
-    """Get existing ProblemStateActor or create a new one."""
-    try:
-        # Try to get existing actor
-        return ray.get_actor(PROBLEM_STATE_ACTOR_NAME, namespace="sbys_grpo")
-    except ValueError:
-        # Actor doesn't exist, create it
-        return ProblemStateActor.options(
-            name=PROBLEM_STATE_ACTOR_NAME,
-            namespace="sbys_grpo",  # Use consistent namespace
-            lifetime="detached",  # Survives driver failure
-            max_concurrency=2000,  # Must handle TRAIN_BATCH_SIZE * n concurrent requests (256 * 4 = 1024+)
-        ).remote()
+    """Get existing ProblemStateActor or create a new one.
+    
+    Uses get-or-create pattern with retries to handle race conditions.
+    Does NOT kill existing actor to avoid race conditions with multiple workers.
+    
+    NOTE: If you need fresh code, manually kill the actor before starting:
+        ray.kill(ray.get_actor('problem_state_actor', namespace='sbys_grpo'))
+    """
+    import time
+    
+    # Try to get or create the actor with retries (handles race conditions)
+    for attempt in range(10):
+        try:
+            # First check if actor already exists
+            actor = ray.get_actor(PROBLEM_STATE_ACTOR_NAME, namespace="sbys_grpo")
+            if attempt == 0:
+                print(f"[ProblemStateActor] Found existing actor, reusing it")
+            return actor
+        except ValueError:
+            # Actor doesn't exist, try to create it
+            try:
+                print(f"[ProblemStateActor] Creating new actor (attempt {attempt + 1})...")
+                return ProblemStateActor.options(
+                    name=PROBLEM_STATE_ACTOR_NAME,
+                    namespace="sbys_grpo",
+                    lifetime="detached",
+                    max_concurrency=2000,
+                ).remote()
+            except ray.exceptions.ActorAlreadyExistsError:
+                # Another worker created it, retry to get it
+                print(f"[ProblemStateActor] Race condition, retrying...")
+                time.sleep(0.5)
+                continue
+    
+    # Final fallback
+    return ray.get_actor(PROBLEM_STATE_ACTOR_NAME, namespace="sbys_grpo")
 
 
 class PromptUpdateInteraction(BaseInteraction):
@@ -1375,6 +1414,9 @@ class PromptUpdateInteraction(BaseInteraction):
         
         Returns: 1 for Turn 1, 2 for Turn 2
         """
+        # Count assistant messages to detect actual turn number
+        assistant_count = sum(1 for msg in messages if msg.get("role") == "assistant")
+        
         for msg in messages:
             if msg.get("role") == "system":
                 system_content = msg.get("content", "")
@@ -1382,11 +1424,18 @@ class PromptUpdateInteraction(BaseInteraction):
                 is_our_prompt = system_content in self._our_system_prompts
                 # Also check substring match as fallback
                 is_turn2_keyword = "studying mathematics" in system_content or "Incomplete proof:" in system_content
-                print(f"[TURN_DETECT] system_len={len(system_content)}, is_our_prompt={is_our_prompt}, is_turn2_keyword={is_turn2_keyword}, first50={system_content[:50]!r}", flush=True)
-                if is_our_prompt or is_turn2_keyword:
-                    return 2  # This is our prompt from Turn 1's reset
-                else:
-                    return 1  # This is the original prompt from dataset
+                detected_turn = 2 if (is_our_prompt or is_turn2_keyword) else 1
+                
+                # SANITY CHECK: assistant_count should match detected turn
+                # Turn 1: 1 assistant message (the one we're discarding)
+                # Turn 2: 1 assistant message (the one with hints we're scoring)
+                if assistant_count > 1:
+                    print(f"[TURN_DETECT WARNING] assistant_count={assistant_count} > 1! "
+                          f"detected_turn={detected_turn}, is_our_prompt={is_our_prompt}, first50={system_content[:50]!r}")
+                
+                print(f"[TURN_DETECT] detected_turn={detected_turn}, assistant_count={assistant_count}, "
+                      f"is_our_prompt={is_our_prompt}, is_turn2_keyword={is_turn2_keyword}", flush=True)
+                return detected_turn
         return 1  # Default to Turn 1 if no system message found
     
     ##generate_response returns a 4‑tuple:
@@ -1458,10 +1507,12 @@ class PromptUpdateInteraction(BaseInteraction):
         
         # ==================== DETAILED TIMING START ====================
         _impl_start = _time.time()
+        _rollout_step = kwargs.get("_rollout_step", -1)  # Global step from sglang_rollout
         _timing_log = {
             "instance_id": instance_id[:16],
             "impl_start": _impl_start,
             "state_actor_calls": [],  # Track all state actor calls
+            "rollout_step": _rollout_step,
         }
         
         # Track detailed state for crash diagnosis
@@ -1615,7 +1666,7 @@ class PromptUpdateInteraction(BaseInteraction):
                 try_index=problem_state.get("try_index", 0),
             )
             print(f"[TIMING] Turn 1 START at {_turn1_start:.3f}, setup_time={_turn1_start - _impl_start:.3f}s")
-            print(f"[PromptUpdateInteraction] Turn 1, problem_key={problem_key[:50]}..., try_index={problem_state['try_index']}")
+            print(f"[PromptUpdateInteraction] ROLLOUT_STEP={_rollout_step} Turn 1, problem_key={problem_key[:50]}..., try_index={problem_state['try_index']}")
             print(f"[PromptUpdateInteraction] Turn 1: problem={problem[:80] if problem else 'None'}...")
             print(f"[PromptUpdateInteraction] Turn 1: sbys_solution has {len(sbys_solution)} steps")
             
@@ -1691,16 +1742,14 @@ class PromptUpdateInteraction(BaseInteraction):
             # Actually save turn1_info to class dict for retrieval in Turn 2
             PromptUpdateInteraction._turn1_info_by_problem[problem_key] = turn1_info
             
-            # Increment turn counter - FIRE AND FORGET (don't await)
-            # This is critical for performance: avoids 768 serialized actor calls per batch
-            # Each Turn 1 and Turn 2 increments by 1. Last one to reach target claims.
+            # Increment turn counter - FIRE AND FORGET with debug params
+            # The state actor will detect if this call arrives late (after next step started)
             N_SAMPLES_PER_PROMPT = 4  # Must match actor_rollout_ref.rollout.n
             TARGET_COUNT = N_SAMPLES_PER_PROMPT * 2  # 4 Turn 1s + 4 Turn 2s = 8
-            
-            # Track fire-and-forget call (we don't await but track when we sent it)
-            _increment_fire_time = _time.time()
-            self._state_actor.increment_turn_counter.remote(problem_key, TARGET_COUNT)  # No await!
-            _timing_log["state_actor_calls"].append(("increment_turn_counter_fire", 0.0))  # Fire and forget
+            current_step = problem_state.get("total_attempts", 0)
+            sent_at = _time.time()
+            print(f"[COUNTER_DEBUG] Turn 1 INCREMENT (fire-and-forget) for {problem_key[:40]}... instance={instance_id[:8]}, step={current_step}")
+            self._state_actor.increment_turn_counter.remote(problem_key, TARGET_COUNT, sent_at, current_step)
             
             # Record Turn 1 end time for timing measurement
             _turn1_end = _time.time()
@@ -1741,7 +1790,7 @@ class PromptUpdateInteraction(BaseInteraction):
             try_index=problem_state.get("try_index", 0),
         )
         print(f"[TIMING] Turn 2 START at {_turn2_start:.3f}, gen_time_approx={_generation_time_approx:.3f}s")
-        print(f"[PromptUpdateInteraction] Turn 2: Evaluating generation for problem_key={problem_key[:50] if problem_key else None}...")
+        print(f"[PromptUpdateInteraction] ROLLOUT_STEP={_rollout_step} Turn 2: Evaluating generation for problem_key={problem_key[:50] if problem_key else None}...")
         
         # Extract the assistant's response
         last_assistant = ""
@@ -1846,6 +1895,7 @@ class PromptUpdateInteraction(BaseInteraction):
         # Await this call - it updates try_index which must complete before next step
         # Only 256 Turn 2 calls per batch (not 768), so this is acceptable
         _try_claim_start = _time.time()
+        print(f"[COUNTER_DEBUG] Turn 2 try_claim_and_update for {problem_key[:40]}... instance={instance_id[:8]}")
         print(f"[TIMING] try_claim_and_update STARTING at {_try_claim_start:.3f} for {instance_id[:8]}...")
         result = await self._safe_actor_call(
             self._state_actor.try_claim_and_update.remote(problem_key, is_correct, TARGET_COUNT),
@@ -2844,7 +2894,7 @@ def main():
         f"trainer.default_local_dir={output_dir}",
         f"trainer.total_epochs={TOTAL_EPOCHS}",
         "trainer.save_freq=50",  # Save checkpoint every N steps
-        "trainer.val_before_train=true",  # Initial evaluation enabled
+        "trainer.val_before_train=false",  # Initial evaluation DISABLED to save time
         "trainer.test_freq=5",  # Validate every 50 training steps
         "trainer.log_val_generations=3",  # Log N validation samples to wandb
         

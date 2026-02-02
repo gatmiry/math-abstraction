@@ -273,6 +273,7 @@ class SGLangRollout(BaseRollout):
         super().__init__()
         self.config = config
         self._device_mesh_cpu = device_mesh
+        self._global_step = 0  # Track global step for debugging race conditions
         os.environ.setdefault("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK", "true")
 
         (
@@ -361,6 +362,8 @@ class SGLangRollout(BaseRollout):
             self.config.multi_turn.max_assistant_turns = self.config.max_model_len // 3
         if self.config.multi_turn.max_user_turns is None:
             self.config.multi_turn.max_user_turns = self.config.max_model_len // 3
+        print(f"[SGLANG_CONFIG] max_assistant_turns={self.config.multi_turn.max_assistant_turns}, "
+              f"max_user_turns={self.config.multi_turn.max_user_turns}, max_model_len={self.config.max_model_len}")
 
     def _init_inference_engine(self, trust_remote_code, actor_module, port):
         # initialize the inference engine
@@ -511,6 +514,8 @@ class SGLangRollout(BaseRollout):
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        self._global_step += 1
+        print(f"[GLOBAL_STEP] ===== Starting generate_sequences, global_step={self._global_step} =====")
         if self.config.multi_turn.enable:
             return self._req_level_generate_sequences(prompts, **kwargs)
         return self._batch_level_generate_sequences(prompts, **kwargs)
@@ -786,6 +791,13 @@ class SGLangRollout(BaseRollout):
         request_sampling_params.update(kwargs)
 
         while current_turns < self.config.multi_turn.max_assistant_turns:
+            # Debug: log loop state at each iteration
+            _problem_preview = str(_req.interaction_kwargs.get("problem", ""))[:40] if _req.interaction_kwargs else "N/A"
+            # gen_turn: 0=initial gen (discarded), 1=Turn1 gen, 2=Turn2 gen
+            # interaction_turn: 1=Turn1 (hint injection), 2=Turn2 (scoring)
+            print(f"[SGLANG_LOOP] STEP={self._global_step} request={_req.request_id[:8]}... state={_req.state.name}, "
+                  f"gen_turn={current_turns}, interaction_count={user_turns}, problem={_problem_preview}...")
+            
             if _req.state == AsyncRolloutRequestStateEnum.PENDING:
                 await self._handle_pending_state(_req)
                 _req.state = AsyncRolloutRequestStateEnum.RUNNING
@@ -831,12 +843,18 @@ class SGLangRollout(BaseRollout):
                     if current_turns > 1:  # Turn 2 finished with LENGTH
                         # Still need to call interaction for scoring before breaking
                         if _req.interaction_kwargs:
+                            # This is Turn 2 interaction (scoring) - gen_turn=2 means we just finished gen #2
+                            print(f"[SGLANG_INTERACTION] STEP={self._global_step} PATH=LENGTH_TURN2 (scoring), request={_req.request_id[:8]}..., "
+                                  f"gen_turn={current_turns}, calling_interaction_turn=2")
                             messages = [{"role": x.role, "content": x.content} for x in _req.messages]
-                            should_terminate_sequence, _, reward, metrics = await self.interaction.generate_response(_req.request_id, messages, **_req.interaction_kwargs)
+                            _kwargs = {**_req.interaction_kwargs, "_rollout_step": self._global_step}
+                            should_terminate_sequence, _, reward, metrics = await self.interaction.generate_response(_req.request_id, messages, **_kwargs)
+                            print(f"[SGLANG_INTERACTION] RESULT: should_terminate={should_terminate_sequence}, reward={reward}")
                             user_turn_rewards.append(reward)
                         break
                     else:  # Turn 1 finished with LENGTH - need to call interaction for hint injection
                         if _req.interaction_kwargs and user_turns < self.config.multi_turn.max_user_turns:
+                            print(f"[SGLANG_STATE] Turn 1 LENGTH -> INTERACTING, request={_req.request_id[:8]}..., current_turns={current_turns}")
                             _req.state = AsyncRolloutRequestStateEnum.INTERACTING
                         # If no interaction needed, continue to next turn
                 else:
@@ -881,18 +899,31 @@ class SGLangRollout(BaseRollout):
                             content,
                         )
                         if _req.interaction_kwargs and user_turns < self.config.multi_turn.max_user_turns and current_turns < self.config.multi_turn.max_assistant_turns:
+                            print(f"[SGLANG_STATE] STOP -> INTERACTING, request={_req.request_id[:8]}..., "
+                                  f"current_turns={current_turns}, user_turns={user_turns}, max_assistant={self.config.multi_turn.max_assistant_turns}")
                             _req.state = AsyncRolloutRequestStateEnum.INTERACTING
                         else:
                             # Final turn - call interaction for scoring before breaking
                             if _req.interaction_kwargs:
+                                # This is Turn 2 interaction (scoring) - gen_turn=2, max reached
+                                print(f"[SGLANG_INTERACTION] STEP={self._global_step} PATH=STOP_FINAL_TURN (scoring), request={_req.request_id[:8]}..., "
+                                      f"gen_turn={current_turns}, calling_interaction_turn=2, max_gen={self.config.multi_turn.max_assistant_turns}")
                                 messages = [{"role": x.role, "content": x.content} for x in _req.messages]
-                                should_terminate_sequence, _, reward, metrics = await self.interaction.generate_response(_req.request_id, messages, **_req.interaction_kwargs)
+                                _kwargs = {**_req.interaction_kwargs, "_rollout_step": self._global_step}
+                                should_terminate_sequence, _, reward, metrics = await self.interaction.generate_response(_req.request_id, messages, **_kwargs)
+                                print(f"[SGLANG_INTERACTION] RESULT: should_terminate={should_terminate_sequence}, reward={reward}")
                                 user_turn_rewards.append(reward)
                             break
             elif _req.state == AsyncRolloutRequestStateEnum.INTERACTING:
                 user_turns += 1
+                # This is Turn 1 interaction (hint injection) if user_turns was 0, or Turn 2 if user_turns was 1
+                interaction_turn = user_turns  # user_turns was just incremented, so this is the current interaction turn
+                print(f"[SGLANG_INTERACTION] STEP={self._global_step} PATH=INTERACTING_HANDLER, request={_req.request_id[:8]}..., "
+                      f"gen_turn={current_turns}, calling_interaction_turn={interaction_turn}")
                 messages = [{"role": x.role, "content": x.content} for x in _req.messages]
-                should_terminate_sequence, content, reward, metrics = await self.interaction.generate_response(_req.request_id, messages, **_req.interaction_kwargs)
+                _kwargs = {**_req.interaction_kwargs, "_rollout_step": self._global_step}
+                should_terminate_sequence, content, reward, metrics = await self.interaction.generate_response(_req.request_id, messages, **_kwargs)
+                print(f"[SGLANG_INTERACTION] RESULT: should_terminate={should_terminate_sequence}, reward={reward}, content_len={len(content) if content else 0}")
                 user_turn_rewards.append(reward)
                 if should_terminate_sequence:
                     finish_reason_type = FinishReasonTypeEnum.STOP
