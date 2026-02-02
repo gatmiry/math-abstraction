@@ -10,6 +10,7 @@ import sys
 import json
 import argparse
 import fcntl
+import numpy as np
 import apple_bolt as bolt
 
 # Add parent directory to PYTHONPATH so 'sbys_hinting' module can be imported by verl workers
@@ -1116,6 +1117,39 @@ class ProblemStateActor:
             "total_correct": total_correct,
         }
     
+    def get_hint_level_stats(self) -> Dict[str, Any]:
+        """Get hint level (try_index) distribution stats for wandb logging."""
+        if not self._problem_state:
+            return {"hint_level/count": 0}
+        
+        try_indices = [s.get("try_index", 0) for s in self._problem_state.values()]
+        guide_steps = [s.get("guide_steps_count", 0) for s in self._problem_state.values()]
+        
+        # Calculate percentages of max hint level used
+        hint_pcts = []
+        for ti, gs in zip(try_indices, guide_steps):
+            if gs > 0:
+                hint_pcts.append(ti / gs)
+            else:
+                hint_pcts.append(0.0)
+        
+        try_indices = np.array(try_indices)
+        hint_pcts = np.array(hint_pcts)
+        
+        return {
+            "hint_level/count": len(try_indices),
+            "hint_level/mean": float(np.mean(try_indices)),
+            "hint_level/median": float(np.median(try_indices)),
+            "hint_level/max": float(np.max(try_indices)),
+            "hint_level/min": float(np.min(try_indices)),
+            "hint_level/std": float(np.std(try_indices)),
+            "hint_level/pct_zero": float((try_indices == 0).mean()),
+            "hint_level/pct_low_1_5": float(((try_indices >= 1) & (try_indices <= 5)).mean()),
+            "hint_level/pct_mid_6_15": float(((try_indices >= 6) & (try_indices <= 15)).mean()),
+            "hint_level/pct_high_16plus": float((try_indices >= 16).mean()),
+            "hint_level/pct_of_max_mean": float(np.mean(hint_pcts)),  # How much of available hints used
+        }
+    
     def verify_counters_reset(self, problem_keys: List[str]) -> Dict[str, Any]:
         """Verify that turn_counter is 0 for all specified problems.
         
@@ -1978,6 +2012,22 @@ class PromptUpdateInteraction(BaseInteraction):
                     print(f"  Hint levels: {problems_tracked} problems tracked, {all_4_samples} had all 4 samples")
                     # Clear tracker after summary to avoid memory growth
                     PromptUpdateInteraction._hint_level_tracker = {}
+            
+            # Log hint level stats to wandb (from state actor)
+            try:
+                if self._state_actor is not None:
+                    hint_stats = ray.get(self._state_actor.get_hint_level_stats.remote(), timeout=5.0)
+                    print(f"  [HINT_LEVEL_STATS] mean={hint_stats.get('hint_level/mean', 0):.2f}, "
+                          f"pct_zero={hint_stats.get('hint_level/pct_zero', 0)*100:.1f}%, "
+                          f"pct_high_16+={hint_stats.get('hint_level/pct_high_16plus', 0)*100:.1f}%")
+                    
+                    # Log to wandb if available (only one worker should do this to avoid spam)
+                    import wandb
+                    if wandb.run is not None:
+                        wandb.log(hint_stats, commit=False)
+            except Exception as e:
+                print(f"  [HINT_LEVEL_STATS] Failed to get stats: {e}")
+            
             print(f"{'='*60}\n")
         
         # Terminate the sequence - we're done with this problem for this GRPO step
@@ -3005,9 +3055,21 @@ def main():
                 print("[INFO] Could not connect to existing Ray cluster, starting new one...")
                 ray.init(ignore_reinit_error=True)
         
+        # Kill any existing ProblemStateActor to ensure fresh code is used
+        # This is critical - detached actors survive between runs and may have stale code
+        print("[INFO] Killing any existing ProblemStateActor to ensure fresh code...")
+        try:
+            existing_actor = ray.get_actor(PROBLEM_STATE_ACTOR_NAME, namespace="sbys_grpo")
+            ray.kill(existing_actor)
+            print("[INFO] Killed existing ProblemStateActor")
+            import time
+            time.sleep(2)  # Give Ray time to clean up
+        except ValueError:
+            print("[INFO] No existing ProblemStateActor found")
+        
         # Create the shared ProblemStateActor before training starts
         # This ensures all workers can access the same actor instance
-        print("[INFO] Initializing shared ProblemStateActor for persistent problem state...")
+        print("[INFO] Creating fresh ProblemStateActor...")
         state_actor = get_or_create_problem_state_actor()
         print(f"[INFO] ProblemStateActor ready: {state_actor}")
         
