@@ -59,7 +59,6 @@ SYSTEM_PROMPT_NAME = "full_solution_simple"
 HINT_LEVEL = -1
 VAL_SIZE = 256
 PROMPT_UPDATE_ENABLED = True
-DYNAMIC_HINT_SELECTION = False  # If True, use state actor for binary search hint selection. If False, use fixed try_index = len(sbys_solution) // 2
 PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
 PROMPT_UPDATE_MAX_USER_TURNS = 2
 PROMPT_RESET_PREFIX = "__RESET_PROMPT__\n"
@@ -1426,12 +1425,8 @@ class PromptUpdateInteraction(BaseInteraction):
     def __init__(self, config):
         super().__init__(config)
         self._instance_state = {}  # Per-instance state (keyed by instance_id)
-        # Use Ray Actor for persistent state across all workers (only if dynamic hint selection is enabled)
-        if DYNAMIC_HINT_SELECTION:
-            self._state_actor = get_or_create_problem_state_actor()
-        else:
-            self._state_actor = None
-            print(f"[PromptUpdateInteraction] DYNAMIC_HINT_SELECTION=False, using fixed try_index = len(sbys_solution) // 2")
+        # Use Ray Actor for persistent state across all workers
+        self._state_actor = get_or_create_problem_state_actor()
         # Install the prompt reset hook on this worker (needed for multi-turn with prompt reset)
         install_prompt_reset_hook()
         
@@ -1623,57 +1618,41 @@ class PromptUpdateInteraction(BaseInteraction):
         # Use problem text as key for persistent binary search state (survives across steps)
         problem_key = problem if problem else instance_id
         
-        # Get problem state - either from state actor (dynamic) or use fixed hint level (static)
-        if DYNAMIC_HINT_SELECTION and self._state_actor is not None:
-            # Get persistent state from Ray Actor (initialized at start of training)
-            # Use safe wrapper with timeout to avoid blocking and handle actor issues gracefully
-            _get_state_start = _time.time()
-            problem_state = await self._safe_actor_call(
-                self._state_actor.get_state.remote(problem_key),
-                timeout_seconds=30,
-                default=None,
-                call_name="get_state"
-            )
-            _get_state_duration = _time.time() - _get_state_start
-            _timing_log["state_actor_calls"].append(("get_state", _get_state_duration))
-            if _get_state_duration > 1.0:
-                print(f"[TIMING WARNING] get_state took {_get_state_duration:.3f}s (>1s) for {instance_id[:8]}...")
-            
-            # Fallback initialization if state wasn't pre-initialized (shouldn't happen normally)
-            if problem_state is None:
-                print(f"[PromptUpdateInteraction] WARNING: Problem state not pre-initialized for: {problem_key[:50]}...")
-                problem_state = {
-                    "guide_steps_count": len(sbys_solution) if sbys_solution else 0,
-                    "unable_index": 0,
-                    "able_index": len(sbys_solution) if sbys_solution else 0,
-                    "try_index": 0,
-                    "total_attempts": 0,
-                    "total_correct": 0,
-                }
-                _set_state_start = _time.time()
-                await self._safe_actor_call(
-                    self._state_actor.set_state.remote(problem_key, problem_state),
-                    timeout_seconds=30,
-                    call_name="set_state_init"
-                )
-                _set_state_duration = _time.time() - _set_state_start
-                _timing_log["state_actor_calls"].append(("set_state_init", _set_state_duration))
-                if _set_state_duration > 1.0:
-                    print(f"[TIMING WARNING] set_state (init) took {_set_state_duration:.3f}s (>1s)")
-        else:
-            # STATIC HINT SELECTION: Use fixed try_index = len(sbys_solution) // 2
-            # No state actor calls, no persistent state tracking
-            guide_steps_count = len(sbys_solution) if sbys_solution else 0
-            fixed_try_index = guide_steps_count // 2
+        # Get persistent state from Ray Actor (initialized at start of training)
+        # Use safe wrapper with timeout to avoid blocking and handle actor issues gracefully
+        _get_state_start = _time.time()
+        problem_state = await self._safe_actor_call(
+            self._state_actor.get_state.remote(problem_key),
+            timeout_seconds=30,
+            default=None,
+            call_name="get_state"
+        )
+        _get_state_duration = _time.time() - _get_state_start
+        _timing_log["state_actor_calls"].append(("get_state", _get_state_duration))
+        if _get_state_duration > 1.0:
+            print(f"[TIMING WARNING] get_state took {_get_state_duration:.3f}s (>1s) for {instance_id[:8]}...")
+        
+        # Fallback initialization if state wasn't pre-initialized (shouldn't happen normally)
+        if problem_state is None:
+            print(f"[PromptUpdateInteraction] WARNING: Problem state not pre-initialized for: {problem_key[:50]}...")
             problem_state = {
-                "guide_steps_count": guide_steps_count,
+                "guide_steps_count": len(sbys_solution) if sbys_solution else 0,
                 "unable_index": 0,
-                "able_index": guide_steps_count,
-                "try_index": fixed_try_index,
+                "able_index": len(sbys_solution) if sbys_solution else 0,
+                "try_index": 0,
                 "total_attempts": 0,
                 "total_correct": 0,
             }
-            print(f"[PromptUpdateInteraction] STATIC HINT: try_index={fixed_try_index} (half of {guide_steps_count} steps)")
+            _set_state_start = _time.time()
+            await self._safe_actor_call(
+                self._state_actor.set_state.remote(problem_key, problem_state),
+                timeout_seconds=30,
+                call_name="set_state_init"
+            )
+            _set_state_duration = _time.time() - _set_state_start
+            _timing_log["state_actor_calls"].append(("set_state_init", _set_state_duration))
+            if _set_state_duration > 1.0:
+                print(f"[TIMING WARNING] set_state (init) took {_set_state_duration:.3f}s (>1s)")
         
         # Detect turn by checking system prompt content (not by counter!)
         # Turn 1: System prompt is ORIGINAL from dataset
@@ -1699,17 +1678,16 @@ class PromptUpdateInteraction(BaseInteraction):
         
         # Note: Validation state logging moved to Turn 2 where we have the reward
         
-        # Update guide_steps_count if sbys_solution changed (only if dynamic hint selection)
-        if DYNAMIC_HINT_SELECTION and self._state_actor is not None:
-            if problem_state["guide_steps_count"] == 0 and sbys_solution:
-                print('guide_steps_count changed from 0 to ', len(sbys_solution), ' this was an error and should not happen')
-                problem_state["guide_steps_count"] = len(sbys_solution)
-                problem_state["able_index"] = len(sbys_solution)
-                await self._safe_actor_call(
-                    self._state_actor.set_state.remote(problem_key, problem_state),
-                    timeout_seconds=30,
-                    call_name="set_state_guide_steps_fix"
-                )
+        # Update guide_steps_count if sbys_solution changed (shouldn't happen, but just in case)
+        if problem_state["guide_steps_count"] == 0 and sbys_solution:
+            print('guide_steps_count changed from 0 to ', len(sbys_solution), ' this was an error and should not happen')
+            problem_state["guide_steps_count"] = len(sbys_solution)
+            problem_state["able_index"] = len(sbys_solution)
+            await self._safe_actor_call(
+                self._state_actor.set_state.remote(problem_key, problem_state),
+                timeout_seconds=30,
+                call_name="set_state_guide_steps_fix"
+            )
         
         # ==================== TURN 1: Inject hints ====================
         # Ignore the initial generation (it had no hints), return prompt WITH hints
@@ -1798,17 +1776,14 @@ class PromptUpdateInteraction(BaseInteraction):
             # Actually save turn1_info to class dict for retrieval in Turn 2
             PromptUpdateInteraction._turn1_info_by_problem[problem_key] = turn1_info
             
-            # Increment turn counter - FIRE AND FORGET with debug params (only if dynamic hint selection)
+            # Increment turn counter - FIRE AND FORGET with debug params
             # The state actor will detect if this call arrives late (after next step started)
-            if DYNAMIC_HINT_SELECTION and self._state_actor is not None:
-                N_SAMPLES_PER_PROMPT = 4  # Must match actor_rollout_ref.rollout.n
-                TARGET_COUNT = N_SAMPLES_PER_PROMPT * 2  # 4 Turn 1s + 4 Turn 2s = 8
-                current_step = problem_state.get("total_attempts", 0)
-                sent_at = _time.time()
-                print(f"[COUNTER_DEBUG] Turn 1 INCREMENT (fire-and-forget) for {problem_key[:40]}... instance={instance_id[:8]}, step={current_step}")
-                self._state_actor.increment_turn_counter.remote(problem_key, TARGET_COUNT, sent_at, current_step)
-            else:
-                print(f"[STATIC_HINT] Turn 1 skipping state actor call, fixed try_index={problem_state['try_index']}")
+            N_SAMPLES_PER_PROMPT = 4  # Must match actor_rollout_ref.rollout.n
+            TARGET_COUNT = N_SAMPLES_PER_PROMPT * 2  # 4 Turn 1s + 4 Turn 2s = 8
+            current_step = problem_state.get("total_attempts", 0)
+            sent_at = _time.time()
+            print(f"[COUNTER_DEBUG] Turn 1 INCREMENT (fire-and-forget) for {problem_key[:40]}... instance={instance_id[:8]}, step={current_step}")
+            self._state_actor.increment_turn_counter.remote(problem_key, TARGET_COUNT, sent_at, current_step)
             
             # Record Turn 1 end time for timing measurement
             _turn1_end = _time.time()
@@ -1940,49 +1915,41 @@ class PromptUpdateInteraction(BaseInteraction):
             print(f">>> REWARD: {reward}")
             print("=" * 80 + "\n")
         
-        # ==================== STATE UPDATE (only if dynamic hint selection) ====================
+        # ==================== RACE-FREE STATE UPDATE ====================
+        # Counter-based approach (works regardless of interleaving):
+        # - Turn 1: Each of 4 generations increments counter (+4)
+        # - Turn 2: Each of 4 generations increments counter (+4)
+        # - Total per step = 8 (N_SAMPLES_PER_PROMPT * 2)
+        # - The generation whose increment reaches exactly 8 claims and updates
+        # - After claiming, counter resets to 0 for next step
         is_correct = reward > 0.5
+        N_SAMPLES_PER_PROMPT = 4  # Must match actor_rollout_ref.rollout.n
+        TARGET_COUNT = N_SAMPLES_PER_PROMPT * 2  # 4 Turn 1s + 4 Turn 2s = 8
         
-        if DYNAMIC_HINT_SELECTION and self._state_actor is not None:
-            # Counter-based approach (works regardless of interleaving):
-            # - Turn 1: Each of 4 generations increments counter (+4)
-            # - Turn 2: Each of 4 generations increments counter (+4)
-            # - Total per step = 8 (N_SAMPLES_PER_PROMPT * 2)
-            # - The generation whose increment reaches exactly 8 claims and updates
-            # - After claiming, counter resets to 0 for next step
-            N_SAMPLES_PER_PROMPT = 4  # Must match actor_rollout_ref.rollout.n
-            TARGET_COUNT = N_SAMPLES_PER_PROMPT * 2  # 4 Turn 1s + 4 Turn 2s = 8
-            
-            # Await this call - it updates try_index which must complete before next step
-            # Only 256 Turn 2 calls per batch (not 768), so this is acceptable
-            _try_claim_start = _time.time()
-            print(f"[COUNTER_DEBUG] Turn 2 try_claim_and_update for {problem_key[:40]}... instance={instance_id[:8]}")
-            print(f"[TIMING] try_claim_and_update STARTING at {_try_claim_start:.3f} for {instance_id[:8]}...")
-            result = await self._safe_actor_call(
-                self._state_actor.try_claim_and_update.remote(problem_key, is_correct, TARGET_COUNT),
-                timeout_seconds=30,
-                default=(False, problem_state.get("try_index", 0), problem_state.get("try_index", 0), problem_state),
-                call_name="try_claim_and_update"
-            )
-            _try_claim_duration = _time.time() - _try_claim_start
-            _timing_log["state_actor_calls"].append(("try_claim_and_update", _try_claim_duration))
-            _timing_log["try_claim_duration"] = _try_claim_duration
-            if _try_claim_duration > 2.0:
-                print(f"[TIMING WARNING] try_claim_and_update took {_try_claim_duration:.3f}s (>2s) for {instance_id[:8]}")
-                print(f"[TIMING WARNING] This is a BLOCKING state actor call!")
-            
-            update_success, old_try_index, new_try_index, updated_state = result
-            
-            if update_success:
-                print(f"[PromptUpdateInteraction] WON update claim! Updated hint level: {old_try_index} -> {new_try_index}")
-            else:
-                print(f"[PromptUpdateInteraction] Turn 2 complete: try_index={old_try_index}, is_correct={is_correct}")
+        # Await this call - it updates try_index which must complete before next step
+        # Only 256 Turn 2 calls per batch (not 768), so this is acceptable
+        _try_claim_start = _time.time()
+        print(f"[COUNTER_DEBUG] Turn 2 try_claim_and_update for {problem_key[:40]}... instance={instance_id[:8]}")
+        print(f"[TIMING] try_claim_and_update STARTING at {_try_claim_start:.3f} for {instance_id[:8]}...")
+        result = await self._safe_actor_call(
+            self._state_actor.try_claim_and_update.remote(problem_key, is_correct, TARGET_COUNT),
+            timeout_seconds=30,
+            default=(False, problem_state.get("try_index", 0), problem_state.get("try_index", 0), problem_state),
+            call_name="try_claim_and_update"
+        )
+        _try_claim_duration = _time.time() - _try_claim_start
+        _timing_log["state_actor_calls"].append(("try_claim_and_update", _try_claim_duration))
+        _timing_log["try_claim_duration"] = _try_claim_duration
+        if _try_claim_duration > 2.0:
+            print(f"[TIMING WARNING] try_claim_and_update took {_try_claim_duration:.3f}s (>2s) for {instance_id[:8]}")
+            print(f"[TIMING WARNING] This is a BLOCKING state actor call!")
+        
+        update_success, old_try_index, new_try_index, updated_state = result
+        
+        if update_success:
+            print(f"[PromptUpdateInteraction] WON update claim! Updated hint level: {old_try_index} -> {new_try_index}")
         else:
-            # STATIC HINT SELECTION: No state actor calls, try_index stays fixed
-            old_try_index = problem_state.get("try_index", 0)
-            new_try_index = old_try_index  # Never changes in static mode
-            update_success = False
-            print(f"[STATIC_HINT] Turn 2 complete: fixed try_index={old_try_index}, is_correct={is_correct}, reward={reward}")
+            print(f"[PromptUpdateInteraction] Turn 2 complete: try_index={old_try_index}, is_correct={is_correct}")
 
             # Clean up instance state and turn1_info
             if instance_id in self._instance_state:
@@ -2046,9 +2013,9 @@ class PromptUpdateInteraction(BaseInteraction):
                     # Clear tracker after summary to avoid memory growth
                     PromptUpdateInteraction._hint_level_tracker = {}
             
-            # Log hint level stats to wandb (from state actor) - only if dynamic hint selection
-            if DYNAMIC_HINT_SELECTION and self._state_actor is not None:
-                try:
+            # Log hint level stats to wandb (from state actor)
+            try:
+                if self._state_actor is not None:
                     hint_stats = ray.get(self._state_actor.get_hint_level_stats.remote(), timeout=5.0)
                     print(f"  [HINT_LEVEL_STATS] mean={hint_stats.get('hint_level/mean', 0):.2f}, "
                           f"pct_zero={hint_stats.get('hint_level/pct_zero', 0)*100:.1f}%, "
@@ -2058,10 +2025,8 @@ class PromptUpdateInteraction(BaseInteraction):
                     import wandb
                     if wandb.run is not None:
                         wandb.log(hint_stats, commit=False)
-                except Exception as e:
-                    print(f"  [HINT_LEVEL_STATS] Failed to get stats: {e}")
-            else:
-                print(f"  [STATIC_HINT] Using fixed try_index = len(sbys_solution) // 2 for all problems")
+            except Exception as e:
+                print(f"  [HINT_LEVEL_STATS] Failed to get stats: {e}")
             
             print(f"{'='*60}\n")
         
@@ -2842,7 +2807,6 @@ def main():
     print(f"Output: {output_dir}")
     print(f"Experiment: {experiment_name}")
     print(f"Hint Level: {hint_level}")
-    print(f"Hint Selection: {'DYNAMIC (binary search via ProblemStateActor)' if DYNAMIC_HINT_SELECTION else 'STATIC (fixed at len(sbys_solution) // 2)'}")
     print(f"Nodes: {NUM_NODES}, GPUs per node: {GPUS_PER_NODE}")
     print("=" * 80)
     
@@ -2932,7 +2896,7 @@ def main():
         "actor_rollout_ref.rollout.response_length=10240",  # 10k for Turn 2 (reduced from 16k)
         "actor_rollout_ref.rollout.max_model_len=14336",  # 4096 + 10240
         "actor_rollout_ref.rollout.max_num_batched_tokens=917504",  # 14336*64
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8",  # Halved to avoid OOM in entropy calculation
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
         
@@ -2946,7 +2910,7 @@ def main():
         
         # Actor config
         f"actor_rollout_ref.actor.ppo_mini_batch_size={TRAIN_BATCH_SIZE}",  # Must be <= train_batch_size
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8",  # Halved to avoid OOM in entropy calculation
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         "+actor_rollout_ref.actor.offload_param=true",  # Offload actor params to CPU to reduce GPU memory pressure
@@ -3008,7 +2972,6 @@ def main():
         interaction_config_path = write_interaction_config()
         overrides.extend([
             "actor_rollout_ref.rollout.name=sglang",
-            "actor_rollout_ref.rollout.mode=async",  # Use AsyncLLM for better request scheduling
             "actor_rollout_ref.rollout.multi_turn.enable=true",
             f"actor_rollout_ref.rollout.multi_turn.interaction_config_path={interaction_config_path}",
             f"actor_rollout_ref.rollout.multi_turn.max_assistant_turns={PROMPT_UPDATE_MAX_ASSISTANT_TURNS}",
@@ -3092,42 +3055,37 @@ def main():
                 print("[INFO] Could not connect to existing Ray cluster, starting new one...")
                 ray.init(ignore_reinit_error=True)
         
-        # Only initialize ProblemStateActor if DYNAMIC_HINT_SELECTION is enabled
-        if DYNAMIC_HINT_SELECTION:
-            # Kill any existing ProblemStateActor to ensure fresh code is used
-            # This is critical - detached actors survive between runs and may have stale code
-            print("[INFO] Killing any existing ProblemStateActor to ensure fresh code...")
-            try:
-                existing_actor = ray.get_actor(PROBLEM_STATE_ACTOR_NAME, namespace="sbys_grpo")
-                ray.kill(existing_actor)
-                print("[INFO] Killed existing ProblemStateActor")
-                import time
-                time.sleep(2)  # Give Ray time to clean up
-            except ValueError:
-                print("[INFO] No existing ProblemStateActor found")
-            
-            # Create the shared ProblemStateActor before training starts
-            # This ensures all workers can access the same actor instance
-            print("[INFO] Creating fresh ProblemStateActor...")
-            state_actor = get_or_create_problem_state_actor()
-            print(f"[INFO] ProblemStateActor ready: {state_actor}")
-            
-            # Initialize all problem states at once (more efficient than initializing per-call)
-            all_problems = []
-            for item in train_data:
-                extra_info = item.get("extra_info", {})
-                interaction_kwargs = extra_info.get("interaction_kwargs", {})
-                if interaction_kwargs.get("problem"):
-                    all_problems.append({
-                        "problem": interaction_kwargs["problem"],
-                        "sbys_solution": interaction_kwargs.get("sbys_solution", []),
-                    })
-            print(f"[INFO] Initializing state for {len(all_problems)} problems...")
-            num_initialized = ray.get(state_actor.initialize_all_problems.remote(all_problems))
-            print(f"[INFO] Initialized {num_initialized} problem states")
-        else:
-            print("[INFO] DYNAMIC_HINT_SELECTION=False, skipping ProblemStateActor initialization")
-            print("[INFO] Using fixed try_index = len(sbys_solution) // 2 for all problems")
+        # Kill any existing ProblemStateActor to ensure fresh code is used
+        # This is critical - detached actors survive between runs and may have stale code
+        print("[INFO] Killing any existing ProblemStateActor to ensure fresh code...")
+        try:
+            existing_actor = ray.get_actor(PROBLEM_STATE_ACTOR_NAME, namespace="sbys_grpo")
+            ray.kill(existing_actor)
+            print("[INFO] Killed existing ProblemStateActor")
+            import time
+            time.sleep(2)  # Give Ray time to clean up
+        except ValueError:
+            print("[INFO] No existing ProblemStateActor found")
+        
+        # Create the shared ProblemStateActor before training starts
+        # This ensures all workers can access the same actor instance
+        print("[INFO] Creating fresh ProblemStateActor...")
+        state_actor = get_or_create_problem_state_actor()
+        print(f"[INFO] ProblemStateActor ready: {state_actor}")
+        
+        # Initialize all problem states at once (more efficient than initializing per-call)
+        all_problems = []
+        for item in train_data:
+            extra_info = item.get("extra_info", {})
+            interaction_kwargs = extra_info.get("interaction_kwargs", {})
+            if interaction_kwargs.get("problem"):
+                all_problems.append({
+                    "problem": interaction_kwargs["problem"],
+                    "sbys_solution": interaction_kwargs.get("sbys_solution", []),
+                })
+        print(f"[INFO] Initializing state for {len(all_problems)} problems...")
+        num_initialized = ray.get(state_actor.initialize_all_problems.remote(all_problems))
+        print(f"[INFO] Initialized {num_initialized} problem states")
     
     # Import run_ppo here to avoid import issues
     from verl.trainer.main_ppo import run_ppo
