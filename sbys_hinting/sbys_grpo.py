@@ -3012,11 +3012,12 @@ def main():
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.8",  # Reduced to 50% - more headroom for FSDP
+        "actor_rollout_ref.rollout.multi_stage_wake_up=true",  # Stage memory: weights first, then KV cache - avoids OOM during sync
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
         "actor_rollout_ref.rollout.response_length=10240",  # 10k for Turn 2 (reduced from 16k)
         "actor_rollout_ref.rollout.max_model_len=14336",  # 4096 + 10240
-        "actor_rollout_ref.rollout.max_num_batched_tokens=917504",  # 14336*64
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",  # Halved to avoid OOM in entropy calculation
+        "actor_rollout_ref.rollout.max_num_batched_tokens=9175040",  # 14336*64
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
         
@@ -3030,7 +3031,7 @@ def main():
         
         # Actor config
         f"actor_rollout_ref.actor.ppo_mini_batch_size={TRAIN_BATCH_SIZE}",  # Must be <= train_batch_size
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",  # Halved to avoid OOM in entropy calculation
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         "+actor_rollout_ref.actor.offload_param=true",  # Offload actor params to CPU to reduce GPU memory pressure
