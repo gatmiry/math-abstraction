@@ -3011,12 +3011,12 @@ def main():
         "actor_rollout_ref.rollout.n=4",  # Multiple generations for GRPO
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.8",  # High utilization - no offload means no weight swap OOM
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.7",  # Reduced from 0.8 to leave room for actor update (lm_head needs ~32GB)
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
         "actor_rollout_ref.rollout.response_length=10240",  # 10k for Turn 2 (reduced from 16k)
         "actor_rollout_ref.rollout.max_model_len=14336",  # 4096 + 10240
         "actor_rollout_ref.rollout.max_num_batched_tokens=917504",  # 14336*64
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8",  # Halved to avoid OOM in entropy calculation
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",  # Reduced to avoid OOM in actor update
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
         
@@ -3030,7 +3030,7 @@ def main():
         
         # Actor config
         f"actor_rollout_ref.actor.ppo_mini_batch_size={TRAIN_BATCH_SIZE}",  # Must be <= train_batch_size
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8",  # Halved to avoid OOM in entropy calculation
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",  # Reduced to avoid OOM in actor update (lm_head needs ~32GB)
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         "+actor_rollout_ref.actor.offload_param=false",  # Keep weights on GPU - B200 has 183GB, no need to offload
