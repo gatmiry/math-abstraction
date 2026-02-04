@@ -3083,7 +3083,7 @@ def main():
         interaction_config_path = write_interaction_config()
         overrides.extend([
             "actor_rollout_ref.rollout.name=sglang",
-            "actor_rollout_ref.rollout.mode=async",  # Use AsyncLLM for better request scheduling
+            #"actor_rollout_ref.rollout.mode=async",  # Use AsyncLLM for better request scheduling
             "actor_rollout_ref.rollout.multi_turn.enable=true",
             f"actor_rollout_ref.rollout.multi_turn.interaction_config_path={interaction_config_path}",
             f"actor_rollout_ref.rollout.multi_turn.max_assistant_turns={PROMPT_UPDATE_MAX_ASSISTANT_TURNS}",
