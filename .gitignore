@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+myenv/
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Hugging Face cache
+.hf_cache/
+hf_token.txt
+
+# Output directories (large files)
+outputs/
+newopenaioutputs/
+training_output.log
+crash_logs/
+wandb/
+validation_prompts/
+
+# Task runtime
+task_runtime/
+task_runtime.egg-info/
+
+# Backup files
+*.bak
+
+# Settings
+settings.json

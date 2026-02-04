@@ -3011,7 +3011,7 @@ def main():
         "actor_rollout_ref.rollout.n=4",  # Multiple generations for GRPO
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.7",  # Reduced from 0.8 to leave room for actor update (lm_head needs ~32GB)
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.6",  # Reduced from 0.7 - actor update needs ~55GB headroom
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
         "actor_rollout_ref.rollout.response_length=10240",  # 10k for Turn 2 (reduced from 16k)
         "actor_rollout_ref.rollout.max_model_len=14336",  # 4096 + 10240
