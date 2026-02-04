@@ -59,7 +59,7 @@ SYSTEM_PROMPT_NAME = "full_solution_simple"
 HINT_LEVEL = -1
 VAL_SIZE = 256
 PROMPT_UPDATE_ENABLED = True
-DYNAMIC_HINT_SELECTION = False  # If True, use state actor for binary search hint selection. If False, use fixed try_index = len(sbys_solution) // 2
+DYNAMIC_HINT_SELECTION = True  # If True, use state actor for binary search hint selection. If False, use fixed try_index = len(sbys_solution) // 2
 PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
 PROMPT_UPDATE_MAX_USER_TURNS = 2
 PROMPT_RESET_PREFIX = "__RESET_PROMPT__\n"
@@ -2525,6 +2525,81 @@ def patch_sglang_on_all_nodes():
     return patch_verl_on_all_nodes()
 
 
+def distribute_sbys_grpo_to_all_nodes():
+    """
+    Distribute the sbys_grpo.py file to all nodes in the Ray cluster.
+    
+    This ensures all workers have the latest version of the training script,
+    even if the shared filesystem has caching issues or delays.
+    """
+    current_file = os.path.abspath(__file__)
+    target_path = current_file  # Same path on all nodes
+    
+    # Read the current file
+    with open(current_file, 'rb') as f:
+        file_content = f.read()
+    print(f"[INFO] Read {current_file} ({len(file_content)} bytes)")
+    
+    # Also distribute helper files in the same directory
+    script_dir = os.path.dirname(current_file)
+    files_to_distribute = [
+        (file_content, target_path, "sbys_grpo.py"),
+    ]
+    
+    # Add math_checker.py if it exists
+    math_checker_path = os.path.join(script_dir, "math_checker.py")
+    if os.path.exists(math_checker_path):
+        with open(math_checker_path, 'rb') as f:
+            files_to_distribute.append((f.read(), math_checker_path, "math_checker.py"))
+        print(f"[INFO] Read math_checker.py")
+    
+    # Add system_prompt file if it exists
+    if os.path.exists(SYSTEM_PROMPT_FILE):
+        with open(SYSTEM_PROMPT_FILE, 'rb') as f:
+            files_to_distribute.append((f.read(), SYSTEM_PROMPT_FILE, os.path.basename(SYSTEM_PROMPT_FILE)))
+        print(f"[INFO] Read {os.path.basename(SYSTEM_PROMPT_FILE)}")
+    
+    @ray.remote
+    def write_files(files_list: list) -> str:
+        """Write files on this node."""
+        import os
+        import socket
+        results = []
+        for content, target, name in files_list:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, 'wb') as f:
+                f.write(content)
+            results.append(name)
+        return f"{socket.gethostname()}: wrote {', '.join(results)}"
+    
+    # Get all nodes
+    nodes = ray.nodes()
+    node_ips = [node["NodeManagerAddress"] for node in nodes if node["Alive"]]
+    print(f"[INFO] Distributing sbys_grpo.py and dependencies to {len(node_ips)} nodes: {node_ips}")
+    
+    # Distribute to all nodes
+    tasks = []
+    for node_ip in node_ips:
+        task = write_files.options(
+            resources={f"node:{node_ip}": 0.001}
+        ).remote(files_to_distribute)
+        tasks.append((node_ip, task))
+    
+    # Wait for all writes to complete
+    success = True
+    for node_ip, task in tasks:
+        try:
+            result = ray.get(task, timeout=60)
+            print(f"[INFO] {result}")
+        except Exception as e:
+            print(f"[ERROR] Failed to distribute to {node_ip}: {e}")
+            success = False
+    
+    if success:
+        print(f"[INFO] ✓ sbys_grpo.py distributed to all nodes")
+    return success
+
+
 def distribute_checkpoint_to_all_nodes(checkpoint_dir: str, target_dir: str):
     """
     Distribute checkpoint shards from head node to all worker nodes.
@@ -2927,12 +3002,12 @@ def main():
         "actor_rollout_ref.rollout.n=4",  # Multiple generations for GRPO
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",  # Reduced to 50% - more headroom for FSDP
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.8",  # Reduced to 50% - more headroom for FSDP
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
         "actor_rollout_ref.rollout.response_length=10240",  # 10k for Turn 2 (reduced from 16k)
         "actor_rollout_ref.rollout.max_model_len=14336",  # 4096 + 10240
         "actor_rollout_ref.rollout.max_num_batched_tokens=917504",  # 14336*64
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8",  # Halved to avoid OOM in entropy calculation
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
         
@@ -2946,7 +3021,7 @@ def main():
         
         # Actor config
         f"actor_rollout_ref.actor.ppo_mini_batch_size={TRAIN_BATCH_SIZE}",  # Must be <= train_batch_size
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8",  # Halved to avoid OOM in entropy calculation
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",  # Halved to avoid OOM in entropy calculation
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         "+actor_rollout_ref.actor.offload_param=true",  # Offload actor params to CPU to reduce GPU memory pressure
@@ -3091,6 +3166,10 @@ def main():
             except ConnectionError:
                 print("[INFO] Could not connect to existing Ray cluster, starting new one...")
                 ray.init(ignore_reinit_error=True)
+        
+        # Distribute sbys_grpo.py to all nodes FIRST (ensures all workers have latest code)
+        print("[INFO] Distributing sbys_grpo.py to all nodes...")
+        distribute_sbys_grpo_to_all_nodes()
         
         # Only initialize ProblemStateActor if DYNAMIC_HINT_SELECTION is enabled
         if DYNAMIC_HINT_SELECTION:
