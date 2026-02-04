@@ -855,6 +855,15 @@ try:
     # Enable sglang debug logging to diagnose multi-turn issues
     PPO_RAY_RUNTIME_ENV["env_vars"]["SGLANG_LOG_LEVEL"] = "DEBUG"
     PPO_RAY_RUNTIME_ENV["env_vars"]["SGLANG_SHOW_TIME_COST"] = "1"
+    # Add WANDB_API_KEY to Ray workers so wandb logger can authenticate
+    try:
+        _early_tokens = load_tokens()
+        _wandb_key = _early_tokens.get('WANDB_API_KEY', '')
+        if _wandb_key and _wandb_key != 'YOUR_WANDB_API_KEY_HERE':
+            PPO_RAY_RUNTIME_ENV["env_vars"]["WANDB_API_KEY"] = _wandb_key
+            print(f"[INFO] WANDB_API_KEY added to Ray runtime_env for workers")
+    except Exception as e:
+        print(f"[WARNING] Could not add WANDB_API_KEY to Ray runtime_env: {e}")
     # Add sglang to pip packages for workers
     PPO_RAY_RUNTIME_ENV.setdefault("pip", [])
     PPO_RAY_RUNTIME_ENV["pip"].append("sglang[all]==0.4.6.post1")
