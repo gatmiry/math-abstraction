@@ -38,8 +38,8 @@ os.environ.setdefault("HF_HOME", "/mnt/task_runtime/.hf_cache")
 # If generations are taking longer than 3 minutes, something is wrong and we want to know
 try:
     from sglang.srt.server_args import ServerArgs
-    ServerArgs.watchdog_timeout = 600  # 10 minutes - allow time for long sequences (16k tokens)
-    print(f"[INFO] Set sglang watchdog_timeout to {ServerArgs.watchdog_timeout}s (10 min)")
+    ServerArgs.watchdog_timeout = 1200  # 20 minutes - allow time for long sequences (16k tokens)
+    print(f"[INFO] Set sglang watchdog_timeout to {ServerArgs.watchdog_timeout}s (20 min)")
 except ImportError:
     pass  # sglang not installed yet
 

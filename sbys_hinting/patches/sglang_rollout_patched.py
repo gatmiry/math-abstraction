@@ -416,7 +416,7 @@ class SGLangRollout(BaseRollout):
                 mm_attention_backend="fa3",
                 attention_backend="triton",  # Use triton instead of flashinfer (system CUDA doesn't support sm_100a)
                 disable_cuda_graph=True,  # Disable CUDA graphs for B200 compatibility with system CUDA < 12.8
-                watchdog_timeout=600,  # 10 minutes - allow time for long 16k token sequences
+                watchdog_timeout=1200,  # 20 minutes - allow time for long 16k token sequences
             )
         else:
             self._engine = None
