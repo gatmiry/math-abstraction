@@ -46,6 +46,16 @@ except ImportError:
 # Tell wandb to save code with each run
 os.environ["WANDB_SAVE_CODE"] = "true"
 
+# Ray gRPC and health check timeouts - MUST be set BEFORE ray.init()
+# These prevent Ray from killing actors during slow model initialization
+os.environ["RAY_grpc_keepalive_time_ms"] = "60000"      # Send keepalive ping every 60s (default 10s)
+os.environ["RAY_grpc_keepalive_timeout_ms"] = "600000"  # Wait 10 min for keepalive response (default 20s)
+os.environ["RAY_health_check_initial_delay_ms"] = "60000"   # Delay first health check by 60s
+os.environ["RAY_health_check_period_ms"] = "60000"          # Health check every 60s
+os.environ["RAY_health_check_timeout_ms"] = "600000"        # 10 min timeout for health checks
+os.environ["RAY_health_check_failure_threshold"] = "10"     # Allow 10 failures before considering dead
+print("[INFO] Set Ray keepalive/health check timeouts (10 min) for slow model init")
+
 # Token file path (not tracked by git)
 # Try sbys_hinting first, then fall back to hinting folder
 TOKEN_FILE = os.path.join(os.path.dirname(__file__), "hf_token.txt")
@@ -2552,6 +2562,7 @@ def patch_verl_on_all_nodes():
     Patches:
     1. sglang_rollout.py - watchdog_timeout=1200 (20 min), Turn 1 optimization (32 tokens)
     2. fsdp_workers.py - distributed timeout=3600s (was 30min default causing timeouts)
+    3. ray_trainer.py - save_checkpoint_before_train option to save step 0 checkpoint
     """
     import shutil
     patches_dir = os.path.join(os.path.dirname(__file__), "patches")
@@ -2566,6 +2577,10 @@ def patch_verl_on_all_nodes():
         (
             os.path.join(patches_dir, "fsdp_workers_patched.py"),
             "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/workers/fsdp_workers.py"
+        ),
+        (
+            os.path.join(patches_dir, "ray_trainer_patched.py"),
+            "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/trainer/ppo/ray_trainer.py"
         ),
     ]
     print("[INFO] Patching LOCAL node first...")
@@ -2585,6 +2600,10 @@ def patch_verl_on_all_nodes():
         (
             os.path.join(patches_dir, "fsdp_workers_patched.py"),
             "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/workers/fsdp_workers.py"
+        ),
+        (
+            os.path.join(patches_dir, "ray_trainer_patched.py"),
+            "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/trainer/ppo/ray_trainer.py"
         ),
     ]
     
@@ -3126,12 +3145,12 @@ def main():
         "actor_rollout_ref.rollout.n=4",  # Multiple generations for GRPO
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",  # High utilization - FSDP offloads weights to CPU
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.6",  # High utilization - FSDP offloads weights to CPU
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
         "actor_rollout_ref.rollout.response_length=16384",  # 16k for Turn 2
         "actor_rollout_ref.rollout.max_model_len=20480",  # 4096 + 16384
         "actor_rollout_ref.rollout.max_num_batched_tokens=1310720",  # 20480*64 (intentionally large)
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",  # Reduced to avoid OOM in actor update
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",  # Reduced to avoid OOM in actor update
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
         "actor_rollout_ref.rollout.free_cache_engine=true",  # Free KV cache between generation and FSDP update phases
@@ -3146,7 +3165,7 @@ def main():
         
         # Actor config
         f"actor_rollout_ref.actor.ppo_mini_batch_size={TRAIN_BATCH_SIZE}",  # Must be <= train_batch_size
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",  # Reduced to avoid OOM in actor update (lm_head needs ~32GB)
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",  # Reduced to avoid OOM in actor update (lm_head needs ~32GB)
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         "+actor_rollout_ref.actor.offload_param=true",  # Offload weights to CPU - frees GPU for sglang KV cache
@@ -3179,7 +3198,8 @@ def main():
         f"trainer.n_gpus_per_node={GPUS_PER_NODE}",
         f"trainer.default_local_dir={output_dir}",
         f"trainer.total_epochs={TOTAL_EPOCHS}",
-        "trainer.save_freq=50",  # Save checkpoint every N steps
+        "trainer.save_freq=20",  # Save checkpoint every N steps
+        "trainer.save_checkpoint_before_train=true",  # Save step 0 checkpoint as sanity check
         "trainer.val_before_train=false",  # Initial evaluation DISABLED to save time
         "trainer.test_freq=5",  # Validate every 50 training steps
         "trainer.log_val_generations=3",  # Log N validation samples to wandb
