@@ -1053,91 +1053,17 @@ class ProblemStateActor:
             print(f"[ProblemStateActor] Reset {reset_count} stale counters at run start")
         return reset_count
     
-    def get_next_validation_log_index(self) -> int:
-        """Atomically increment and return the next validation log index.
-        
-        This is thread-safe across all distributed workers since it runs
-        in a single Ray actor.
-        """
-        self._validation_log_count += 1
-        return self._validation_log_count
+    
     
     def get_state(self, problem_key: str) -> Optional[Dict[str, Any]]:
         """Get state for a problem, returns None if not exists."""
         return self._problem_state.get(problem_key)
     
-    def get_states_batch(self, problem_keys: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
-        """Get states for multiple problems in a single call (reduces actor contention)."""
-        return {key: self._problem_state.get(key) for key in problem_keys}
-    
     def set_state(self, problem_key: str, state: Dict[str, Any]) -> None:
         """Set state for a problem."""
         self._problem_state[problem_key] = state
     
-    def process_turn1_batch(self, problem_keys: List[str], target_count: int = 8) -> Dict[str, int]:
-        """Process Turn 1 for multiple problems in a single call.
-        
-        Increments turn_counter for each problem and returns the new counter values.
-        Much more efficient than calling increment_turn_counter individually.
-        """
-        results = {}
-        for key in problem_keys:
-            if key in self._problem_state:
-                state = self._problem_state[key]
-                counter = state.get("turn_counter", 0) + 1
-                state["turn_counter"] = counter
-                results[key] = counter
-        return results
     
-    def process_turn2_batch(self, updates: List[Dict[str, Any]], target_count: int = 8) -> Dict[str, tuple]:
-        """Process Turn 2 for multiple problems in a single call.
-        
-        Each update dict should contain: problem_key, is_correct
-        Returns dict of problem_key -> (update_success, old_try_index, new_try_index, state)
-        """
-        results = {}
-        for update in updates:
-            key = update["problem_key"]
-            is_correct = update["is_correct"]
-            
-            if key not in self._problem_state:
-                results[key] = (False, 0, 0, {})
-                continue
-                
-            state = self._problem_state[key]
-            counter = state.get("turn_counter", 0) + 1
-            state["turn_counter"] = counter
-            
-            # Check if this call claims the update (hits target_count)
-            if counter == target_count:
-                old_try_index = state.get("try_index", 0)
-                able = state.get("able_index", 0)
-                unable = state.get("unable_index", 0)
-                
-                if is_correct:
-                    # Correct: move able_index down (need fewer hints)
-                    able = old_try_index
-                else:
-                    # Incorrect: move unable_index up (need more hints)
-                    unable = old_try_index + 1
-                
-                # Binary search: next try is midpoint
-                new_try_index = (able + unable) // 2
-                
-                state["able_index"] = able
-                state["unable_index"] = unable
-                state["try_index"] = new_try_index
-                state["total_attempts"] = state.get("total_attempts", 0) + 1
-                if is_correct:
-                    state["total_correct"] = state.get("total_correct", 0) + 1
-                state["turn_counter"] = 0  # Reset for next step
-                state["last_verified_attempts"] = state.get("total_attempts", 0)
-                
-                results[key] = (True, old_try_index, new_try_index, dict(state))
-            else:
-                results[key] = (False, state.get("try_index", 0), state.get("try_index", 0), dict(state))
-        
-        return results
     
     def update_state(self, problem_key: str, updates: Dict[str, Any]) -> Dict[str, Any]:
         """Update specific fields in problem state and return the updated state."""
@@ -1146,22 +1072,7 @@ class ProblemStateActor:
         self._problem_state[problem_key].update(updates)
         return self._problem_state[problem_key]
     
-    def init_state_if_missing(self, problem_key: str, default_state: Dict[str, Any]) -> Dict[str, Any]:
-        """Initialize state for a problem if it doesn't exist, return current state."""
-        if problem_key not in self._problem_state:
-            self._problem_state[problem_key] = default_state
-        return self._problem_state[problem_key]
     
-    def get_all_stats(self) -> Dict[str, Any]:
-        """Get summary statistics across all problems."""
-        total_problems = len(self._problem_state)
-        total_attempts = sum(s.get("total_attempts", 0) for s in self._problem_state.values())
-        total_correct = sum(s.get("total_correct", 0) for s in self._problem_state.values())
-        return {
-            "total_problems": total_problems,
-            "total_attempts": total_attempts,
-            "total_correct": total_correct,
-        }
     
     def get_hint_level_stats(self) -> Dict[str, Any]:
         """Get hint level (try_index) distribution stats for wandb logging."""
@@ -1196,26 +1107,7 @@ class ProblemStateActor:
             "hint_level/pct_of_max_mean": float(np.mean(hint_pcts)),  # How much of available hints used
         }
     
-    def verify_counters_reset(self, problem_keys: List[str]) -> Dict[str, Any]:
-        """Verify that turn_counter is 0 for all specified problems.
-        
-        Called after each GRPO step to ensure all counters were properly reset.
-        
-        Returns:
-            Dict with 'all_zero': bool, 'non_zero_problems': list of (key, counter) tuples
-        """
-        non_zero = []
-        for key in problem_keys:
-            if key in self._problem_state:
-                counter = self._problem_state[key].get("turn_counter", 0)
-                if counter != 0:
-                    non_zero.append((key[:50], counter))
-        
-        return {
-            "all_zero": len(non_zero) == 0,
-            "non_zero_problems": non_zero,
-            "checked_count": len(problem_keys),
-        }
+    
     
     def initialize_all_problems(self, problems_data: List[Dict[str, Any]]) -> int:
         """Initialize state for all problems at once (called at start of training).
