@@ -2550,10 +2550,31 @@ def patch_verl_on_all_nodes():
     Apply patched verl files to all nodes in the Ray cluster.
     
     Patches:
-    1. sglang_rollout.py - watchdog_timeout=600, Turn 1 optimization (32 tokens)
+    1. sglang_rollout.py - watchdog_timeout=1200 (20 min), Turn 1 optimization (32 tokens)
     2. fsdp_workers.py - distributed timeout=3600s (was 30min default causing timeouts)
     """
+    import shutil
     patches_dir = os.path.join(os.path.dirname(__file__), "patches")
+    
+    # ==================== PATCH LOCAL NODE FIRST ====================
+    # This ensures the head node has the patches before any workers start
+    local_patches = [
+        (
+            os.path.join(patches_dir, "sglang_rollout_patched.py"),
+            "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/workers/rollout/sglang_rollout/sglang_rollout.py"
+        ),
+        (
+            os.path.join(patches_dir, "fsdp_workers_patched.py"),
+            "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/workers/fsdp_workers.py"
+        ),
+    ]
+    print("[INFO] Patching LOCAL node first...")
+    for source, target in local_patches:
+        if os.path.exists(source):
+            shutil.copy2(source, target)
+            print(f"[INFO] LOCAL: Copied {os.path.basename(source)} -> {target}")
+        else:
+            print(f"[WARN] LOCAL: Patch not found: {source}")
     
     # Define patches to apply: (source_file, target_path)
     patches = [
