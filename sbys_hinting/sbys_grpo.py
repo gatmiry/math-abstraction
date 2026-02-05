@@ -59,7 +59,7 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full
 SYSTEM_PROMPT_NAME = "full_solution_simple"
 
 HINT_LEVEL = -1
-VAL_SIZE = 256
+VAL_SIZE = 128
 PROMPT_UPDATE_ENABLED = True
 DYNAMIC_HINT_SELECTION = True  # If True, use state actor for binary search hint selection. If False, use fixed try_index = len(sbys_solution) // 2
 PROMPT_UPDATE_MAX_ASSISTANT_TURNS = 2  # Turn 1: inject hints, Turn 2: evaluate
@@ -70,9 +70,9 @@ PROMPT_RESET_USER_TAG = "__USER__\n"
 PROMPT_LOG_VALIDATION_MARKER = "__LOG_VALIDATION__\n"  # Marker to enable logging in _reset_request_prompt
 ENABLE_VALIDATION_INTERACTION = False
 #
-TRAIN_BATCH_SIZE = 256  # Minimum for 8 GPUs - debugging multi-turn
+TRAIN_BATCH_SIZE = 128  # Minimum for 8 GPUs - debugging multi-turn
 TOTAL_EPOCHS = 50
-TEST_BATCH_SIZE = 256  # Minimum for 8 GPUs
+TEST_BATCH_SIZE = 128  # Minimum for 8 GPUs
 
 
 
@@ -709,6 +709,94 @@ def report_crash_to_monitor(error_type: str, error_msg: str, stack_trace: str = 
         print(f"[CrashMonitor] Failed to report crash: {e}", flush=True)
 
 
+# =============================================================================
+# SGLANG HEALTH CHECK - Detect when sglang scheduler processes die
+# =============================================================================
+_SGLANG_DEATH_DETECTED = False
+
+def check_sglang_scheduler_health():
+    """Check if sglang scheduler processes are alive.
+    
+    Detects defunct/zombie scheduler processes which indicate sglang has crashed.
+    If detected, logs the error and crashes the program.
+    
+    Returns:
+        True if sglang is healthy, raises RuntimeError if dead
+    """
+    global _SGLANG_DEATH_DETECTED
+    
+    # Only check once - if already detected, skip (we're about to crash anyway)
+    if _SGLANG_DEATH_DETECTED:
+        return False
+    
+    try:
+        import subprocess
+        # Check for sglang scheduler processes
+        result = subprocess.run(
+            ["ps", "aux"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        lines = result.stdout.split('\n')
+        scheduler_lines = [l for l in lines if 'sglang::schedul' in l]
+        
+        if not scheduler_lines:
+            # No scheduler processes found at all - might be too early or already dead
+            return True
+        
+        # Check if any schedulers are defunct (zombie)
+        defunct_schedulers = [l for l in scheduler_lines if '<defunct>' in l or ' Z' in l.split()[7:8]]
+        alive_schedulers = [l for l in scheduler_lines if '<defunct>' not in l and ' Z' not in l.split()[7:8]]
+        
+        if defunct_schedulers and not alive_schedulers:
+            # ALL schedulers are dead!
+            _SGLANG_DEATH_DETECTED = True
+            
+            error_msg = f"FATAL: All sglang scheduler processes are DEAD (defunct/zombie)!\n"
+            error_msg += f"Found {len(defunct_schedulers)} defunct schedulers, 0 alive.\n"
+            error_msg += "This means generation cannot proceed. The training will hang indefinitely.\n"
+            error_msg += "\nDefunct processes:\n"
+            for line in defunct_schedulers[:5]:  # Show first 5
+                error_msg += f"  {line}\n"
+            
+            print("\n" + "!" * 80)
+            print("[SGLANG CRASH DETECTED]")
+            print(error_msg)
+            print("!" * 80 + "\n", flush=True)
+            
+            # Log to crash monitor
+            log_crash(
+                error_type="SGLANG_SCHEDULER_DEAD",
+                error_msg=error_msg,
+                extra_info={
+                    "defunct_count": len(defunct_schedulers),
+                    "alive_count": len(alive_schedulers),
+                }
+            )
+            
+            # CRASH THE PROGRAM
+            raise RuntimeError(f"[FATAL] sglang scheduler processes are dead! {len(defunct_schedulers)} defunct, 0 alive. Training cannot continue.")
+        
+        elif defunct_schedulers:
+            # Some schedulers are dead but others alive - warn but don't crash yet
+            print(f"[SGLANG WARNING] {len(defunct_schedulers)}/{len(scheduler_lines)} scheduler processes are defunct!", flush=True)
+        
+        return True
+        
+    except subprocess.TimeoutExpired:
+        print("[SGLANG HEALTH] ps command timed out", flush=True)
+        return True
+    except RuntimeError:
+        # Re-raise our own RuntimeError
+        raise
+    except Exception as e:
+        # Don't crash on health check errors
+        print(f"[SGLANG HEALTH] Error checking health: {e}", flush=True)
+        return True
+
+
 # Override the heartbeat thread to also send to monitor
 def start_heartbeat_thread_v2(interval_seconds=30):
     """Start a background thread that logs heartbeats to both file and monitor."""
@@ -718,12 +806,22 @@ def start_heartbeat_thread_v2(interval_seconds=30):
         while not _HEARTBEAT_STOP.is_set():
             log_heartbeat()  # Original file-based heartbeat
             send_heartbeat_to_monitor()  # New monitor-based heartbeat
+            
+            # Check sglang health - will crash if schedulers are dead
+            try:
+                check_sglang_scheduler_health()
+            except RuntimeError as e:
+                print(f"\n[FATAL] sglang health check failed: {e}", flush=True)
+                # Force exit the entire process
+                import os
+                os._exit(1)
+            
             _HEARTBEAT_STOP.wait(interval_seconds)
     
     _HEARTBEAT_STOP.clear()
     _HEARTBEAT_THREAD = threading.Thread(target=heartbeat_loop, daemon=True, name="HeartbeatThread")
     _HEARTBEAT_THREAD.start()
-    print(f"[INFO] Started heartbeat thread v2 (interval={interval_seconds}s)", flush=True)
+    print(f"[INFO] Started heartbeat thread v2 (interval={interval_seconds}s) with sglang health monitoring", flush=True)
 
 
 # =============================================================================
@@ -1545,6 +1643,11 @@ class PromptUpdateInteraction(BaseInteraction):
         """Internal implementation of generate_response with actual logic."""
         import math
         import time as _time
+        
+        # ==================== SGLANG HEALTH CHECK ====================
+        # Check if sglang scheduler is alive before attempting any generation
+        # This prevents hanging on a dead scheduler
+        check_sglang_scheduler_health()  # Will raise RuntimeError if dead
         
         # ==================== DETAILED TIMING START ====================
         _impl_start = _time.time()
@@ -3006,8 +3109,8 @@ def main():
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
         "actor_rollout_ref.rollout.response_length=16384",  # 16k for Turn 2
         "actor_rollout_ref.rollout.max_model_len=20480",  # 4096 + 16384
-        "actor_rollout_ref.rollout.max_num_batched_tokens=13107200",  # 20480*64 (intentionally large)
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",  # Reduced to avoid OOM in actor update
+        "actor_rollout_ref.rollout.max_num_batched_tokens=1310720",  # 20480*64 (intentionally large)
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",  # Reduced to avoid OOM in actor update
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
         "actor_rollout_ref.rollout.free_cache_engine=true",  # Free KV cache between generation and FSDP update phases
@@ -3022,7 +3125,7 @@ def main():
         
         # Actor config
         f"actor_rollout_ref.actor.ppo_mini_batch_size={TRAIN_BATCH_SIZE}",  # Must be <= train_batch_size
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2",  # Reduced to avoid OOM in actor update (lm_head needs ~32GB)
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",  # Reduced to avoid OOM in actor update (lm_head needs ~32GB)
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         "+actor_rollout_ref.actor.offload_param=true",  # Offload weights to CPU - frees GPU for sglang KV cache
