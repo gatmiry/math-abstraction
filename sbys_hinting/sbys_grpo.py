@@ -1623,8 +1623,8 @@ class PromptUpdateInteraction(BaseInteraction):
             # Re-raise to crash the worker
             raise
     
-    async def _actor_call(self, coro, timeout_seconds=30, call_name="unknown"):
-        """Await a Ray actor call with timeout. Logs and re-raises exceptions."""
+    async def _actor_call(self, coro, timeout_seconds=300, call_name="unknown"):
+        """Await a Ray actor call with timeout. Crashes on timeout after long wait."""
         import asyncio
         import time as _time
         _call_start = _time.time()
@@ -1636,17 +1636,18 @@ class PromptUpdateInteraction(BaseInteraction):
             return result
         except asyncio.TimeoutError:
             _call_duration = _time.time() - _call_start
-            print(f"[ACTOR CALL TIMEOUT] {call_name} TIMED OUT after {_call_duration:.2f}s (limit={timeout_seconds}s)")
+            error_msg = f"FATAL: Actor call '{call_name}' TIMED OUT after {_call_duration:.2f}s (limit={timeout_seconds}s)"
+            print(f"[ACTOR CALL TIMEOUT] {error_msg}")
             print(f"[ACTOR CALL TIMEOUT] Worker state: {dict(_WORKER_STATE)}")
-            log_crash("ACTOR_TIMEOUT", f"Actor call '{call_name}' timed out after {timeout_seconds}s",
+            log_crash("ACTOR_TIMEOUT", error_msg,
                      extra_info={"call_name": call_name, "timeout": timeout_seconds})
-            raise  # Re-raise to crash
+            raise RuntimeError(error_msg)  # Crash on timeout
         except Exception as e:
             _call_duration = _time.time() - _call_start
             print(f"[ACTOR CALL FAILED] {call_name} failed after {_call_duration:.2f}s: {e}")
             log_crash("ACTOR_CALL_FAILED", str(e), traceback.format_exc(),
                      extra_info={"call_name": call_name})
-            raise  # Re-raise to crash
+            raise  # Re-raise to crash on non-timeout errors
     
     async def _generate_response_impl(self, instance_id, messages, **kwargs):
         """Internal implementation of generate_response with actual logic."""
@@ -1739,7 +1740,7 @@ class PromptUpdateInteraction(BaseInteraction):
             _get_state_start = _time.time()
             problem_state = await self._actor_call(
                 self._state_actor.get_state.remote(problem_key),
-                timeout_seconds=30,
+                timeout_seconds=300,  # 5 minutes - wait long, then crash
                 call_name="get_state"
             )
             _get_state_duration = _time.time() - _get_state_start
@@ -1761,7 +1762,7 @@ class PromptUpdateInteraction(BaseInteraction):
                 _set_state_start = _time.time()
                 await self._actor_call(
                     self._state_actor.set_state.remote(problem_key, problem_state),
-                    timeout_seconds=30,
+                    timeout_seconds=300,  # 5 minutes - wait long, then crash
                     call_name="set_state_init"
                 )
                 _set_state_duration = _time.time() - _set_state_start
@@ -1815,7 +1816,7 @@ class PromptUpdateInteraction(BaseInteraction):
                 problem_state["able_index"] = len(sbys_solution)
                 await self._actor_call(
                     self._state_actor.set_state.remote(problem_key, problem_state),
-                    timeout_seconds=30,
+                    timeout_seconds=300,  # 5 minutes - wait long, then crash
                     call_name="set_state_guide_steps_fix"
                 )
         
@@ -2068,7 +2069,7 @@ class PromptUpdateInteraction(BaseInteraction):
             print(f"[TIMING] try_claim_and_update STARTING at {_try_claim_start:.3f} for {instance_id[:8]}...")
             result = await self._actor_call(
                 self._state_actor.try_claim_and_update.remote(problem_key, is_correct, TARGET_COUNT),
-                timeout_seconds=30,
+                timeout_seconds=300,  # 5 minutes - wait long, then crash if still stuck
                 call_name="try_claim_and_update"
             )
             _try_claim_duration = _time.time() - _try_claim_start
