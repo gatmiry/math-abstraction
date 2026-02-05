@@ -10,6 +10,8 @@ import sys
 import json
 import argparse
 import fcntl
+import time
+import uuid
 import numpy as np
 import apple_bolt as bolt
 
@@ -1011,11 +1013,45 @@ class ProblemStateActor:
     This actor is shared across all workers in distributed training,
     ensuring that problem state persists across GRPO steps regardless
     of which worker processes the problem.
+    
+    IMPORTANT: Uses run_id to detect and crash on stale state from previous runs.
     """
     
-    def __init__(self):
+    def __init__(self, run_id: str = None):
         self._problem_state = {}  # Keyed by problem text
         self._validation_log_count = 0  # Shared counter for validation logging
+        self._run_id = run_id or str(uuid.uuid4())
+        self._created_at = time.time()
+        print(f"[ProblemStateActor] Initialized with run_id={self._run_id[:16]}... at {self._created_at}")
+    
+    def get_run_id(self) -> str:
+        """Get the run_id this actor was created with."""
+        return self._run_id
+    
+    def verify_run_id(self, expected_run_id: str) -> bool:
+        """Verify the run_id matches. Returns False if mismatched (stale actor)."""
+        if self._run_id != expected_run_id:
+            print(f"[ProblemStateActor] FATAL: run_id mismatch! "
+                  f"Actor has {self._run_id[:16]}..., expected {expected_run_id[:16]}...")
+            return False
+        return True
+    
+    def reset_all_counters(self) -> int:
+        """Reset all turn_counters to 0. Called at start of each run.
+        
+        Returns the number of problems that had non-zero counters.
+        """
+        reset_count = 0
+        for key, state in self._problem_state.items():
+            if state.get("turn_counter", 0) != 0:
+                old_counter = state["turn_counter"]
+                state["turn_counter"] = 0
+                reset_count += 1
+                print(f"[COUNTER_RESET] Reset stale counter for {key[:40]}... "
+                      f"(was {old_counter}, now 0)")
+        if reset_count > 0:
+            print(f"[ProblemStateActor] Reset {reset_count} stale counters at run start")
+        return reset_count
     
     def get_next_validation_log_index(self) -> int:
         """Atomically increment and return the next validation log index.
@@ -1368,17 +1404,40 @@ class ProblemStateActor:
 # Global name for the shared actor
 PROBLEM_STATE_ACTOR_NAME = "problem_state_actor"
 
+# Global run_id for this training run - set once at startup
+_CURRENT_RUN_ID = None
 
-def get_or_create_problem_state_actor():
+
+def set_current_run_id(run_id: str):
+    """Set the global run_id for this training run."""
+    global _CURRENT_RUN_ID
+    _CURRENT_RUN_ID = run_id
+    print(f"[RUN_ID] Set current run_id to {run_id[:16]}...")
+
+
+def get_current_run_id() -> str:
+    """Get the global run_id for this training run."""
+    global _CURRENT_RUN_ID
+    if _CURRENT_RUN_ID is None:
+        _CURRENT_RUN_ID = str(uuid.uuid4())
+        print(f"[RUN_ID] Generated new run_id: {_CURRENT_RUN_ID[:16]}...")
+    return _CURRENT_RUN_ID
+
+
+def get_or_create_problem_state_actor(run_id: str = None):
     """Get existing ProblemStateActor or create a new one.
     
     Uses get-or-create pattern with retries to handle race conditions.
-    Does NOT kill existing actor to avoid race conditions with multiple workers.
     
-    NOTE: If you need fresh code, manually kill the actor before starting:
-        ray.kill(ray.get_actor('problem_state_actor', namespace='sbys_grpo'))
+    IMPORTANT: 
+    - If run_id is provided, creates actor with that run_id (main process)
+    - If run_id is None (worker process), gets existing actor and adopts its run_id
+    - If existing actor has different run_id than provided, CRASHES
+    
+    Args:
+        run_id: The run_id for this training run. If None, adopts from existing actor.
     """
-    import time
+    import time as _time
     
     # Try to get or create the actor with retries (handles race conditions)
     for attempt in range(10):
@@ -1386,26 +1445,67 @@ def get_or_create_problem_state_actor():
             # First check if actor already exists
             actor = ray.get_actor(PROBLEM_STATE_ACTOR_NAME, namespace="sbys_grpo")
             if attempt == 0:
-                print(f"[ProblemStateActor] Found existing actor, reusing it")
+                print(f"[ProblemStateActor] Found existing actor")
+            
+            # Get the actor's run_id
+            actor_run_id = ray.get(actor.get_run_id.remote(), timeout=30)
+            
+            if run_id is not None:
+                # Main process: verify the run_id matches
+                if actor_run_id != run_id:
+                    error_msg = (
+                        f"FATAL: Stale ProblemStateActor detected!\n"
+                        f"  Actor run_id: {actor_run_id[:16]}...\n"
+                        f"  Expected run_id: {run_id[:16]}...\n"
+                        f"This indicates a previous run's actor is still alive.\n"
+                        f"The actor should have been killed at startup.\n"
+                        f"Please manually kill it: ray.kill(ray.get_actor('problem_state_actor', namespace='sbys_grpo'))"
+                    )
+                    print(f"[ProblemStateActor] {error_msg}")
+                    raise RuntimeError(error_msg)
+                print(f"[ProblemStateActor] run_id verified ✓ ({run_id[:16]}...)")
+            else:
+                # Worker process: adopt the actor's run_id
+                set_current_run_id(actor_run_id)
+                print(f"[ProblemStateActor] Adopted run_id from existing actor: {actor_run_id[:16]}...")
+            
             return actor
         except ValueError:
-            # Actor doesn't exist, try to create it
+            # Actor doesn't exist
+            if run_id is None:
+                # Worker trying to get actor that doesn't exist - FATAL
+                error_msg = (
+                    f"FATAL: ProblemStateActor does not exist!\n"
+                    f"Worker processes should not create the actor.\n"
+                    f"The main process should have created it before workers start.\n"
+                    f"This indicates a startup race condition or main process failure."
+                )
+                print(f"[ProblemStateActor] {error_msg}")
+                raise RuntimeError(error_msg)
+            
+            # Main process: try to create it
             try:
-                print(f"[ProblemStateActor] Creating new actor (attempt {attempt + 1})...")
+                print(f"[ProblemStateActor] Creating new actor (attempt {attempt + 1}) with run_id={run_id[:16]}...")
+                # NOTE: Removed lifetime="detached" to prevent persistence across runs
                 return ProblemStateActor.options(
                     name=PROBLEM_STATE_ACTOR_NAME,
                     namespace="sbys_grpo",
-                    lifetime="detached",
                     max_concurrency=2000,
-                ).remote()
+                ).remote(run_id=run_id)
             except ray.exceptions.ActorAlreadyExistsError:
                 # Another worker created it, retry to get it
                 print(f"[ProblemStateActor] Race condition, retrying...")
-                time.sleep(0.5)
+                _time.sleep(0.5)
                 continue
     
-    # Final fallback
-    return ray.get_actor(PROBLEM_STATE_ACTOR_NAME, namespace="sbys_grpo")
+    # Final fallback - get actor and verify
+    actor = ray.get_actor(PROBLEM_STATE_ACTOR_NAME, namespace="sbys_grpo")
+    actor_run_id = ray.get(actor.get_run_id.remote(), timeout=30)
+    if run_id is not None and actor_run_id != run_id:
+        raise RuntimeError(f"FATAL: Stale actor run_id mismatch after retries: {actor_run_id} != {run_id}")
+    if run_id is None:
+        set_current_run_id(actor_run_id)
+    return actor
 
 
 class PromptUpdateInteraction(BaseInteraction):
@@ -1505,14 +1605,14 @@ class PromptUpdateInteraction(BaseInteraction):
         import math
         import traceback
         
-        # Wrap entire method in try/except to prevent worker crashes
+        # Catch exceptions to log them, but always re-raise to crash
         try:
             update_worker_state(phase="generate_response", instance_id=instance_id[:16])
             return await self._generate_response_impl(instance_id, messages, **kwargs)
         except Exception as e:
             # Log the error to centralized crash log AND console
             stack_trace = traceback.format_exc()
-            print(f"[PromptUpdateInteraction] ERROR in generate_response: {e}")
+            print(f"[PromptUpdateInteraction] FATAL ERROR in generate_response: {e}")
             print(stack_trace)
             log_crash(
                 error_type="INTERACTION_ERROR",
@@ -1520,11 +1620,11 @@ class PromptUpdateInteraction(BaseInteraction):
                 stack_trace=stack_trace,
                 extra_info={"instance_id": instance_id, "kwargs_keys": list(kwargs.keys())}
             )
-            # Return safe default: terminate with 0 reward
-            return True, "", 0.0, {"error": str(e), "fallback": True}
+            # Re-raise to crash the worker
+            raise
     
-    async def _safe_actor_call(self, coro, timeout_seconds=30, default=None, call_name="unknown"):
-        """Safely await a Ray actor call with timeout and error handling."""
+    async def _actor_call(self, coro, timeout_seconds=30, call_name="unknown"):
+        """Await a Ray actor call with timeout. Logs and re-raises exceptions."""
         import asyncio
         import time as _time
         _call_start = _time.time()
@@ -1540,13 +1640,13 @@ class PromptUpdateInteraction(BaseInteraction):
             print(f"[ACTOR CALL TIMEOUT] Worker state: {dict(_WORKER_STATE)}")
             log_crash("ACTOR_TIMEOUT", f"Actor call '{call_name}' timed out after {timeout_seconds}s",
                      extra_info={"call_name": call_name, "timeout": timeout_seconds})
-            return default
+            raise  # Re-raise to crash
         except Exception as e:
             _call_duration = _time.time() - _call_start
             print(f"[ACTOR CALL FAILED] {call_name} failed after {_call_duration:.2f}s: {e}")
             log_crash("ACTOR_CALL_FAILED", str(e), traceback.format_exc(),
                      extra_info={"call_name": call_name})
-            return default
+            raise  # Re-raise to crash
     
     async def _generate_response_impl(self, instance_id, messages, **kwargs):
         """Internal implementation of generate_response with actual logic."""
@@ -1637,10 +1737,9 @@ class PromptUpdateInteraction(BaseInteraction):
             # Get persistent state from Ray Actor (initialized at start of training)
             # Use safe wrapper with timeout to avoid blocking and handle actor issues gracefully
             _get_state_start = _time.time()
-            problem_state = await self._safe_actor_call(
+            problem_state = await self._actor_call(
                 self._state_actor.get_state.remote(problem_key),
                 timeout_seconds=30,
-                default=None,
                 call_name="get_state"
             )
             _get_state_duration = _time.time() - _get_state_start
@@ -1660,7 +1759,7 @@ class PromptUpdateInteraction(BaseInteraction):
                     "total_correct": 0,
                 }
                 _set_state_start = _time.time()
-                await self._safe_actor_call(
+                await self._actor_call(
                     self._state_actor.set_state.remote(problem_key, problem_state),
                     timeout_seconds=30,
                     call_name="set_state_init"
@@ -1714,7 +1813,7 @@ class PromptUpdateInteraction(BaseInteraction):
                 print('guide_steps_count changed from 0 to ', len(sbys_solution), ' this was an error and should not happen')
                 problem_state["guide_steps_count"] = len(sbys_solution)
                 problem_state["able_index"] = len(sbys_solution)
-                await self._safe_actor_call(
+                await self._actor_call(
                     self._state_actor.set_state.remote(problem_key, problem_state),
                     timeout_seconds=30,
                     call_name="set_state_guide_steps_fix"
@@ -1967,10 +2066,9 @@ class PromptUpdateInteraction(BaseInteraction):
             _try_claim_start = _time.time()
             print(f"[COUNTER_DEBUG] Turn 2 try_claim_and_update for {problem_key[:40]}... instance={instance_id[:8]}")
             print(f"[TIMING] try_claim_and_update STARTING at {_try_claim_start:.3f} for {instance_id[:8]}...")
-            result = await self._safe_actor_call(
+            result = await self._actor_call(
                 self._state_actor.try_claim_and_update.remote(problem_key, is_correct, TARGET_COUNT),
                 timeout_seconds=30,
-                default=(False, problem_state.get("try_index", 0), problem_state.get("try_index", 0), problem_state),
                 call_name="try_claim_and_update"
             )
             _try_claim_duration = _time.time() - _try_claim_start
@@ -3011,14 +3109,15 @@ def main():
         "actor_rollout_ref.rollout.n=4",  # Multiple generations for GRPO
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.6",  # High utilization - FSDP offloads weights to CPU
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",  # High utilization - FSDP offloads weights to CPU
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
-        "actor_rollout_ref.rollout.response_length=10240",  # 10k for Turn 2 (reduced from 16k)
-        "actor_rollout_ref.rollout.max_model_len=14336",  # 4096 + 10240
-        "actor_rollout_ref.rollout.max_num_batched_tokens=917504",  # 14336*64
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",  # Reduced to avoid OOM in actor update
+        "actor_rollout_ref.rollout.response_length=16384",  # 16k for Turn 2
+        "actor_rollout_ref.rollout.max_model_len=20480",  # 4096 + 16384
+        "actor_rollout_ref.rollout.max_num_batched_tokens=13107200",  # 20480*64 (intentionally large)
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2",  # Reduced to avoid OOM in actor update
         "actor_rollout_ref.rollout.load_format=auto",
         "actor_rollout_ref.rollout.enforce_eager=true",
+        "actor_rollout_ref.rollout.free_cache_engine=true",  # Free KV cache between generation and FSDP update phases
         
         # Validation rollout config - 2 samples per prompt for @2 metrics
         "actor_rollout_ref.rollout.val_kwargs.n=2",
@@ -3030,7 +3129,7 @@ def main():
         
         # Actor config
         f"actor_rollout_ref.actor.ppo_mini_batch_size={TRAIN_BATCH_SIZE}",  # Must be <= train_batch_size
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",  # Reduced to avoid OOM in actor update (lm_head needs ~32GB)
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2",  # Reduced to avoid OOM in actor update (lm_head needs ~32GB)
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         "+actor_rollout_ref.actor.offload_param=true",  # Offload weights to CPU - frees GPU for sglang KV cache
@@ -3051,7 +3150,7 @@ def main():
         f"data.val_files={val_dataset_file}",
         "data.prompt_key=prompt",
         "data.max_prompt_length=4096",  # Match increased prompt_length for multi-turn
-        "data.max_response_length=10240",  # Match response_length for Turn 2
+        "data.max_response_length=16384",  # Match response_length for Turn 2 (16k)
         f"data.train_batch_size={TRAIN_BATCH_SIZE}",
         f"data.val_batch_size={TEST_BATCH_SIZE}",
         "data.return_raw_chat=true",  # Required for sglang rollout
@@ -3182,23 +3281,44 @@ def main():
         
         # Only initialize ProblemStateActor if DYNAMIC_HINT_SELECTION is enabled
         if DYNAMIC_HINT_SELECTION:
-            # Kill any existing ProblemStateActor to ensure fresh code is used
-            # This is critical - detached actors survive between runs and may have stale code
-            print("[INFO] Killing any existing ProblemStateActor to ensure fresh code...")
+            # Generate unique run_id for this training run
+            import time as _time
+            run_id = f"run_{int(_time.time())}_{uuid.uuid4().hex[:8]}"
+            set_current_run_id(run_id)
+            print(f"[INFO] Generated run_id: {run_id}")
+            
+            # Kill any existing ProblemStateActor to ensure fresh state
+            # This is CRITICAL - even without detached lifetime, actors may persist
+            # in some edge cases. Always kill to be safe.
+            print("[INFO] Killing any existing ProblemStateActor to ensure fresh state...")
             try:
                 existing_actor = ray.get_actor(PROBLEM_STATE_ACTOR_NAME, namespace="sbys_grpo")
+                # Check if it's a stale actor before killing
+                try:
+                    old_run_id = ray.get(existing_actor.get_run_id.remote(), timeout=10)
+                    print(f"[INFO] Found existing actor with run_id={old_run_id[:16]}...")
+                except Exception as e:
+                    old_run_id = "unknown"
+                    print(f"[INFO] Could not get run_id from existing actor: {e}")
                 ray.kill(existing_actor)
-                print("[INFO] Killed existing ProblemStateActor")
-                import time
-                time.sleep(2)  # Give Ray time to clean up
+                print(f"[INFO] Killed existing ProblemStateActor (was run_id={old_run_id[:16] if old_run_id else 'unknown'}...)")
+                _time.sleep(2)  # Give Ray time to clean up
             except ValueError:
-                print("[INFO] No existing ProblemStateActor found")
+                print("[INFO] No existing ProblemStateActor found (good)")
             
             # Create the shared ProblemStateActor before training starts
             # This ensures all workers can access the same actor instance
-            print("[INFO] Creating fresh ProblemStateActor...")
-            state_actor = get_or_create_problem_state_actor()
+            print(f"[INFO] Creating fresh ProblemStateActor with run_id={run_id}...")
+            state_actor = get_or_create_problem_state_actor(run_id=run_id)
             print(f"[INFO] ProblemStateActor ready: {state_actor}")
+            
+            # Reset all counters to ensure clean state (belt and suspenders)
+            print("[INFO] Resetting all counters to ensure clean state...")
+            reset_count = ray.get(state_actor.reset_all_counters.remote())
+            if reset_count > 0:
+                print(f"[WARNING] Reset {reset_count} stale counters - this indicates previous run crashed mid-step")
+            else:
+                print("[INFO] No stale counters found (clean state)")
             
             # Initialize all problem states at once (more efficient than initializing per-call)
             all_problems = []
