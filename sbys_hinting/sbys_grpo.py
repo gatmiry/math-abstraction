@@ -1851,8 +1851,17 @@ class PromptUpdateInteraction(BaseInteraction):
                 tracker = PromptUpdateInteraction._hint_level_tracker[problem_key]
                 tracker['count'] += 1
                 if tracker['level'] != hint_level:
-                    print(f"[HINT_LEVEL_MISMATCH] problem={problem_key[:40]}... "
-                          f"sample #{tracker['count']} has hint_level={hint_level} but expected {tracker['level']}!")
+                    error_msg = (f"[HINT_LEVEL_MISMATCH] FATAL: problem={problem_key[:60]}... "
+                                 f"sample #{tracker['count']} has hint_level={hint_level} but expected {tracker['level']}! "
+                                 f"All samples of the same problem in one step MUST have the same hint level.")
+                    print(error_msg, flush=True)
+                    log_crash("HINT_LEVEL_MISMATCH", error_msg, extra_info={
+                        "problem_key": problem_key[:100],
+                        "expected_level": tracker['level'],
+                        "actual_level": hint_level,
+                        "sample_count": tracker['count'],
+                    })
+                    raise RuntimeError(error_msg)
                 else:
                     print(f"[HINT_LEVEL_CHECK] problem={problem_key[:40]}... "
                           f"sample #{tracker['count']}/4 hint_level={hint_level} ✓")
@@ -3198,8 +3207,8 @@ def main():
         f"trainer.n_gpus_per_node={GPUS_PER_NODE}",
         f"trainer.default_local_dir={output_dir}",
         f"trainer.total_epochs={TOTAL_EPOCHS}",
-        "trainer.save_freq=20",  # Save checkpoint every N steps
-        "trainer.save_checkpoint_before_train=true",  # Save step 0 checkpoint as sanity check
+        "trainer.save_freq=15",  # Save checkpoint every N steps
+        "+trainer.save_checkpoint_before_train=true",  # Save step 0 checkpoint as sanity check
         "trainer.val_before_train=false",  # Initial evaluation DISABLED to save time
         "trainer.test_freq=5",  # Validate every 50 training steps
         "trainer.log_val_generations=3",  # Log N validation samples to wandb
