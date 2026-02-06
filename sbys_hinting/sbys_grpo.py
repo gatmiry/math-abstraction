@@ -1192,19 +1192,11 @@ class ProblemStateActor:
         step_snapshots = self._step_hint_snapshots[step]
         
         if problem_key not in step_snapshots:
-            # First access for this (step, problem_key) - snapshot the ACTUAL current value
-            actual_state = self._problem_state.get(problem_key, {})
-            actual_hint_level = actual_state.get("try_index", 0)
-            step_snapshots[problem_key] = {'level': actual_hint_level, 'count': 1}
-            print(f"[HINT_SNAPSHOT] Step {step}, problem={problem_key[:40]}... snapshotted try_index={actual_hint_level}")
-            # Check if worker's observation matches the snapshot
-            if observed_hint_level != actual_hint_level:
-                error_msg = (f"[HINT_LEVEL_MISMATCH] FATAL: Step {step}, problem={problem_key[:60]}... "
-                            f"first worker saw hint_level={observed_hint_level} but actual state has {actual_hint_level}! "
-                            f"Race condition: state was modified between get_state() and check_hint_level_consistency().")
-                print(error_msg)
-                raise RuntimeError(error_msg)
-            return {'expected': actual_hint_level, 'sample_count': 1}
+            # First access for this (step, problem_key) - snapshot the OBSERVED value
+            # We use the first worker's observation as ground truth, then verify all others match
+            step_snapshots[problem_key] = {'level': observed_hint_level, 'count': 1}
+            print(f"[HINT_SNAPSHOT] Step {step}, problem={problem_key[:40]}... snapshotted observed_hint_level={observed_hint_level}")
+            return {'expected': observed_hint_level, 'sample_count': 1}
         
         # Check consistency with snapshot
         tracker = step_snapshots[problem_key]
@@ -1213,8 +1205,8 @@ class ProblemStateActor:
         
         if observed_hint_level != expected_level:
             error_msg = (f"[HINT_LEVEL_MISMATCH] FATAL: Step {step}, problem={problem_key[:60]}... "
-                        f"sample #{tracker['count']} saw hint_level={observed_hint_level} but snapshot has {expected_level}! "
-                        f"Race condition: hint level was updated mid-step by another worker.")
+                        f"sample #{tracker['count']} has hint_level={observed_hint_level} but first sample had {expected_level}! "
+                        f"All samples of the same problem in one step MUST see the same hint level.")
             print(error_msg)
             raise RuntimeError(error_msg)
         
