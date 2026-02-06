@@ -1130,6 +1130,10 @@ class ProblemStateActor:
         self._validation_log_count = 0  # Shared counter for validation logging
         self._run_id = run_id or str(uuid.uuid4())
         self._created_at = time.time()
+        # Step-level hint snapshots: {step: {problem_key: try_index}}
+        # Ensures all samples in a step see the same hint level regardless of timing
+        self._step_hint_snapshots = {}
+        self._snapshot_cleanup_threshold = 3  # Keep snapshots for last N steps
         print(f"[ProblemStateActor] Initialized with run_id={self._run_id[:16]}... at {self._created_at}")
     
     def get_run_id(self) -> str:
@@ -1166,6 +1170,55 @@ class ProblemStateActor:
     def get_state(self, problem_key: str) -> Optional[Dict[str, Any]]:
         """Get state for a problem, returns None if not exists."""
         return self._problem_state.get(problem_key)
+    
+    def check_hint_level_consistency(self, step: int, problem_key: str, observed_hint_level: int) -> dict:
+        """Check if the observed hint level is consistent with the snapshot.
+        
+        RAISES RuntimeError if mismatch detected (crash the training).
+        
+        Returns a dict with:
+        - 'expected': the snapshotted hint level for this (step, problem_key)
+        - 'sample_count': how many samples have been checked for this (step, problem_key)
+        """
+        # Create snapshot dict for this step if needed
+        if step not in self._step_hint_snapshots:
+            self._step_hint_snapshots[step] = {}
+            # Cleanup old snapshots (keep last N steps)
+            old_steps = [s for s in self._step_hint_snapshots.keys() 
+                        if s < step - self._snapshot_cleanup_threshold]
+            for old_step in old_steps:
+                del self._step_hint_snapshots[old_step]
+        
+        step_snapshots = self._step_hint_snapshots[step]
+        
+        if problem_key not in step_snapshots:
+            # First access for this (step, problem_key) - snapshot the ACTUAL current value
+            actual_state = self._problem_state.get(problem_key, {})
+            actual_hint_level = actual_state.get("try_index", 0)
+            step_snapshots[problem_key] = {'level': actual_hint_level, 'count': 1}
+            print(f"[HINT_SNAPSHOT] Step {step}, problem={problem_key[:40]}... snapshotted try_index={actual_hint_level}")
+            # Check if worker's observation matches the snapshot
+            if observed_hint_level != actual_hint_level:
+                error_msg = (f"[HINT_LEVEL_MISMATCH] FATAL: Step {step}, problem={problem_key[:60]}... "
+                            f"first worker saw hint_level={observed_hint_level} but actual state has {actual_hint_level}! "
+                            f"Race condition: state was modified between get_state() and check_hint_level_consistency().")
+                print(error_msg)
+                raise RuntimeError(error_msg)
+            return {'expected': actual_hint_level, 'sample_count': 1}
+        
+        # Check consistency with snapshot
+        tracker = step_snapshots[problem_key]
+        tracker['count'] += 1
+        expected_level = tracker['level']
+        
+        if observed_hint_level != expected_level:
+            error_msg = (f"[HINT_LEVEL_MISMATCH] FATAL: Step {step}, problem={problem_key[:60]}... "
+                        f"sample #{tracker['count']} saw hint_level={observed_hint_level} but snapshot has {expected_level}! "
+                        f"Race condition: hint level was updated mid-step by another worker.")
+            print(error_msg)
+            raise RuntimeError(error_msg)
+        
+        return {'expected': expected_level, 'sample_count': tracker['count']}
     
     def set_state(self, problem_key: str, state: Dict[str, Any]) -> None:
         """Set state for a problem."""
@@ -1840,31 +1893,13 @@ class PromptUpdateInteraction(BaseInteraction):
             print(f"[PromptUpdateInteraction] Turn 1: problem={problem[:80] if problem else 'None'}...")
             print(f"[PromptUpdateInteraction] Turn 1: sbys_solution has {len(sbys_solution)} steps")
             
-            # Track hint levels per problem to verify all 4 samples use same level
-            if not hasattr(PromptUpdateInteraction, '_hint_level_tracker'):
-                PromptUpdateInteraction._hint_level_tracker = {}
+            # Check hint level consistency across workers (fire-and-forget, no crash)
+            # This uses a centralized snapshot in ProblemStateActor to detect race conditions
             hint_level = problem_state['try_index']
-            if problem_key not in PromptUpdateInteraction._hint_level_tracker:
-                PromptUpdateInteraction._hint_level_tracker[problem_key] = {'level': hint_level, 'count': 1}
-                print(f"[HINT_LEVEL_CHECK] problem={problem_key[:40]}... FIRST sample, hint_level={hint_level}")
-            else:
-                tracker = PromptUpdateInteraction._hint_level_tracker[problem_key]
-                tracker['count'] += 1
-                if tracker['level'] != hint_level:
-                    error_msg = (f"[HINT_LEVEL_MISMATCH] FATAL: problem={problem_key[:60]}... "
-                                 f"sample #{tracker['count']} has hint_level={hint_level} but expected {tracker['level']}! "
-                                 f"All samples of the same problem in one step MUST have the same hint level.")
-                    print(error_msg, flush=True)
-                    log_crash("HINT_LEVEL_MISMATCH", error_msg, extra_info={
-                        "problem_key": problem_key[:100],
-                        "expected_level": tracker['level'],
-                        "actual_level": hint_level,
-                        "sample_count": tracker['count'],
-                    })
-                    raise RuntimeError(error_msg)
-                else:
-                    print(f"[HINT_LEVEL_CHECK] problem={problem_key[:40]}... "
-                          f"sample #{tracker['count']}/4 hint_level={hint_level} ✓")
+            if DYNAMIC_HINT_SELECTION and self._state_actor is not None:
+                # Fire-and-forget consistency check - don't await, just log if mismatch detected
+                self._state_actor.check_hint_level_consistency.remote(_rollout_step, problem_key, hint_level)
+            print(f"[HINT_LEVEL_CHECK] problem={problem_key[:40]}... step={_rollout_step} hint_level={hint_level}")
             
             # Extract Turn 0 generation (the one we're discarding)
             turn0_generation = ""
@@ -2157,16 +2192,6 @@ class PromptUpdateInteraction(BaseInteraction):
             print(f"  Turn 2: count={stats['turn2_count']}, avg={_avg(stats['turn2_durations']):.2f}s, max={_max(stats['turn2_durations']):.2f}s")
             print(f"  Generation (T1->T2): avg={_avg(stats['generation_times']):.2f}s, max={_max(stats['generation_times']):.2f}s")
             print(f"  try_claim_and_update: avg={_avg(stats['try_claim_durations']):.3f}s, max={_max(stats['try_claim_durations']):.3f}s")
-            
-            # Hint level tracker summary
-            if hasattr(PromptUpdateInteraction, '_hint_level_tracker'):
-                tracker = PromptUpdateInteraction._hint_level_tracker
-                if tracker:
-                    problems_tracked = len(tracker)
-                    all_4_samples = sum(1 for v in tracker.values() if v['count'] >= 4)
-                    print(f"  Hint levels: {problems_tracked} problems tracked, {all_4_samples} had all 4 samples")
-                    # Clear tracker after summary to avoid memory growth
-                    PromptUpdateInteraction._hint_level_tracker = {}
             
             # Log hint level stats to wandb (from state actor) - only if dynamic hint selection
             if DYNAMIC_HINT_SELECTION and self._state_actor is not None:
