@@ -1172,15 +1172,35 @@ class ProblemStateActor:
         return self._problem_state.get(problem_key)
     
     def check_hint_level_consistency(self, step: int, problem_key: str, observed_hint_level: int) -> dict:
-        """Check if the observed hint level is consistent with the snapshot.
+        """Check if the observed hint level is consistent with the snapshot from PREVIOUS step.
+        
+        Uses snapshot from step-1 (which is guaranteed finalized/stable) to compare against.
+        This prevents race conditions where current step's snapshot could be affected by updates.
         
         RAISES RuntimeError if mismatch detected (crash the training).
         
         Returns a dict with:
-        - 'expected': the snapshotted hint level for this (step, problem_key)
-        - 'sample_count': how many samples have been checked for this (step, problem_key)
+        - 'expected': the snapshotted hint level
+        - 'from_step': which step the snapshot came from
         """
-        # Create snapshot dict for this step if needed
+        # FIRST: Try to use snapshot from PREVIOUS step (step - 1)
+        # This is guaranteed to be finalized since step-1 is complete
+        prev_step = step - 1
+        if prev_step >= 0 and prev_step in self._step_hint_snapshots:
+            prev_snapshots = self._step_hint_snapshots[prev_step]
+            if problem_key in prev_snapshots:
+                expected_level = prev_snapshots[problem_key]['level']
+                if observed_hint_level != expected_level:
+                    error_msg = (f"[HINT_LEVEL_MISMATCH] FATAL: Step {step}, problem={problem_key[:60]}... "
+                                f"observed hint_level={observed_hint_level} but step {prev_step} snapshot has {expected_level}! "
+                                f"Hint level was updated between steps - this indicates a race condition.")
+                    print(error_msg)
+                    raise RuntimeError(error_msg)
+                # Match! Return success
+                return {'expected': expected_level, 'from_step': prev_step}
+        
+        # FALLBACK: No snapshot from previous step (step 0, or problem not in prev batch)
+        # Create/use snapshot for current step
         if step not in self._step_hint_snapshots:
             self._step_hint_snapshots[step] = {}
             # Cleanup old snapshots (keep last N steps)
@@ -1193,12 +1213,11 @@ class ProblemStateActor:
         
         if problem_key not in step_snapshots:
             # First access for this (step, problem_key) - snapshot the OBSERVED value
-            # We use the first worker's observation as ground truth, then verify all others match
             step_snapshots[problem_key] = {'level': observed_hint_level, 'count': 1}
-            print(f"[HINT_SNAPSHOT] Step {step}, problem={problem_key[:40]}... snapshotted observed_hint_level={observed_hint_level}")
-            return {'expected': observed_hint_level, 'sample_count': 1}
+            print(f"[HINT_SNAPSHOT] Step {step}, problem={problem_key[:40]}... snapshotted observed_hint_level={observed_hint_level} (no prev step snapshot)")
+            return {'expected': observed_hint_level, 'from_step': step}
         
-        # Check consistency with snapshot
+        # Check consistency with current step's snapshot
         tracker = step_snapshots[problem_key]
         tracker['count'] += 1
         expected_level = tracker['level']
@@ -1210,7 +1229,7 @@ class ProblemStateActor:
             print(error_msg)
             raise RuntimeError(error_msg)
         
-        return {'expected': expected_level, 'sample_count': tracker['count']}
+        return {'expected': expected_level, 'from_step': step, 'sample_count': tracker['count']}
     
     def set_state(self, problem_key: str, state: Dict[str, Any]) -> None:
         """Set state for a problem."""
