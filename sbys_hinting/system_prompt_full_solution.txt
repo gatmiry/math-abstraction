@@ -33,9 +33,9 @@ To solve \( f(x) = 0 \), we first write \( f(x) = x^2 - 4x + 3 \). Factoring the
 ---
 
 **Important:**
-- Always base your solution on your own reasoning, and do not refer to the incomplete proof, even indirectly.
+- Do not refer to the incomplete proof.
 - In your answer, first explain your full reasoning process, then conclude with the boxed final answer.
-- Do not simply complete or reference the incomplete proof; generate the proof anew, using ideas from it only if useful and implicitly.
+- Do not simply complete or reference the incomplete proof; generate the proof anew, using ideas from it if useful and implicitly.
 - Final answer must be in \boxed{}.
 
 ---

@@ -46,6 +46,11 @@ except ImportError:
 # Tell wandb to save code with each run
 os.environ["WANDB_SAVE_CODE"] = "true"
 
+# HuggingFace timeout settings - prevent 504 timeouts from slow HF servers
+# Don't use offline mode as sglang needs to check if quant config exists
+os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "300"  # 5 min timeout for downloads
+os.environ["HF_HUB_ETAG_TIMEOUT"] = "60"  # 1 min timeout for metadata checks
+
 # Ray gRPC and health check timeouts - MUST be set BEFORE ray.init()
 # These prevent Ray from killing actors during slow model initialization
 os.environ["RAY_grpc_keepalive_time_ms"] = "60000"      # Send keepalive ping every 60s (default 10s)
@@ -965,6 +970,9 @@ try:
     # Enable sglang debug logging to diagnose multi-turn issues
     PPO_RAY_RUNTIME_ENV["env_vars"]["SGLANG_LOG_LEVEL"] = "DEBUG"
     PPO_RAY_RUNTIME_ENV["env_vars"]["SGLANG_SHOW_TIME_COST"] = "1"
+    # HuggingFace timeout settings - prevent 504 timeouts from slow HF servers
+    PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HUB_DOWNLOAD_TIMEOUT"] = "300"  # 5 min timeout
+    PPO_RAY_RUNTIME_ENV["env_vars"]["HF_HUB_ETAG_TIMEOUT"] = "60"  # 1 min for metadata
     # Add WANDB_API_KEY to Ray workers so wandb logger can authenticate
     try:
         _early_tokens = load_tokens()
@@ -981,7 +989,8 @@ except ImportError:
     pass  # verl 0.4.x may not have this
 
 # Configuration
-DEFAULT_MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507"
+# Use local cached model to avoid HuggingFace network requests
+DEFAULT_MODEL_PATH = "/root/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/cdbee75f17c01a7cc42f958dc650907174af0554"
 DATASET_NAME = os.path.join(os.path.dirname(__file__), "outputs", "hint_helped_dataset", "hint_helped_dataset")
 MAX_NUM = None  # Limit dataset to last MAX_NUM rows (None = use all data). Useful for testing.
 
@@ -2872,6 +2881,59 @@ def distribute_checkpoint_to_all_nodes(checkpoint_dir: str, target_dir: str):
             return False
     
     print(f"[Distribute] ✓ Checkpoint distributed to all nodes at: {target_dir}")
+    
+    # Verify files exist on all nodes
+    @ray.remote
+    def verify_checkpoint_files(target_path: str, expected_files: list):
+        """Verify checkpoint files exist on this node."""
+        import os
+        import socket
+        missing = []
+        size_mismatch = []
+        for filename, expected_size in expected_files:
+            filepath = os.path.join(target_path, filename)
+            if not os.path.exists(filepath):
+                missing.append(filename)
+            elif os.path.getsize(filepath) != expected_size:
+                size_mismatch.append((filename, os.path.getsize(filepath), expected_size))
+        return {
+            'hostname': socket.gethostname(),
+            'missing': missing,
+            'size_mismatch': size_mismatch,
+            'total_checked': len(expected_files)
+        }
+    
+    # Build expected files list with sizes
+    expected_files = [(f, len(d)) for f, d in files_data.items()]
+    
+    print(f"[Distribute] Verifying files on all nodes...")
+    verify_tasks = []
+    for node_ip in node_ips:
+        task = verify_checkpoint_files.options(
+            resources={f"node:{node_ip}": 0.001}
+        ).remote(target_actor_dir, expected_files)
+        verify_tasks.append((node_ip, task))
+    
+    all_verified = True
+    for node_ip, task in verify_tasks:
+        try:
+            result = ray.get(task, timeout=120)
+            if result['missing'] or result['size_mismatch']:
+                print(f"[Distribute] VERIFICATION FAILED on {result['hostname']}!")
+                if result['missing']:
+                    print(f"  Missing files: {result['missing'][:5]}...")
+                if result['size_mismatch']:
+                    print(f"  Size mismatch: {result['size_mismatch'][:3]}...")
+                all_verified = False
+            else:
+                print(f"[Distribute] ✓ Verified {result['total_checked']} files on {result['hostname']}")
+        except Exception as e:
+            print(f"[Distribute] Verification failed on {node_ip}: {e}")
+            all_verified = False
+    
+    if not all_verified:
+        print("[Distribute] ABORT: File verification failed!")
+        return False
     return True
 
 
@@ -3190,7 +3252,7 @@ def main():
         "actor_rollout_ref.rollout.n=4",  # Multiple generations for GRPO
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.6",  # High utilization - FSDP offloads weights to CPU
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5",  # High utilization - FSDP offloads weights to CPU
         "actor_rollout_ref.rollout.prompt_length=4096",  # Increased from 2560 to handle multi-turn prompt updates
         "actor_rollout_ref.rollout.response_length=16384",  # 16k for Turn 2
         "actor_rollout_ref.rollout.max_model_len=20480",  # 4096 + 16384
@@ -3245,7 +3307,7 @@ def main():
         f"trainer.total_epochs={TOTAL_EPOCHS}",
         "trainer.save_freq=15",  # Save checkpoint every N steps
         "+trainer.save_checkpoint_before_train=true",  # Save step 0 checkpoint as sanity check
-        "trainer.val_before_train=false",  # Initial evaluation DISABLED to save time
+        "trainer.val_before_train=true",  # Initial evaluation DISABLED to save time
         "trainer.test_freq=5",  # Validate every 50 training steps
         "trainer.log_val_generations=3",  # Log N validation samples to wandb
         
