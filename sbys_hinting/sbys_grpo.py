@@ -1158,18 +1158,27 @@ class ProblemStateActor:
         return True
     
     def reset_all_counters(self) -> int:
-        """Reset all turn_counters to 0. Called at start of each run.
+        """Reset all turn_counters and step_correct_counts to 0. Called at start of each run.
         
         Returns the number of problems that had non-zero counters.
         """
         reset_count = 0
         for key, state in self._problem_state.items():
+            had_stale = False
             if state.get("turn_counter", 0) != 0:
                 old_counter = state["turn_counter"]
                 state["turn_counter"] = 0
-                reset_count += 1
-                print(f"[COUNTER_RESET] Reset stale counter for {key[:40]}... "
+                had_stale = True
+                print(f"[COUNTER_RESET] Reset stale turn_counter for {key[:40]}... "
                       f"(was {old_counter}, now 0)")
+            if state.get("step_correct_count", 0) != 0:
+                old_correct = state["step_correct_count"]
+                state["step_correct_count"] = 0
+                had_stale = True
+                print(f"[COUNTER_RESET] Reset stale step_correct_count for {key[:40]}... "
+                      f"(was {old_correct}, now 0)")
+            if had_stale:
+                reset_count += 1
         if reset_count > 0:
             print(f"[ProblemStateActor] Reset {reset_count} stale counters at run start")
         return reset_count
@@ -1312,6 +1321,7 @@ class ProblemStateActor:
                     "total_attempts": 0,
                     "total_correct": 0,
                     "turn_counter": 0,  # For race-free state updates
+                    "step_correct_count": 0,  # Number of correct responses in current step (0-4)
                     "last_verified_attempts": -1,  # Sentinel for step completion verification
                 }
                 count += 1
@@ -1384,6 +1394,8 @@ class ProblemStateActor:
         - Only the generation whose increment hits exactly target_count claims
         - After claiming, reset counter to 0 for next step
         
+        Also tracks step_correct_count: number of correct responses in this step (0-4).
+        
         Returns:
             (success, old_try_index, new_try_index, state)
         """
@@ -1395,8 +1407,16 @@ class ProblemStateActor:
         # Increment counter and check if we hit the target
         counter = state.get("turn_counter", 0) + 1
         state["turn_counter"] = counter
+        
+        # Track number of correct responses in this step (only Turn 2 calls have is_correct info)
+        # Turn 1 increments counter via increment_turn_counter, Turn 2 via try_claim_and_update
+        # So step_correct_count only gets incremented here (Turn 2)
+        if is_correct:
+            state["step_correct_count"] = state.get("step_correct_count", 0) + 1
+        
         total_attempts = state.get("total_attempts", 0)
-        print(f"[COUNTER_DEBUG] try_claim_and_update: {problem_key[:40]}... counter={counter}/{target_count}, problem_step={total_attempts}")
+        step_correct = state.get("step_correct_count", 0)
+        print(f"[COUNTER_DEBUG] try_claim_and_update: {problem_key[:40]}... counter={counter}/{target_count}, problem_step={total_attempts}, step_correct={step_correct}")
         
         # SANITY CHECK: Counter should NEVER exceed target_count
         # If it does, something is seriously wrong (duplicate calls, missing reset, etc.)
@@ -1420,10 +1440,15 @@ class ProblemStateActor:
             self._problem_state[problem_key] = state
             return False, old_try_index, old_try_index, state
         
-        # We hit the target! Claim and reset counter for next step
+        # We hit the target! Claim and reset counters for next step
         old_step = state.get("total_attempts", 0)
+        final_step_correct_count = state.get("step_correct_count", 0)  # Save before reset
         state["turn_counter"] = 0
+        state["step_correct_count"] = 0  # Reset for next step
+        print(f"[STEP_CORRECT] problem={problem_key[:40]}... step {old_step} had {final_step_correct_count}/4 correct responses")
         
+       
+
         # Apply updates
         state["total_attempts"] = old_step + 1
         new_step = state["total_attempts"]
@@ -1431,6 +1456,11 @@ class ProblemStateActor:
         if is_correct:
             state["total_correct"] = state.get("total_correct", 0) + 1
         
+        ## check if we might not need to update the try_index and yet go to the next step
+        if final_step_correct_count != 4 or final_step_correct_count != 0:
+            print(f"[STEP_COMPLETE] problem={problem_key[:40]}... step {old_step} → {new_step}, counter reset to 0, but no try_index update needed")
+            return True, old_try_index, old_try_index, state
+        ## check if we might not need to update the try_index and yet go to the next step
         # Binary search logic to update try_index
         try_index = state.get("try_index", 0)
         able_index = state.get("able_index", 0)
@@ -1836,6 +1866,7 @@ class PromptUpdateInteraction(BaseInteraction):
                     "try_index": 0,
                     "total_attempts": 0,
                     "total_correct": 0,
+                    "step_correct_count": 0,
                 }
                 _set_state_start = _time.time()
                 await self._actor_call(
@@ -1859,6 +1890,7 @@ class PromptUpdateInteraction(BaseInteraction):
                 "try_index": fixed_try_index,
                 "total_attempts": 0,
                 "total_correct": 0,
+                "step_correct_count": 0,
             }
             print(f"[PromptUpdateInteraction] STATIC HINT: try_index={fixed_try_index} (half of {guide_steps_count} steps)")
         
@@ -1913,12 +1945,16 @@ class PromptUpdateInteraction(BaseInteraction):
             print(f"[PromptUpdateInteraction] Turn 1: problem={problem[:80] if problem else 'None'}...")
             print(f"[PromptUpdateInteraction] Turn 1: sbys_solution has {len(sbys_solution)} steps")
             
-            # Check hint level consistency across workers (fire-and-forget, no crash)
+            # Check hint level consistency across workers (CRASH on mismatch!)
             # This uses a centralized snapshot in ProblemStateActor to detect race conditions
             hint_level = problem_state['try_index']
             if DYNAMIC_HINT_SELECTION and self._state_actor is not None:
-                # Fire-and-forget consistency check - don't await, just log if mismatch detected
-                self._state_actor.check_hint_level_consistency.remote(_rollout_step, problem_key, hint_level)
+                # Await consistency check - CRASH if mismatch detected (race condition = fatal error)
+                await self._actor_call(
+                    self._state_actor.check_hint_level_consistency.remote(_rollout_step, problem_key, hint_level),
+                    timeout_seconds=60,  # Short timeout - this should be fast
+                    call_name="check_hint_level_consistency"
+                )
             print(f"[HINT_LEVEL_CHECK] problem={problem_key[:40]}... step={_rollout_step} hint_level={hint_level}")
             
             # Extract Turn 0 generation (the one we're discarding)
