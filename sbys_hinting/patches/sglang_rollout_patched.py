@@ -394,7 +394,7 @@ class SGLangRollout(BaseRollout):
                 model_path=actor_module,
                 dtype=self.config.dtype,
                 mem_fraction_static=self.config.gpu_memory_utilization,
-                enable_memory_saver=True,  # Enabled - releases KV cache during FSDP weight loading
+                enable_memory_saver=False,  # Disabled - 50% gpu_memory_utilization provides enough headroom
                 base_gpu_id=0,
                 gpu_id_step=1,
                 tp_size=self._tp_size,

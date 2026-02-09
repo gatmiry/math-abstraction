@@ -1025,7 +1025,7 @@ def parse_args():
 
 # Distributed training configuration
 # 1 node, 8 GPUs = 8 GPUs total
-NUM_NODES = 8  # 8 nodes (64 GPUs)
+NUM_NODES = 4  # 8 nodes (64 GPUs)
 GPUS_PER_NODE = 8
 
 
