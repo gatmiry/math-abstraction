@@ -670,21 +670,33 @@ def send_heartbeat_to_monitor():
         state["ip"] = socket.gethostbyname(socket.gethostname())
         
         # ==================== STUCK DETECTION ON HEARTBEAT ====================
-        # Check if worker has been in the same phase for too long
-        phase_start_str = _WORKER_STATE.get("_phase_start_time")
+        # Check if worker has been inactive for too long (no activity, not phase duration)
+        last_activity_str = _WORKER_STATE.get("last_activity")
         current_phase = _WORKER_STATE.get("phase", "unknown")
+        
+        # Also track phase duration for informational purposes
+        phase_start_str = _WORKER_STATE.get("_phase_start_time")
         if phase_start_str:
             try:
                 phase_start = datetime.datetime.fromisoformat(phase_start_str)
                 phase_duration = (datetime.datetime.now() - phase_start).total_seconds()
                 state["phase_duration_seconds"] = round(phase_duration, 1)
+            except:
+                pass
+        
+        # Use last_activity for stuck detection (not phase start time!)
+        if last_activity_str:
+            try:
+                last_activity = datetime.datetime.fromisoformat(last_activity_str)
+                idle_time = (datetime.datetime.now() - last_activity).total_seconds()
+                state["idle_seconds"] = round(idle_time, 1)
                 
-                # Log warning if stuck in a phase for too long
-                if phase_duration > 120:  # 2 minutes
-                    print(f"[STUCK ALERT] Worker stuck in phase '{current_phase}' for {phase_duration:.0f}s!")
+                # Log warning if no activity for too long
+                if idle_time > 120:  # 2 minutes without any activity
+                    print(f"[STUCK ALERT] Worker idle for {idle_time:.0f}s in phase '{current_phase}'!")
                     print(f"[STUCK ALERT] Worker state: {state}")
-                    if phase_duration > 300:  # 5 minutes
-                        print(f"[STUCK CRITICAL] Worker CRITICALLY stuck in '{current_phase}' for {phase_duration:.0f}s!")
+                    if idle_time > 300:  # 5 minutes without any activity
+                        print(f"[STUCK CRITICAL] Worker CRITICALLY idle for {idle_time:.0f}s!")
                         print(f"[STUCK CRITICAL] This may cause distributed barrier failures!")
             except Exception as e:
                 pass  # Ignore parsing errors
