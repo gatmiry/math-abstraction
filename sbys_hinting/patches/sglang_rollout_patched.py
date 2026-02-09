@@ -20,10 +20,64 @@ import logging
 import multiprocessing as mp
 import os
 import time
+import socket
+from datetime import datetime
 from copy import deepcopy
 from json import JSONDecodeError
 from typing import Any, List, Optional, Tuple, Union
 from uuid import uuid4
+
+# =============================================================================
+# PERSISTENT TIMING LOGS - Write to shared filesystem to survive crashes
+# =============================================================================
+_SGLANG_LOG_DIR = "/mnt/task_wrapper/user_output/artifacts/sglang_timing_logs"
+_SGLANG_LOG_FILE = None
+_SGLANG_NODE_ID = None
+
+def _init_persistent_log():
+    """Initialize persistent log file for this node."""
+    global _SGLANG_LOG_FILE, _SGLANG_NODE_ID
+    if _SGLANG_LOG_FILE is not None:
+        return
+    
+    try:
+        os.makedirs(_SGLANG_LOG_DIR, exist_ok=True)
+        hostname = socket.gethostname()
+        ip = socket.gethostbyname(hostname)
+        pid = os.getpid()
+        _SGLANG_NODE_ID = f"{hostname}_{ip}_{pid}"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _SGLANG_LOG_FILE = os.path.join(_SGLANG_LOG_DIR, f"sglang_{_SGLANG_NODE_ID}_{timestamp}.log")
+        
+        # Write header
+        with open(_SGLANG_LOG_FILE, 'w') as f:
+            f.write(f"# SGLANG TIMING LOG\n")
+            f.write(f"# Node: {_SGLANG_NODE_ID}\n")
+            f.write(f"# Started: {datetime.now().isoformat()}\n")
+            f.write(f"# =====================================================\n\n")
+        print(f"[SGLANG_LOG] Persistent log initialized: {_SGLANG_LOG_FILE}")
+    except Exception as e:
+        print(f"[SGLANG_LOG] Failed to init persistent log: {e}")
+        _SGLANG_LOG_FILE = None
+
+def _log_timing(msg: str):
+    """Log timing message to both stdout and persistent file."""
+    global _SGLANG_LOG_FILE, _SGLANG_NODE_ID
+    
+    # Always print to stdout (for real-time visibility via Ray)
+    print(msg, flush=True)
+    
+    # Also write to persistent file
+    if _SGLANG_LOG_FILE is None:
+        _init_persistent_log()
+    
+    if _SGLANG_LOG_FILE:
+        try:
+            timestamp = datetime.now().isoformat()
+            with open(_SGLANG_LOG_FILE, 'a') as f:
+                f.write(f"{timestamp} {msg}\n")
+        except Exception:
+            pass  # Don't fail on log errors
 
 import numpy as np
 import sglang.srt.entrypoints.engine
@@ -748,7 +802,7 @@ class SGLangRollout(BaseRollout):
         # TIMING: Track total request duration
         _request_start_time = time.time()
         _problem_preview_start = str(_req.interaction_kwargs.get("problem", ""))[:50] if _req.interaction_kwargs else "N/A"
-        print(f"[REQUEST_START] request={_req.request_id[:8]}... problem={_problem_preview_start}...")
+        _log_timing(f"[REQUEST_START] request={_req.request_id[:8]}... problem={_problem_preview_start}...")
 
         image_data = None
         video_data = None
@@ -802,8 +856,8 @@ class SGLangRollout(BaseRollout):
             # interaction_turn: 1=Turn1 (hint injection), 2=Turn2 (scoring)
             _loop_elapsed = time.time() - _request_start_time
             if _loop_elapsed > 300:  # > 5 minutes
-                print(f"[REQUEST_STALLED] request={_req.request_id[:8]}... running for {_loop_elapsed:.0f}s! state={_req.state.name} gen_turn={current_turns}")
-            print(f"[SGLANG_LOOP] STEP={self._global_step} request={_req.request_id[:8]}... state={_req.state.name}, "
+                _log_timing(f"[REQUEST_STALLED] request={_req.request_id[:8]}... running for {_loop_elapsed:.0f}s! state={_req.state.name} gen_turn={current_turns}")
+            _log_timing(f"[SGLANG_LOOP] STEP={self._global_step} request={_req.request_id[:8]}... state={_req.state.name}, "
                   f"gen_turn={current_turns}, interaction_count={user_turns}, elapsed={_loop_elapsed:.1f}s, problem={_problem_preview}...")
             
             if _req.state == AsyncRolloutRequestStateEnum.PENDING:
@@ -845,14 +899,14 @@ class SGLangRollout(BaseRollout):
                 # TIMING: Track sglang engine call duration
                 _engine_call_start = time.time()
                 _prompt_len = len(_req.get_generation_prompt_ids(self.processing_class))
-                print(f"[ENGINE_CALL_START] request={_req.request_id[:8]}... gen_turn={current_turns} prompt_len={_prompt_len} max_new_tokens={turn_sampling_params.get('max_new_tokens', 'default')}")
+                _log_timing(f"[ENGINE_CALL_START] request={_req.request_id[:8]}... gen_turn={current_turns} prompt_len={_prompt_len} max_new_tokens={turn_sampling_params.get('max_new_tokens', 'default')}")
                 output = await self._handle_engine_call(_req, turn_sampling_params, image_data=image_data)
                 _engine_call_duration = time.time() - _engine_call_start
                 _output_len = len(output.get("text", "")) if output else 0
                 if _engine_call_duration > 60:
-                    print(f"[ENGINE_CALL_SLOW] request={_req.request_id[:8]}... took {_engine_call_duration:.1f}s (>60s)! gen_turn={current_turns} output_len={_output_len}")
+                    _log_timing(f"[ENGINE_CALL_SLOW] request={_req.request_id[:8]}... took {_engine_call_duration:.1f}s (>60s)! gen_turn={current_turns} output_len={_output_len}")
                 else:
-                    print(f"[ENGINE_CALL_DONE] request={_req.request_id[:8]}... took {_engine_call_duration:.1f}s gen_turn={current_turns} output_len={_output_len}")
+                    _log_timing(f"[ENGINE_CALL_DONE] request={_req.request_id[:8]}... took {_engine_call_duration:.1f}s gen_turn={current_turns} output_len={_output_len}")
                 content = output["text"]
                 finish_reason_type = FinishReasonTypeEnum.from_str(output["meta_info"]["finish_reason"]["type"])
                 current_turns += 1
@@ -862,7 +916,7 @@ class SGLangRollout(BaseRollout):
                         # Still need to call interaction for scoring before breaking
                         if _req.interaction_kwargs:
                             # This is Turn 2 interaction (scoring) - gen_turn=2 means we just finished gen #2
-                            print(f"[SGLANG_INTERACTION] STEP={self._global_step} PATH=LENGTH_TURN2 (scoring), request={_req.request_id[:8]}..., "
+                            _log_timing(f"[SGLANG_INTERACTION] STEP={self._global_step} PATH=LENGTH_TURN2 (scoring), request={_req.request_id[:8]}..., "
                                   f"gen_turn={current_turns}, calling_interaction_turn=2")
                             messages = [{"role": x.role, "content": x.content} for x in _req.messages]
                             _kwargs = {**_req.interaction_kwargs, "_rollout_step": self._global_step}
@@ -870,13 +924,13 @@ class SGLangRollout(BaseRollout):
                             should_terminate_sequence, _, reward, metrics = await self.interaction.generate_response(_req.request_id, messages, **_kwargs)
                             _interaction_duration = time.time() - _interaction_start
                             if _interaction_duration > 10:
-                                print(f"[INTERACTION_SLOW] request={_req.request_id[:8]}... PATH=LENGTH_TURN2 took {_interaction_duration:.1f}s (>10s)!")
-                            print(f"[SGLANG_INTERACTION] RESULT: should_terminate={should_terminate_sequence}, reward={reward} duration={_interaction_duration:.2f}s")
+                                _log_timing(f"[INTERACTION_SLOW] request={_req.request_id[:8]}... PATH=LENGTH_TURN2 took {_interaction_duration:.1f}s (>10s)!")
+                            _log_timing(f"[SGLANG_INTERACTION] RESULT: should_terminate={should_terminate_sequence}, reward={reward} duration={_interaction_duration:.2f}s")
                             user_turn_rewards.append(reward)
                         break
                     else:  # Turn 1 finished with LENGTH - need to call interaction for hint injection
                         if _req.interaction_kwargs and user_turns < self.config.multi_turn.max_user_turns:
-                            print(f"[SGLANG_STATE] Turn 1 LENGTH -> INTERACTING, request={_req.request_id[:8]}..., current_turns={current_turns}")
+                            _log_timing(f"[SGLANG_STATE] Turn 1 LENGTH -> INTERACTING, request={_req.request_id[:8]}..., current_turns={current_turns}")
                             _req.state = AsyncRolloutRequestStateEnum.INTERACTING
                         # If no interaction needed, continue to next turn
                 else:
@@ -921,14 +975,14 @@ class SGLangRollout(BaseRollout):
                             content,
                         )
                         if _req.interaction_kwargs and user_turns < self.config.multi_turn.max_user_turns and current_turns < self.config.multi_turn.max_assistant_turns:
-                            print(f"[SGLANG_STATE] STOP -> INTERACTING, request={_req.request_id[:8]}..., "
+                            _log_timing(f"[SGLANG_STATE] STOP -> INTERACTING, request={_req.request_id[:8]}..., "
                                   f"current_turns={current_turns}, user_turns={user_turns}, max_assistant={self.config.multi_turn.max_assistant_turns}")
                             _req.state = AsyncRolloutRequestStateEnum.INTERACTING
                         else:
                             # Final turn - call interaction for scoring before breaking
                             if _req.interaction_kwargs:
                                 # This is Turn 2 interaction (scoring) - gen_turn=2, max reached
-                                print(f"[SGLANG_INTERACTION] STEP={self._global_step} PATH=STOP_FINAL_TURN (scoring), request={_req.request_id[:8]}..., "
+                                _log_timing(f"[SGLANG_INTERACTION] STEP={self._global_step} PATH=STOP_FINAL_TURN (scoring), request={_req.request_id[:8]}..., "
                                       f"gen_turn={current_turns}, calling_interaction_turn=2, max_gen={self.config.multi_turn.max_assistant_turns}")
                                 messages = [{"role": x.role, "content": x.content} for x in _req.messages]
                                 _kwargs = {**_req.interaction_kwargs, "_rollout_step": self._global_step}
@@ -936,15 +990,15 @@ class SGLangRollout(BaseRollout):
                                 should_terminate_sequence, _, reward, metrics = await self.interaction.generate_response(_req.request_id, messages, **_kwargs)
                                 _interaction_duration = time.time() - _interaction_start
                                 if _interaction_duration > 10:
-                                    print(f"[INTERACTION_SLOW] request={_req.request_id[:8]}... PATH=STOP_FINAL_TURN took {_interaction_duration:.1f}s (>10s)!")
-                                print(f"[SGLANG_INTERACTION] RESULT: should_terminate={should_terminate_sequence}, reward={reward} duration={_interaction_duration:.2f}s")
+                                    _log_timing(f"[INTERACTION_SLOW] request={_req.request_id[:8]}... PATH=STOP_FINAL_TURN took {_interaction_duration:.1f}s (>10s)!")
+                                _log_timing(f"[SGLANG_INTERACTION] RESULT: should_terminate={should_terminate_sequence}, reward={reward} duration={_interaction_duration:.2f}s")
                                 user_turn_rewards.append(reward)
                             break
             elif _req.state == AsyncRolloutRequestStateEnum.INTERACTING:
                 user_turns += 1
                 # This is Turn 1 interaction (hint injection) if user_turns was 0, or Turn 2 if user_turns was 1
                 interaction_turn = user_turns  # user_turns was just incremented, so this is the current interaction turn
-                print(f"[SGLANG_INTERACTION] STEP={self._global_step} PATH=INTERACTING_HANDLER, request={_req.request_id[:8]}..., "
+                _log_timing(f"[SGLANG_INTERACTION] STEP={self._global_step} PATH=INTERACTING_HANDLER, request={_req.request_id[:8]}..., "
                       f"gen_turn={current_turns}, calling_interaction_turn={interaction_turn}")
                 messages = [{"role": x.role, "content": x.content} for x in _req.messages]
                 _kwargs = {**_req.interaction_kwargs, "_rollout_step": self._global_step}
@@ -952,8 +1006,8 @@ class SGLangRollout(BaseRollout):
                 should_terminate_sequence, content, reward, metrics = await self.interaction.generate_response(_req.request_id, messages, **_kwargs)
                 _interaction_duration = time.time() - _interaction_start
                 if _interaction_duration > 10:
-                    print(f"[INTERACTION_SLOW] request={_req.request_id[:8]}... PATH=INTERACTING_HANDLER took {_interaction_duration:.1f}s (>10s)!")
-                print(f"[SGLANG_INTERACTION] RESULT: should_terminate={should_terminate_sequence}, reward={reward}, content_len={len(content) if content else 0} duration={_interaction_duration:.2f}s")
+                    _log_timing(f"[INTERACTION_SLOW] request={_req.request_id[:8]}... PATH=INTERACTING_HANDLER took {_interaction_duration:.1f}s (>10s)!")
+                _log_timing(f"[SGLANG_INTERACTION] RESULT: should_terminate={should_terminate_sequence}, reward={reward}, content_len={len(content) if content else 0} duration={_interaction_duration:.2f}s")
                 user_turn_rewards.append(reward)
                 if should_terminate_sequence:
                     finish_reason_type = FinishReasonTypeEnum.STOP
@@ -988,9 +1042,9 @@ class SGLangRollout(BaseRollout):
         # TIMING: Log total request duration
         _request_total_duration = time.time() - _request_start_time
         if _request_total_duration > 120:  # > 2 minutes
-            print(f"[REQUEST_SLOW] request={_req.request_id[:8]}... TOTAL took {_request_total_duration:.1f}s (>120s)! problem={_problem_preview_start}...")
+            _log_timing(f"[REQUEST_SLOW] request={_req.request_id[:8]}... TOTAL took {_request_total_duration:.1f}s (>120s)! problem={_problem_preview_start}...")
         else:
-            print(f"[REQUEST_DONE] request={_req.request_id[:8]}... TOTAL took {_request_total_duration:.1f}s")
+            _log_timing(f"[REQUEST_DONE] request={_req.request_id[:8]}... TOTAL took {_request_total_duration:.1f}s")
         
         return _req
 
