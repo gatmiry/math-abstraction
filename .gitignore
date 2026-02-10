@@ -55,3 +55,4 @@ task_runtime.egg-info/
 
 # Settings
 settings.json
+nenv/
