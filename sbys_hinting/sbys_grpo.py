@@ -1037,7 +1037,7 @@ def parse_args():
 
 # Distributed training configuration
 # 1 node, 8 GPUs = 8 GPUs total
-NUM_NODES = 1  # 1 node (8 GPUs)
+NUM_NODES = 4  # 1 node (8 GPUs)
 GPUS_PER_NODE = 8
 
 
@@ -2684,6 +2684,10 @@ def patch_verl_on_all_nodes():
             os.path.join(patches_dir, "ray_trainer_patched.py"),
             "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/trainer/ppo/ray_trainer.py"
         ),
+        (
+            os.path.join(patches_dir, "torchao_utils_patched.py"),
+            "/mnt/task_runtime/myenv/lib/python3.12/site-packages/sglang/srt/layers/torchao_utils.py"
+        ),
     ]
     print("[INFO] Patching LOCAL node first...")
     for source, target in local_patches:
@@ -2706,6 +2710,10 @@ def patch_verl_on_all_nodes():
         (
             os.path.join(patches_dir, "ray_trainer_patched.py"),
             "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/trainer/ppo/ray_trainer.py"
+        ),
+        (
+            os.path.join(patches_dir, "torchao_utils_patched.py"),
+            "/mnt/task_runtime/myenv/lib/python3.12/site-packages/sglang/srt/layers/torchao_utils.py"
         ),
     ]
     
