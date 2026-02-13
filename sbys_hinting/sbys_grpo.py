@@ -964,16 +964,16 @@ try:
     PPO_RAY_RUNTIME_ENV["env_vars"]["PYTHONPATH"] = _parent_dir
     # Add CUDA library paths for sglang subprocesses
     cuda_lib_paths = [
-        "/mnt/task_runtime/nenv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib",
-        "/mnt/task_runtime/nenv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib",
-        "/mnt/task_runtime/nenv/lib/python3.12/site-packages/nvidia/cublas/lib",
-        "/mnt/task_runtime/nenv/lib/python3.12/site-packages/nvidia/cudnn/lib",
-        "/mnt/task_runtime/nenv/lib/python3.12/site-packages/nvidia/cufft/lib",
-        "/mnt/task_runtime/nenv/lib/python3.12/site-packages/nvidia/curand/lib",
-        "/mnt/task_runtime/nenv/lib/python3.12/site-packages/nvidia/cusolver/lib",
-        "/mnt/task_runtime/nenv/lib/python3.12/site-packages/nvidia/cusparse/lib",
-        "/mnt/task_runtime/nenv/lib/python3.12/site-packages/nvidia/nccl/lib",
-        "/mnt/task_runtime/nenv/lib/python3.12/site-packages/nvidia/nvjitlink/lib",
+        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib",
+        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib",
+        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cublas/lib",
+        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cudnn/lib",
+        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cufft/lib",
+        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/curand/lib",
+        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cusolver/lib",
+        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/cusparse/lib",
+        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/nccl/lib",
+        "/mnt/task_runtime/myenv/lib/python3.12/site-packages/nvidia/nvjitlink/lib",
     ]
     existing_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
     PPO_RAY_RUNTIME_ENV["env_vars"]["LD_LIBRARY_PATH"] = ":".join(cuda_lib_paths) + ":" + existing_ld_path
@@ -1037,7 +1037,7 @@ def parse_args():
 
 # Distributed training configuration
 # 1 node, 8 GPUs = 8 GPUs total
-NUM_NODES = 1  # 8 nodes (64 GPUs)
+NUM_NODES = 1  # 1 node (8 GPUs)
 GPUS_PER_NODE = 8
 
 
@@ -2674,15 +2674,15 @@ def patch_verl_on_all_nodes():
     local_patches = [
         (
             os.path.join(patches_dir, "sglang_rollout_patched.py"),
-            "/mnt/task_runtime/nenv/lib/python3.12/site-packages/verl/workers/rollout/sglang_rollout/sglang_rollout.py"
+            "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/workers/rollout/sglang_rollout/sglang_rollout.py"
         ),
         (
             os.path.join(patches_dir, "fsdp_workers_patched.py"),
-            "/mnt/task_runtime/nenv/lib/python3.12/site-packages/verl/workers/fsdp_workers.py"
+            "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/workers/fsdp_workers.py"
         ),
         (
             os.path.join(patches_dir, "ray_trainer_patched.py"),
-            "/mnt/task_runtime/nenv/lib/python3.12/site-packages/verl/trainer/ppo/ray_trainer.py"
+            "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/trainer/ppo/ray_trainer.py"
         ),
     ]
     print("[INFO] Patching LOCAL node first...")
@@ -2697,15 +2697,15 @@ def patch_verl_on_all_nodes():
     patches = [
         (
             os.path.join(patches_dir, "sglang_rollout_patched.py"),
-            "/mnt/task_runtime/nenv/lib/python3.12/site-packages/verl/workers/rollout/sglang_rollout/sglang_rollout.py"
+            "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/workers/rollout/sglang_rollout/sglang_rollout.py"
         ),
         (
             os.path.join(patches_dir, "fsdp_workers_patched.py"),
-            "/mnt/task_runtime/nenv/lib/python3.12/site-packages/verl/workers/fsdp_workers.py"
+            "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/workers/fsdp_workers.py"
         ),
         (
             os.path.join(patches_dir, "ray_trainer_patched.py"),
-            "/mnt/task_runtime/nenv/lib/python3.12/site-packages/verl/trainer/ppo/ray_trainer.py"
+            "/mnt/task_runtime/myenv/lib/python3.12/site-packages/verl/trainer/ppo/ray_trainer.py"
         ),
     ]
     
