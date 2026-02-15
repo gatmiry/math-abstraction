@@ -1037,7 +1037,7 @@ def parse_args():
 
 # Distributed training configuration
 # 1 node, 8 GPUs = 8 GPUs total
-NUM_NODES = 4  # 1 node (8 GPUs)
+NUM_NODES = 8  # 1 node (8 GPUs)
 GPUS_PER_NODE = 8
 
 
@@ -3329,7 +3329,7 @@ def main():
         # Actor config
         f"actor_rollout_ref.actor.ppo_mini_batch_size={TRAIN_BATCH_SIZE}",  # Must be <= train_batch_size
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",  # Reduced to avoid OOM in actor update (lm_head needs ~32GB)
-        "actor_rollout_ref.actor.ppo_epochs=1",
+        "actor_rollout_ref.actor.ppo_epochs=2",
         "actor_rollout_ref.actor.entropy_from_logits_with_chunking=false",  # Disabled - using smaller micro batch instead
         "+actor_rollout_ref.actor.offload_param=true",  # Offload weights to CPU - frees GPU for sglang KV cache
         # "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1",  # Only needed when use_kl_in_reward=true
@@ -3409,8 +3409,12 @@ def main():
         
         # Initialize Ray early to distribute checkpoint to all nodes
         print("[INFO] Initializing Ray for checkpoint distribution...")
-        # Runtime env ensures workers can import sbys_hinting module
+        # Runtime env ensures workers can import sbys_hinting module and have WANDB_API_KEY for wandb
         ray_runtime_env = {"env_vars": {"PYTHONPATH": _parent_dir}}
+        _wandb_key = tokens.get("WANDB_API_KEY", "")
+        if _wandb_key and _wandb_key != "YOUR_WANDB_API_KEY_HERE":
+            ray_runtime_env["env_vars"]["WANDB_API_KEY"] = _wandb_key
+            print("[INFO] WANDB_API_KEY added to Ray runtime_env for workers")
         if not ray.is_initialized():
             try:
                 ray.init(address='auto', ignore_reinit_error=True, runtime_env=ray_runtime_env)
@@ -3468,12 +3472,19 @@ def main():
         install_prompt_reset_hook()
         
         # Initialize Ray if not already initialized (needed for ProblemStateActor)
+        # Include WANDB_API_KEY in runtime_env so TaskRunner and all workers inherit it (hf_token.txt
+        # is only on the launch node; Ray workers on other nodes get env vars via runtime_env)
         if not ray.is_initialized():
+            ray_runtime_env = {"env_vars": {"PYTHONPATH": _parent_dir}}
+            _wandb_key = tokens.get("WANDB_API_KEY", "")
+            if _wandb_key and _wandb_key != "YOUR_WANDB_API_KEY_HERE":
+                ray_runtime_env["env_vars"]["WANDB_API_KEY"] = _wandb_key
+                print("[INFO] WANDB_API_KEY added to Ray runtime_env for workers")
             try:
-                ray.init(address='auto', ignore_reinit_error=True)
+                ray.init(address='auto', ignore_reinit_error=True, runtime_env=ray_runtime_env)
             except ConnectionError:
                 print("[INFO] Could not connect to existing Ray cluster, starting new one...")
-                ray.init(ignore_reinit_error=True)
+                ray.init(ignore_reinit_error=True, runtime_env=ray_runtime_env)
         
         # Distribute sbys_grpo.py to all nodes FIRST (ensures all workers have latest code)
         print("[INFO] Distributing sbys_grpo.py to all nodes...")
