@@ -22,21 +22,52 @@ echo ""
 
 # --- Step 1: Create virtualenv ---
 if [ ! -d "$VENV_PATH" ]; then
-    echo "[1/6] Creating virtual environment (with system site-packages)..."
+    echo "[1/7] Creating virtual environment (with system site-packages)..."
     python3.12 -m venv --system-site-packages "$VENV_PATH"
 else
-    echo "[1/6] Virtual environment already exists at $VENV_PATH"
+    echo "[1/7] Virtual environment already exists at $VENV_PATH"
 fi
 
 source "$VENV_PATH/bin/activate"
 pip install --upgrade pip setuptools wheel
 
+# --- Step 1b: Add pip constraints to prevent shadowing system torch/triton/nvidia ---
+echo "[1b] Setting up pip constraints (block torch/triton/nvidia from being installed)..."
+cat > "$VENV_PATH/pip-constraints.txt" << 'CONSTRAINTS'
+# Prevent pip from installing packages that must come from the system (docker image).
+# These are inherited via --system-site-packages. Installing them in myenv causes
+# version conflicts with CUDA/torch ecosystem.
+torch==0.0.0
+torchvision==0.0.0
+torchaudio==0.0.0
+triton==0.0.0
+nvidia-cublas-cu12==0.0.0
+nvidia-cuda-cupti-cu12==0.0.0
+nvidia-cuda-nvrtc-cu12==0.0.0
+nvidia-cuda-runtime-cu12==0.0.0
+nvidia-cudnn-cu12==0.0.0
+nvidia-cufft-cu12==0.0.0
+nvidia-curand-cu12==0.0.0
+nvidia-cusolver-cu12==0.0.0
+nvidia-cusparse-cu12==0.0.0
+nvidia-nccl-cu12==0.0.0
+nvidia-nvjitlink-cu12==0.0.0
+nvidia-nvtx-cu12==0.0.0
+CONSTRAINTS
+
+cat > "$VENV_PATH/pip.conf" << PIPCONF
+[install]
+constraint = $VENV_PATH/pip-constraints.txt
+PIPCONF
+
+echo "export PIP_CONFIG_FILE=$VENV_PATH/pip.conf" >> "$VENV_PATH/bin/activate"
+
 # --- Step 2: Install numpy ---
-echo "[2/6] Installing numpy..."
+echo "[2/7] Installing numpy..."
 pip install numpy
 
 # --- Step 3: Install apple_bolt (Apple-internal, copied from system) ---
-echo "[3/6] Installing apple_bolt from system packages..."
+echo "[3/7] Installing apple_bolt from system packages..."
 
 DEST="$VENV_PATH/lib/python3.12/site-packages"
 
@@ -119,11 +150,11 @@ pip install \
 python -c "import apple_bolt; print(f'  apple_bolt OK')"
 
 # --- Step 4: Install math-verify (used by math_checker.py) ---
-echo "[4/6] Installing math-verify..."
+echo "[4/7] Installing math-verify..."
 pip install math-verify
 
 # --- Step 5: Install verl from local source (editable) ---
-echo "[5/6] Installing verl from local source..."
+echo "[5/7] Installing verl from local source..."
 VERL_DIR="$PROJECT_ROOT/verl"
 if [ ! -d "$VERL_DIR" ]; then
     echo "  Cloning verl from git..."
@@ -134,8 +165,53 @@ fi
 pip install -e "$VERL_DIR" --no-deps
 
 # --- Step 6: Pin transformers to 4.x (verl uses AutoModelForVision2Seq, removed in v5) ---
-echo "[6/6] Pinning transformers to 4.x..."
+echo "[6/7] Pinning transformers to 4.x..."
 pip install "transformers>=4.57,<5"
+
+# --- Step 7: Clean up redundant shadows ---
+echo "[7/7] Removing redundant packages from venv (inherited from system)..."
+DEST="$VENV_PATH/lib/python3.12/site-packages"
+python3 -c "
+import os, shutil
+myenv_sp = '$DEST'
+system_sp = '/usr/local/lib/python3.12/dist-packages'
+# Keep only packages that are myenv-specific (not in system)
+keep_prefixes = [
+    'math_verify', 'latex2sympy2', 'markdown_it', 'mdurl',
+    'rich', 'shellingham', 'typer', 'cryptography', 'jwt', 'pyjwt', 'PyJWT',
+    'transformers', '__editable__', '__pycache__', 'distutils-precedence',
+]
+removed = 0
+for entry in os.listdir(myenv_sp):
+    if any(entry.startswith(p) for p in keep_prefixes):
+        continue
+    if entry.endswith('.dist-info'):
+        continue  # handled with their modules
+    full = os.path.join(myenv_sp, entry)
+    sys_full = os.path.join(system_sp, entry)
+    if os.path.exists(sys_full) or entry.startswith('nvidia') or entry.startswith('_cuda'):
+        if os.path.isdir(full):
+            shutil.rmtree(full)
+        elif os.path.isfile(full):
+            os.remove(full)
+        removed += 1
+# Also remove dist-info for packages that exist in system
+for entry in os.listdir(myenv_sp):
+    if entry.endswith('.dist-info'):
+        if any(entry.startswith(p) for p in keep_prefixes):
+            continue
+        name = entry[:-len('.dist-info')].rsplit('-', 1)[0].replace('_', '-').lower()
+        # Check if system has a dist-info for same package
+        has_system = any(
+            e.endswith('.dist-info') and
+            e[:-len('.dist-info')].rsplit('-', 1)[0].replace('_', '-').lower() == name
+            for e in os.listdir(system_sp)
+        )
+        if has_system:
+            shutil.rmtree(os.path.join(myenv_sp, entry))
+            removed += 1
+print(f'  Cleaned {removed} redundant entries from venv site-packages')
+"
 
 # --- Verify ---
 echo ""

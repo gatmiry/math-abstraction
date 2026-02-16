@@ -1,6 +1,0 @@
-# Token file for sbys_hinting scripts
-# Format: KEY=VALUE (one per line)
-# Lines starting with # are comments
-
-HF_TOKEN=YOUR_HF_TOKEN_HERE
-WANDB_API_KEY=YOUR_WANDB_API_KEY_HERE
