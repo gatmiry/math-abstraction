@@ -3,7 +3,9 @@
 # Usage: ./newverl-install-dependencies.sh [venv_path]
 # Default venv path: /mnt/task_runtime/myenv
 #
-# Installs: numpy, apple_bolt (from system), verl (from git)
+# Installs: numpy, apple_bolt (from system), math-verify,
+#           verl (editable from local/git source),
+#           transformers 4.x (pinned, verl needs AutoModelForVision2Seq removed in v5)
 
 set -e
 
@@ -20,21 +22,21 @@ echo ""
 
 # --- Step 1: Create virtualenv ---
 if [ ! -d "$VENV_PATH" ]; then
-    echo "[1/4] Creating virtual environment..."
-    python3.12 -m venv "$VENV_PATH"
+    echo "[1/6] Creating virtual environment (with system site-packages)..."
+    python3.12 -m venv --system-site-packages "$VENV_PATH"
 else
-    echo "[1/4] Virtual environment already exists at $VENV_PATH"
+    echo "[1/6] Virtual environment already exists at $VENV_PATH"
 fi
 
 source "$VENV_PATH/bin/activate"
 pip install --upgrade pip setuptools wheel
 
 # --- Step 2: Install numpy ---
-echo "[2/4] Installing numpy..."
+echo "[2/6] Installing numpy..."
 pip install numpy
 
 # --- Step 3: Install apple_bolt (Apple-internal, copied from system) ---
-echo "[3/4] Installing apple_bolt from system packages..."
+echo "[3/6] Installing apple_bolt from system packages..."
 
 DEST="$VENV_PATH/lib/python3.12/site-packages"
 
@@ -116,9 +118,24 @@ pip install \
 # Verify apple_bolt
 python -c "import apple_bolt; print(f'  apple_bolt OK')"
 
-# --- Step 4: Install verl from git ---
-echo "[4/4] Installing verl from git (latest)..."
-pip install git+https://github.com/volcengine/verl.git
+# --- Step 4: Install math-verify (used by math_checker.py) ---
+echo "[4/6] Installing math-verify..."
+pip install math-verify
+
+# --- Step 5: Install verl from local source (editable) ---
+echo "[5/6] Installing verl from local source..."
+VERL_DIR="$PROJECT_ROOT/verl"
+if [ ! -d "$VERL_DIR" ]; then
+    echo "  Cloning verl from git..."
+    git clone https://github.com/volcengine/verl.git "$VERL_DIR"
+fi
+# Use --no-deps to avoid pulling in a newer torch that conflicts with the
+# system torch+torchvision+nvidia packages from the docker image
+pip install -e "$VERL_DIR" --no-deps
+
+# --- Step 6: Pin transformers to 4.x (verl uses AutoModelForVision2Seq, removed in v5) ---
+echo "[6/6] Pinning transformers to 4.x..."
+pip install "transformers>=4.57,<5"
 
 # --- Verify ---
 echo ""
@@ -128,6 +145,8 @@ echo "=============================================="
 python -c "import numpy; print(f'  numpy:      {numpy.__version__}')"
 python -c "import apple_bolt; print(f'  apple_bolt: OK')"
 python -c "import verl; print(f'  verl:       installed')"
+python -c "import transformers; print(f'  transformers: {transformers.__version__}')"
+python -c "from verl.interactions.base import BaseInteraction; print(f'  verl.interactions: OK')"
 
 echo ""
 echo "Done! Activate with:"
