@@ -19,6 +19,15 @@ class HintDataset(RLHFDataset):
         # Per-problem hint level: maps problem_string → current hint level (0 = no hints)
         self.hint_level = defaultdict(int)  # problem_str -> int
 
+    def __getitem__(self, item):
+        row_dict = super().__getitem__(item)
+        prompt_str = str(row_dict["raw_prompt"])  # or however you key it
+        level = self.hint_level.get(prompt_str, 0)
+        if level > 0:
+            # Modify row_dict["raw_prompt"] to inject hints
+            row_dict["raw_prompt"] = self._add_hints(row_dict["raw_prompt"], level)
+        return row_dict
+
     def on_batch_end(self, batch):
         scores = batch.batch["token_level_scores"].sum(-1)  # [B*n] total reward per response
         uids = batch.non_tensor_batch["uid"]                # same uid for all n rollouts of a problem
