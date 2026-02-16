@@ -1,0 +1,9 @@
+FROM docker.apple.com/sgatmiry/verl/verlimage:v1
+
+# Trust Apple corporate root CAs (required for pypi.apple.com access)
+ADD "https://pages.github.pie.apple.com/crypto-services/trust-apple-corp-root-cas/trust_apple_corp_root_cas.sh" "/usr/local/bin"
+RUN chmod 755 "/usr/local/bin/trust_apple_corp_root_cas.sh" && \
+    bash "/usr/local/bin/trust_apple_corp_root_cas.sh"
+
+# Install apple-bolt from Apple internal PyPI (needs certs above)
+RUN pip install --no-cache-dir -i https://pypi.apple.com/simple apple-bolt
