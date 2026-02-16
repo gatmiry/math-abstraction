@@ -6,28 +6,46 @@ dataset class has the method. This lets us inspect rewards and adjust
 prompts (e.g., hint levels) for the next iteration.
 """
 
+from collections import defaultdict, OrderedDict
+
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
 
 class HintDataset(RLHFDataset):
     """RLHFDataset subclass with on_batch_end for dynamic prompt adjustment."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Per-problem hint level: maps problem_string → current hint level (0 = no hints)
+        self.hint_level = defaultdict(int)  # problem_str -> int
+
     def on_batch_end(self, batch):
-        n = 4  # rollout.n — number of generations per prompt
-        scores = batch.batch["token_level_scores"].sum(-1)  # [B*n]
-        scores = scores.view(-1, n)  # [B, n] — 4 scores per prompt
+        scores = batch.batch["token_level_scores"].sum(-1)  # [B*n] total reward per response
+        uids = batch.non_tensor_batch["uid"]                # same uid for all n rollouts of a problem
+        prompts = batch.non_tensor_batch["raw_prompt"]
 
-        mean_score = scores.mean(dim=1)   # average reward per problem
-        pass_rate = (scores > 0).float().mean(dim=1)  # fraction of correct generations
+        # Group scores by uid (batch may be reordered by balance_batch)
+        groups = OrderedDict()  # uid -> {prompt, scores}
+        for i, uid in enumerate(uids):
+            if uid not in groups:
+                groups[uid] = {"prompt": prompts[i], "scores": []}
+            groups[uid]["scores"].append(scores[i].item())
 
-        # Problem with 0/4 correct → needs more hints
-        # Problem with 4/4 correct → reduce hints
-        print(f"[HintDataset] on_batch_end: {len(mean_score)} problems, "
-              f"mean_score={mean_score.mean().item():.3f}, "
-              f"mean_pass_rate={pass_rate.mean().item():.3f}")
-        print(f"problem [0] is {batch.non_tensor_batch["raw_prompt"][0]} reward is {scores[0]}")
-        print(f"problem [1] is {batch.non_tensor_batch["raw_prompt"][1]} reward is {scores[1]}")
-        print(f"problem [2] is {batch.non_tensor_batch["raw_prompt"][2]} reward is {scores[2]}")
-        print(f"problem [3] is {batch.non_tensor_batch["raw_prompt"][3]} reward is {scores[3]}")
+        total_pass = 0.0
+        for uid, g in groups.items():
+            n = len(g["scores"])
+            pr = sum(1 for s in g["scores"] if s > 0) / n
+            total_pass += pr
+            prob = g["prompt"]
+            if pr == 0.0:
+                self.hint_level[prob] = min(self.hint_level[prob] + 1, 5)
+            elif pr == 1.0:
+                self.hint_level[prob] = max(self.hint_level[prob] - 1, 0)
+
+        mean_pr = total_pass / len(groups) if groups else 0.0
+        nonzero = {k: v for k, v in self.hint_level.items() if v > 0}
+        print(f"[HintDataset] on_batch_end: {len(groups)} problems, "
+              f"mean_pass_rate={mean_pr:.3f}, "
+              f"{len(nonzero)} problems with hints>0")
         print("--------------------------------")
         exit()

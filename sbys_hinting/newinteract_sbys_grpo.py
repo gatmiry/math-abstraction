@@ -70,9 +70,9 @@ SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt_full
 SYSTEM_PROMPT_NAME = "full_solution_simple"
 
 # Training config
-TRAIN_BATCH_SIZE = 128
+TRAIN_BATCH_SIZE = 32#128
 TOTAL_EPOCHS = 50
-VAL_SIZE = 128
+VAL_SIZE = 32#128
 NUM_NODES = 1
 GPUS_PER_NODE = 8
 
@@ -876,7 +876,7 @@ def main():
         f"trainer.total_epochs={TOTAL_EPOCHS}",
         "trainer.save_freq=15",
         "+trainer.save_checkpoint_before_train=true",
-        "trainer.val_before_train=true",
+        "trainer.val_before_train=false",
         "trainer.test_freq=5",
         "trainer.log_val_generations=3",
         # Reward (new verl uses reward.custom_reward_function / reward.reward_model)
