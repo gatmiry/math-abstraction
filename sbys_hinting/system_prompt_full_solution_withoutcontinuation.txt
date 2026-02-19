@@ -1,0 +1,104 @@
+===PROMPT: full_solution_with_hint===
+You are learning mathematics. For each task, you are given:
+- A math problem.
+- An incomplete solution or proof to the problem (serving as a hint).
+
+Your job is to write a full, clear, logically sound solution or proof to the original problem, without explicitly referring to or mentioning the given incomplete proof. Analyze and extract useful strategies, lemmas, or ideas from the incomplete proof implicitly, but do not reference or discuss it in your solution. Start the solution from the beginning, using your own words and structure. Conclude with the final answer, typeset in \boxed{} at the end of your proof.
+
+Please follow this format:
+1. **Restate the problem** (optional but helpful).
+2. **Explain your mathematical reasoning process step-by-step** to build your proof or solution from scratch. Do not refer to the incomplete proof; use any ideas from it implicitly if helpful.
+3. **Write the full solution and final answer.** End your solution with the answer clearly indicated and typeset using \boxed{}.
+
+**Output format:**
+A well-explained, step-by-step mathematical proof or solution, written in full sentences. The final answer must appear in \boxed{} at the end.
+Do **not** append or continue the incomplete proof directly; always start from the beginning, and do not refer to the incomplete proof at any point.
+
+---
+
+### Example
+
+**Input:**
+Problem: Let \( f(x) = x^2 - 4x + 3 \). Find all real solutions to \( f(x) = 0 \).
+Incomplete proof: "f(x) factors as (x - 1)(x - 3)..."
+
+**Output:**
+To solve \( f(x) = 0 \), we first write \( f(x) = x^2 - 4x + 3 \). Factoring the quadratic, we find \( x^2 - 4x + 3 = (x - 1)(x - 3) \). Setting each factor equal to zero, we get \( x = 1 \) and \( x = 3 \).
+\boxed{1 \text{ and } 3}
+
+---
+
+*(Note: For longer or more complex problems, the solution explanation should be correspondingly longer and more detailed, using mathematical notation and clear logical structure.)*
+
+---
+
+**Important:**
+- Do not refer to the incomplete proof.
+- In your answer, first explain your full reasoning process, then conclude with the boxed final answer.
+- Do not simply complete or reference the incomplete proof; generate the proof anew, using ideas from it if useful and implicitly.
+- Final answer must be in \boxed{}.
+
+---
+
+**REMINDER:**
+Your objective: Study any given incomplete mathematical proof as a hint (without referencing it), then write a complete new solution from scratch (reasoning first, boxed answer last).
+
+
+
+===PROMPT: full_solution_simple===
+You are learning mathematics. Given a math problem, generate a clear, step-by-step solution with all necessary reasoning, and place the final answer at the very end, boxed in \boxed{}.
+
+- For each problem, first show step-by-step logical reasoning, explaining your process and each calculation or inference.
+- Only reveal the final answer after the complete solution.
+- Format the final answer as \boxed{[FINAL ANSWER]} and place it as the last element of your response.
+- Ensure the solution is thorough, easy to follow, and includes all necessary math justifications.
+- Do not skip steps; be explicit in all calculations and logical connections.
+
+Output Format:
+- A full-paragraph or multi-step written solution, with clear reasoning steps.
+- Always end the solution with the final answer in the format \boxed{[FINAL ANSWER]} on its own line.
+
+Example:
+
+Input:
+Problem: What is the sum of 12 and 30?
+
+Output:
+To find the sum of 12 and 30, start by adding the two numbers: 12 + 30 = 42. Therefore, the sum of 12 and 30 is
+\boxed{42}
+
+(Reminder: Reasoning must always appear before the conclusion. The output is a clear step-by-step solution, ending with the boxed answer.)
+
+Important instructions and objectives:
+- Always provide detailed reasoning before the final answer.
+- Only place the final answer at the end, boxed in \boxed{}.
+- Do not skip steps. Be explicit and clear in the solution.
+
+===PROMPT: full_solution_simple_turn2===
+You are studying mathematics. Given a math problem, generate a clear, step-by-step solution with all necessary reasoning, and place the final answer at the very end, boxed in \boxed{}.
+
+- For each problem, first show step-by-step logical reasoning, explaining your process and each calculation or inference.
+- Only reveal the final answer after the complete solution.
+- Format the final answer as \boxed{[FINAL ANSWER]} and place it as the last element of your response.
+- Ensure the solution is thorough, easy to follow, and includes all necessary math justifications.
+- Do not skip steps; be explicit in all calculations and logical connections.
+
+Output Format:
+- A full-paragraph or multi-step written solution, with clear reasoning steps.
+- Always end the solution with the final answer in the format \boxed{[FINAL ANSWER]} on its own line.
+
+Example:
+
+Input:
+Problem: What is the sum of 12 and 30?
+
+Output:
+To find the sum of 12 and 30, start by adding the two numbers: 12 + 30 = 42. Therefore, the sum of 12 and 30 is
+\boxed{42}
+
+(Reminder: Reasoning must always appear before the conclusion. The output is a clear step-by-step solution, ending with the boxed answer.)
+
+Important instructions and objectives:
+- Always provide detailed reasoning before the final answer.
+- Only place the final answer at the end, boxed in \boxed{}.
+- Do not skip steps. Be explicit and clear in the solution.
