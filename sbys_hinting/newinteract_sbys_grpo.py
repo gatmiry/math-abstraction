@@ -500,13 +500,14 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
         print(f"[INFO] Deduplicated dataset: {original_size} -> {len(dataset)}")
 
     def format_dataset(examples):
-        prompts, answers, sbys_solutions = [], [], []
+        prompts, answers, sbys_solutions, problems = [], [], [], []
         for problem, answer, sbys_solution in zip(examples['problem'], examples['answer'], examples['sbys_solution']):
             if answer:
+                problems.append(problem)
                 prompts.append(format_prompt(problem))
                 answers.append(answer)
                 sbys_solutions.append(sbys_solution)
-        return {"prompt": prompts, "answer": answers, "sbys_solution": sbys_solutions}
+        return {"prompt": prompts, "answer": answers, "sbys_solution": sbys_solutions, 'problem': problems}
 
     def is_prompt_short_enough(example):
         prompt_text = tokenizer.apply_chat_template(example['prompt'], tokenize=False, add_generation_prompt=True)
@@ -553,6 +554,7 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
                 "reward_model": {"ground_truth": item["answer"]},
                 "data_source": "omni_math",
                 "sbys_solution": item["sbys_solution"],
+                "problem": item["problem"],
             })
         return rl_data
 

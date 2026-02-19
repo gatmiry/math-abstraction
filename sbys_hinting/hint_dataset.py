@@ -6,9 +6,11 @@ dataset class has the method. This lets us inspect rewards and adjust
 prompts (e.g., hint levels) for the next iteration.
 """
 
+import math
 from collections import defaultdict, OrderedDict
 
 from verl.utils.dataset.rl_dataset import RLHFDataset
+from newinteract_sbys_grpo import load_system_prompt
 
 
 class HintDataset(RLHFDataset):
@@ -22,9 +24,10 @@ class HintDataset(RLHFDataset):
         self.able_index = defaultdict(int)
         self.try_index = defaultdict(int)
         self.guide_steps_count = defaultdict(int)
+        self.hint_system_prompt = load_system_prompt("full_solution_with_hint")
+        self.simple_system_prompt = load_system_prompt("full_solution_simple")
         for row in self.dataframe:
-            prob = row["prompt"][1]['content']
-            #self.hint_level[problem_str] = 0
+            prob = row["problem"]
             self.unable_index[prob] = 0
             self.able_index[prob] = len(row["sbys_solution"])
             self.try_index[prob] = 0
@@ -32,23 +35,36 @@ class HintDataset(RLHFDataset):
 
     def __getitem__(self, item):
         row_dict = super().__getitem__(item)
-        prompt_str = str(row_dict["raw_prompt"])  # or however you key it
-        level = self.hint_level.get(prompt_str, 0)
-        if level > 0:
-            # Modify row_dict["raw_prompt"] to inject hints
-            row_dict["raw_prompt"] = self._add_hints(row_dict["raw_prompt"], level)
+        prob = row_dict["problem"] # or however you key it
+        sbys_solution = row_dict["sbys_solution"]
+        level = self.try_index[prob]
+        row_dict["raw_prompt"] = self._add_hints(sbys_solution, row_dict["raw_prompt"], level)
         return row_dict
+
+    def _add_hints(self, sbys_solution, raw_prompt, level):
+        """Build prompt: simple (no hint) if level==0, continuation prompt otherwise."""
+        problem_text = raw_prompt["problem"]
+        if level == 0:
+            return [
+                {"role": "system", "content": self.simple_system_prompt},
+                {"role": "user", "content": f"Problem: {problem_text}"},
+            ]
+        partial_proof = "\n".join(sbys_solution[:level])
+        return [
+            {"role": "system", "content": self.hint_system_prompt},
+            {"role": "user", "content": f"Problem: {problem_text}\nPartial proof: {partial_proof}"},
+        ]
 
     def on_batch_end(self, batch):
         scores = batch.batch["token_level_scores"].sum(-1)  # [B*n] total reward per response
         uids = batch.non_tensor_batch["uid"]                # same uid for all n rollouts of a problem
-        prompts = batch.non_tensor_batch["raw_prompt"]
+        problem_keys = batch.non_tensor_batch["problem_key"]
 
         # Group scores by uid (batch may be reordered by balance_batch)
-        groups = OrderedDict()  # uid -> {prompt, scores}
+        groups = OrderedDict()  # uid -> {prob, scores}
         for i, uid in enumerate(uids):
             if uid not in groups:
-                groups[uid] = {"prompt": prompts[i], "scores": []}
+                groups[uid] = {"prob": problem_keys[i], "scores": []}
             groups[uid]["scores"].append(scores[i].item())
 
         total_pass = 0.0
@@ -56,7 +72,7 @@ class HintDataset(RLHFDataset):
 
 
 
-            prob = g["prompt"]
+            prob = g["prob"]
             n = len(g["scores"])
             pr = sum(1 for s in g["scores"] if s > 0) 
             ## if pr is not 0 or 4, continue to the next problem
