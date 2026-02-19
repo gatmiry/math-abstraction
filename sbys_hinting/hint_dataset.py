@@ -38,27 +38,26 @@ class HintDataset(RLHFDataset):
         prob = row_dict["problem"] # or however you key it
         sbys_solution = row_dict["sbys_solution"]
         level = self.try_index[prob]
-        row_dict["raw_prompt"] = self._add_hints(sbys_solution, row_dict["raw_prompt"], level)
+        row_dict["raw_prompt"] = self._add_hints(sbys_solution, prob, level)
         return row_dict
 
-    def _add_hints(self, sbys_solution, raw_prompt, level):
+    def _add_hints(self, sbys_solution, prob, level):
         """Build prompt: simple (no hint) if level==0, continuation prompt otherwise."""
-        problem_text = raw_prompt["problem"]
         if level == 0:
             return [
                 {"role": "system", "content": self.simple_system_prompt},
-                {"role": "user", "content": f"Problem: {problem_text}"},
+                {"role": "user", "content": f"Problem: {prob}"},
             ]
         partial_proof = "\n".join(sbys_solution[:level])
         return [
             {"role": "system", "content": self.hint_system_prompt},
-            {"role": "user", "content": f"Problem: {problem_text}\nPartial proof: {partial_proof}"},
+            {"role": "user", "content": f"Problem: {prob}\nPartial proof: {partial_proof}"},
         ]
 
     def on_batch_end(self, batch):
         scores = batch.batch["token_level_scores"].sum(-1)  # [B*n] total reward per response
         uids = batch.non_tensor_batch["uid"]                # same uid for all n rollouts of a problem
-        problem_keys = batch.non_tensor_batch["problem_key"]
+        problem_keys = batch.non_tensor_batch["problem"]
 
         # Group scores by uid (batch may be reordered by balance_batch)
         groups = OrderedDict()  # uid -> {prob, scores}
