@@ -24,30 +24,15 @@ import re
 import numpy as np
 import apple_bolt as bolt
 
-# Add parent directory, verl repo, and venv site-packages to PYTHONPATH
-# so Ray worker processes can find sbys_hinting, verl, and venv-installed packages (math_verify, etc.)
+# Add parent directory to PYTHONPATH so 'sbys_hinting' module can be imported by verl workers
 _parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_verl_repo_dir = os.path.join(_parent_dir, "verl")
-_venv_site_packages = None
-_venv_prefix = os.environ.get("VIRTUAL_ENV") or (sys.prefix if sys.prefix != sys.base_prefix else None)
-if _venv_prefix:
-    import glob
-    _candidates = glob.glob(os.path.join(_venv_prefix, "lib", "python*", "site-packages"))
-    if _candidates:
-        _venv_site_packages = _candidates[0]
-_required_paths = [_verl_repo_dir, _parent_dir]
-if _venv_site_packages and os.path.isdir(_venv_site_packages):
-    _required_paths.append(_venv_site_packages)
-for _d in _required_paths:
-    if _d not in sys.path:
-        sys.path.insert(0, _d)
+if _parent_dir not in sys.path:
+    sys.path.insert(0, _parent_dir)
 if "PYTHONPATH" in os.environ:
-    _existing = os.environ["PYTHONPATH"].split(":")
-    _new = [p for p in _required_paths if p not in _existing]
-    if _new:
-        os.environ["PYTHONPATH"] = ":".join(_new) + ":" + os.environ["PYTHONPATH"]
+    if _parent_dir not in os.environ["PYTHONPATH"]:
+        os.environ["PYTHONPATH"] = f"{_parent_dir}:{os.environ['PYTHONPATH']}"
 else:
-    os.environ["PYTHONPATH"] = ":".join(_required_paths)
+    os.environ["PYTHONPATH"] = _parent_dir
 
 # vLLM V1 engine compatibility
 os.environ.setdefault("VLLM_USE_V1", "0")
@@ -88,7 +73,7 @@ SYSTEM_PROMPT_NAME = "full_solution_simple"
 TRAIN_BATCH_SIZE = 128
 TOTAL_EPOCHS = 50
 VAL_SIZE = 128
-NUM_NODES = 2
+NUM_NODES = 4
 GPUS_PER_NODE = 8
 
 # Model & dataset
@@ -918,7 +903,7 @@ def main():
             sys.exit(1)
 
         print("[INFO] Initializing Ray for checkpoint distribution...")
-        ray_runtime_env = {"env_vars": {"PYTHONPATH": ":".join(_required_paths)}}
+        ray_runtime_env = {"env_vars": {"PYTHONPATH": _parent_dir}}
         _wandb_key = tokens.get("WANDB_API_KEY", "")
         if _wandb_key and _wandb_key != "YOUR_WANDB_API_KEY_HERE":
             ray_runtime_env["env_vars"]["WANDB_API_KEY"] = _wandb_key
@@ -957,7 +942,7 @@ def main():
 
     # Initialize Ray (if not already from resume path)
     if not ray.is_initialized():
-        ray_runtime_env = {"env_vars": {"PYTHONPATH": ":".join(_required_paths)}}
+        ray_runtime_env = {"env_vars": {"PYTHONPATH": _parent_dir}}
         _wandb_key = tokens.get("WANDB_API_KEY", "")
         if _wandb_key and _wandb_key != "YOUR_WANDB_API_KEY_HERE":
             ray_runtime_env["env_vars"]["WANDB_API_KEY"] = _wandb_key
