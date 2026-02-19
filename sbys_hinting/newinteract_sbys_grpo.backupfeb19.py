@@ -560,7 +560,7 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
         print(f"[INFO] Filtered {orig - len(val_dataset)} val samples > {max_prompt_tokens} tokens")
 
     # Convert to verl format
-    def to_verl_format(dataset_split, is_validation: bool = False):
+    def to_verl_format(dataset_split):
         rl_data = []
         for item in dataset_split:
             rl_data.append({
@@ -568,12 +568,12 @@ def create_rl_dataset(tokenizer, dataset_path: str, max_samples: Optional[int] =
                 "ground_truth": item["answer"],
                 "reward_model": {"ground_truth": item["answer"]},
                 "data_source": "omni_math",
-                "extra_info": {"problem": item["problem"], "is_validation": is_validation},
+                "extra_info": {"problem": item["problem"]},
                 "sbys_solution": item["sbys_solution"],
             })
         return rl_data
 
-    return to_verl_format(train_dataset, is_validation=False), to_verl_format(val_dataset, is_validation=True)
+    return to_verl_format(train_dataset), to_verl_format(val_dataset)
 
 
 # =============================================================================
