@@ -6,7 +6,9 @@ dataset class has the method. This lets us inspect rewards and adjust
 prompts (e.g., hint levels) for the next iteration.
 """
 
+import json
 import math
+import os
 from collections import defaultdict, OrderedDict
 
 from verl.utils.dataset.rl_dataset import RLHFDataset
@@ -33,9 +35,13 @@ class HintDataset(RLHFDataset):
             self.try_index[prob] = 0
             self.guide_steps_count[prob] = len(row["sbys_solution"])
 
+        self.step_count = 0
     def __getitem__(self, item):
         row_dict = super().__getitem__(item)
         prob = row_dict["extra_info"]["problem"]
+        is_validation = row_dict["extra_info"]["is_validation"]
+        if is_validation:
+            return row_dict
         sbys_solution = row_dict["sbys_solution"]
         level = self.try_index[prob]
         row_dict["raw_prompt"] = self._add_hints(sbys_solution, prob, level)
@@ -55,11 +61,12 @@ class HintDataset(RLHFDataset):
         ]
 
     def on_batch_end(self, batch):
+        self.step_count += 1
         scores = batch.batch["token_level_scores"].sum(-1)  # [B*n] total reward per response
         uids = batch.non_tensor_batch["uid"]                # same uid for all n rollouts of a problem
         extra_infos = batch.non_tensor_batch["extra_info"]
         problem_keys = [info["problem"] for info in extra_infos]
-
+        is_validation = extra_infos[0]["is_validation"]
         # Group scores by uid (batch may be reordered by balance_batch)
         groups = OrderedDict()  # uid -> {prob, scores}
         for i, uid in enumerate(uids):
@@ -75,6 +82,15 @@ class HintDataset(RLHFDataset):
             prob = g["prob"]
             n = len(g["scores"])
             pr = sum(1 for s in g["scores"] if s > 0) 
+
+
+            ## save state to file
+            ## save state to file
+            state = {"problem": prob, "try_index": self.try_index[prob], "able_index": self.able_index[prob], 
+            "unable_index": self.unable_index[prob], "step_count": self.step_count, "pr": pr, "is_validation": is_validation}
+            os.makedirs("outputs/saved_states", exist_ok=True)
+            with open(f"outputs/saved_states/state_{self.step_count}.json", "w") as f:
+                json.dump(state, f)
             ## if pr is not 0 or 4, continue to the next problem
             if pr not in [0, 4]:
                 continue
