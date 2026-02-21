@@ -88,7 +88,7 @@ SYSTEM_PROMPT_NAME = "full_solution_simple"
 TRAIN_BATCH_SIZE = 128
 TOTAL_EPOCHS = 50
 VAL_SIZE = 128
-NUM_NODES = 2
+NUM_NODES = 1
 GPUS_PER_NODE = 8
 
 # Model & dataset
